@@ -1,12 +1,13 @@
 //! Auto title: names a meeting from its transcript as soon as the transcript
 //! is saved, independent of summary generation.
 //!
-//! A meeting is only renamed while it still carries the timestamp name the
-//! app gives new recordings ("Meeting 11_11_26_14_05_09"), so a name the user
-//! typed is never overwritten.
+//! A meeting is only renamed while it still carries a name the app picked
+//! (the "Meeting 11_11_26_14_05_09" timestamp, or an imported file's name), so
+//! a name the user typed is never overwritten.
 
 use crate::database::repositories::setting::SettingsRepository;
 use crate::summary::llm_client::{generate_summary, LLMProvider};
+use crate::summary::processor::{clean_llm_markdown_detailed, THINK_MARKER_REGEX};
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
@@ -14,8 +15,10 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tracing::{info, warn};
 
 const MIN_WORDS: usize = 20;
-const HEAD_CHARS: usize = 8000;
-const TAIL_CHARS: usize = 3000;
+// About 1.5k tokens: enough to find the topic, and small enough that the title
+// does not hold up the built-in model's summary, which shares one sidecar.
+const HEAD_CHARS: usize = 4500;
+const TAIL_CHARS: usize = 1500;
 const MAX_TITLE_CHARS: usize = 80;
 
 const SYSTEM_PROMPT: &str = "You name meeting recordings. Reply with only the title: \
@@ -28,14 +31,32 @@ pub struct MeetingTitleGenerated {
     pub title: String,
 }
 
-/// True for the names the frontend gives new meetings:
-/// "Meeting 11_11_26_14_05_09" and "Meeting 2026-11-11_14-05-09".
+fn is_digit_groups(s: &str, sep: char, widths: &[usize]) -> bool {
+    let parts: Vec<&str> = s.split(sep).collect();
+    parts.len() == widths.len()
+        && parts
+            .iter()
+            .zip(widths)
+            .all(|(p, w)| p.len() == *w && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// True for the names the frontend gives new meetings: "Meeting 11_11_26_14_05_09"
+/// (useRecordingStart), "Meeting 2026-11-11_14-05-09" (TranscriptContext) and the
+/// "New Meeting" fallback (useRecordingStop).
 pub fn is_default_meeting_title(title: &str) -> bool {
-    match title.trim().strip_prefix("Meeting ") {
-        Some(rest) => {
-            !rest.is_empty()
-                && rest.chars().any(|c| c.is_ascii_digit())
-                && rest.chars().all(|c| c.is_ascii_digit() || c == '_' || c == '-')
+    let title = title.trim();
+    if title == "New Meeting" {
+        return true;
+    }
+    let Some(rest) = title.strip_prefix("Meeting ") else {
+        return false;
+    };
+    if is_digit_groups(rest, '_', &[2, 2, 2, 2, 2, 2]) {
+        return true;
+    }
+    match rest.split_once('_') {
+        Some((date, time)) => {
+            is_digit_groups(date, '-', &[4, 2, 2]) && is_digit_groups(time, '-', &[2, 2, 2])
         }
         None => false,
     }
@@ -54,7 +75,14 @@ fn transcript_excerpt(text: &str) -> String {
 
 /// Turns raw model output into a usable title, or None if it is unusable.
 fn clean_title(raw: &str) -> Option<String> {
-    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let visible = clean_llm_markdown_detailed(raw).markdown;
+    // Some chat templates open the think block inside the prompt, so the reply
+    // is bare reasoning followed by "</think>" and then the answer.
+    let visible = match THINK_MARKER_REGEX.find_iter(&visible).last() {
+        Some(marker) => &visible[marker.end()..],
+        None => visible.as_str(),
+    };
+    let line = visible.lines().map(str::trim).find(|l| !l.is_empty())?;
     let line = line.trim_start_matches('#').trim();
     let line = line
         .strip_prefix("Title:")
@@ -166,32 +194,38 @@ async fn current_title(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Str
         .await
 }
 
-/// Sets `new_title` if the meeting still has its default name. Returns whether
-/// it was applied. Shared with the summary path so neither overwrites a name
-/// the user (or the other path) already set.
+/// Sets `new_title` if the meeting still has a default name, or exactly
+/// `replaceable` (an imported file's name). Returns whether it was applied.
+/// Shared with the summary path so neither overwrites a name the user (or the
+/// other path) already set.
 pub async fn apply_title_if_default(
     pool: &SqlitePool,
     meeting_id: &str,
     new_title: &str,
+    replaceable: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     match current_title(pool, meeting_id).await? {
-        Some(old) if is_default_meeting_title(&old) => {
+        Some(old) if is_default_meeting_title(&old) || replaceable == Some(old.as_str()) => {
             rename_if_unchanged(pool, meeting_id, &old, new_title).await
         }
         _ => Ok(false),
     }
 }
 
-/// Generates a title and applies it if the meeting still has its default name.
-/// Failures are logged and otherwise ignored: a missing title is not an error.
+/// Generates a title and applies it if the meeting still has a default name
+/// (or `replaceable`). Failures are logged and otherwise ignored: a missing
+/// title is not an error, and the summary heading can still fill it in later.
 pub async fn generate_meeting_title<R: Runtime>(
     app: AppHandle<R>,
     pool: SqlitePool,
     meeting_id: String,
     transcript: String,
+    replaceable: Option<String>,
 ) {
     match current_title(&pool, &meeting_id).await {
-        Ok(Some(title)) if is_default_meeting_title(&title) => {}
+        Ok(Some(title))
+            if is_default_meeting_title(&title)
+                || replaceable.as_deref() == Some(title.as_str()) => {}
         Ok(_) => return,
         Err(e) => {
             warn!("Auto title for {meeting_id}: failed to read meeting: {e}");
@@ -216,7 +250,7 @@ pub async fn generate_meeting_title<R: Runtime>(
         return;
     };
 
-    match apply_title_if_default(&pool, &meeting_id, &title).await {
+    match apply_title_if_default(&pool, &meeting_id, &title, replaceable.as_deref()).await {
         Ok(true) => {
             info!("Auto title for {meeting_id}: {title}");
             let _ = app.emit(
@@ -241,6 +275,10 @@ mod tests {
         assert!(!is_default_meeting_title("Q4 planning"));
         assert!(!is_default_meeting_title("Meeting "));
         assert!(!is_default_meeting_title("Meeting ___"));
+        assert!(is_default_meeting_title("New Meeting"));
+        assert!(!is_default_meeting_title("Meeting 3"));
+        assert!(!is_default_meeting_title("Meeting 2026"));
+        assert!(!is_default_meeting_title("Meeting 11_11_26"));
     }
 
     #[test]
@@ -256,6 +294,20 @@ mod tests {
         assert_eq!(clean_title("   \n "), None);
         assert_eq!(clean_title("<Add Title here>"), None);
         assert_eq!(clean_title("Meeting 11_11_26_14_05_09"), None);
+        assert_eq!(clean_title("<think>long reasoning</think>"), None);
+    }
+
+    #[test]
+    fn clean_title_skips_reasoning() {
+        assert_eq!(
+            clean_title("<think>The user wants a title.\nLet me look.</think>\nQ4 Budget Review").as_deref(),
+            Some("Q4 Budget Review")
+        );
+        // The template opened the think block in the prompt: only the closing tag arrives.
+        assert_eq!(
+            clean_title("Okay, the user wants a short title.\nLet me look at it.\n</think>\n\nHiring plan for Berlin").as_deref(),
+            Some("Hiring plan for Berlin")
+        );
     }
 
     #[test]

@@ -607,7 +607,7 @@ impl SummaryService {
                                 .filter(|name| !name.is_empty())
                         {
                             if let Err(error) =
-                                crate::summary::title::apply_title_if_default(&pool, &meeting_id, &name)
+                                crate::summary::title::apply_title_if_default(&pool, &meeting_id, &name, None)
                                     .await
                             {
                                 error!("Failed to update meeting name for {}: {}", meeting_id, error);

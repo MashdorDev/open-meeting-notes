@@ -996,6 +996,7 @@ pub async fn api_save_transcript<R: Runtime>(
                 pool.clone(),
                 meeting_id.clone(),
                 transcript_text,
+                None,
             ));
             Ok(serde_json::json!({
                 "status": "success",

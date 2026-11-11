@@ -664,6 +664,26 @@ async fn run_import<R: Runtime>(
         warn!("Failed to write metadata.json: {}", e);
     }
 
+    // A title left as the file name was picked by the app, not typed by the user.
+    let file_stem = std::path::Path::new(&source_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string);
+    if file_stem.as_deref() == Some(title.as_str()) {
+        let transcript_text = all_transcripts
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        tauri::async_runtime::spawn(crate::summary::title::generate_meeting_title(
+            app.clone(),
+            app_state.db_manager.pool().clone(),
+            meeting_id.clone(),
+            transcript_text,
+            file_stem,
+        ));
+    }
+
     emit_progress(&app, "complete", 100, "Import complete");
 
     Ok(ImportResult {
