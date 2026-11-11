@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tracing::{info, warn};
 
-const MIN_WORDS: usize = 20;
+// Roughly 20 English words, or two or three sentences of Japanese.
+const MIN_CHARS: usize = 80;
 // About 1.5k tokens: enough to find the topic, and small enough that the title
 // does not hold up the built-in model's summary, which shares one sidecar.
 const HEAD_CHARS: usize = 4500;
@@ -78,7 +79,9 @@ fn clean_title(raw: &str) -> Option<String> {
     let visible = clean_llm_markdown_detailed(raw).markdown;
     // Some chat templates open the think block inside the prompt, so the reply
     // is bare reasoning followed by "</think>" and then the answer.
+    // A last marker that opens a block means the reply was cut off mid-reasoning.
     let visible = match THINK_MARKER_REGEX.find_iter(&visible).last() {
+        Some(marker) if !marker.as_str().starts_with("</") => return None,
         Some(marker) => &visible[marker.end()..],
         None => visible.as_str(),
     };
@@ -232,7 +235,8 @@ pub async fn generate_meeting_title<R: Runtime>(
             return;
         }
     }
-    if transcript.split_whitespace().count() < MIN_WORDS {
+    // Counted in characters because Chinese, Japanese and Thai don't separate words with spaces.
+    if transcript.chars().filter(|c| !c.is_whitespace()).count() < MIN_CHARS {
         info!("Auto title skipped for {meeting_id}: transcript too short");
         return;
     }
@@ -295,6 +299,8 @@ mod tests {
         assert_eq!(clean_title("<Add Title here>"), None);
         assert_eq!(clean_title("Meeting 11_11_26_14_05_09"), None);
         assert_eq!(clean_title("<think>long reasoning</think>"), None);
+        // Cut off at the token limit while still reasoning.
+        assert_eq!(clean_title("<think>\nOkay, the user wants a short title. Let me"), None);
     }
 
     #[test]
