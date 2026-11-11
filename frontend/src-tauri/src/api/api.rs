@@ -928,7 +928,7 @@ pub async fn api_save_meeting_title<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_save_transcript<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
@@ -971,6 +971,11 @@ pub async fn api_save_transcript<R: Runtime>(
     }
 
     let pool = state.db_manager.pool();
+    let transcript_text = transcripts_to_save
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
 
     // Now, call the repository with the correctly typed data.
     match TranscriptsRepository::save_transcript(
@@ -986,6 +991,13 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
+            tauri::async_runtime::spawn(crate::summary::title::generate_meeting_title(
+                app.clone(),
+                pool.clone(),
+                meeting_id.clone(),
+                transcript_text,
+                None,
+            ));
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",

@@ -4,6 +4,7 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
 
@@ -115,6 +116,19 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     fetchMeetings();
   }, [serverAddress, fetchMeetings]);
+
+  // Auto titles are generated in the background after a recording is saved.
+  useEffect(() => {
+    const unlisten = listen<{ meeting_id: string; title: string }>('meeting-title-generated', (event) => {
+      fetchMeetings();
+      setCurrentMeeting(prev =>
+        prev?.id === event.payload.meeting_id ? { id: prev.id, title: event.payload.title } : prev
+      );
+    });
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, [fetchMeetings]);
 
   useEffect(() => {
     const fetchSettings = async () => {

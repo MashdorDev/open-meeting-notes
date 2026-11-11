@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 static THINK_ENVELOPE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?is)<think(?:ing)?(?:\s+[^>]*)?>.*?</think(?:ing)?\s*>").unwrap()
 });
-static THINK_MARKER_REGEX: Lazy<Regex> =
+pub(crate) static THINK_MARKER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)</?think(?:ing)?(?:\s+[^>]*)?>").unwrap());
 
 #[derive(Debug, Clone, PartialEq, Eq)]

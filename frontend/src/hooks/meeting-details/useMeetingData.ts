@@ -3,6 +3,7 @@ import { MeetingSummary, Summary, Transcript } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { hasVisibleSummaryContent } from '@/lib/summary-content';
 
@@ -32,6 +33,17 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     console.log('[useMeetingData] Syncing summary data from prop:', summaryData ? 'present' : 'null');
     setAiSummary(summaryData);
   }, [summaryData]); // Only trigger when parent prop changes, not when aiSummary changes
+
+  useEffect(() => {
+    const unlisten = listen<{ meeting_id: string; title: string }>('meeting-title-generated', (event) => {
+      if (event.payload.meeting_id === meeting.id) {
+        setMeetingTitle(event.payload.title);
+      }
+    });
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, [meeting.id]);
 
   const handleSummaryChange = useCallback((newSummary: Summary) => {
     setAiSummary(newSummary);
