@@ -11,7 +11,8 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
-use super::vad::{ContinuousVadProcessor};
+use super::vad::{ContinuousVadProcessor, SpeechSegment};
+use super::speaker_source::SpeakerEnergyTimeline;
 
 /// How long a silence must last before the VAD closes a speech segment, and
 /// therefore how long the audio clips handed to the ASR engine are.
@@ -707,6 +708,8 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Per-window mic/system energy, used to label each segment Me or Others
+    speaker_timeline: SpeakerEnergyTimeline,
 }
 
 impl AudioPipeline {
@@ -785,6 +788,7 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            speaker_timeline: SpeakerEnergyTimeline::default(),
         })
     }
 
@@ -847,6 +851,7 @@ impl AudioPipeline {
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                            self.speaker_timeline.push_window(&mic_window, &sys_window, self.sample_rate);
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
@@ -866,13 +871,7 @@ impl AudioPipeline {
                                             info!("📤 Sending VAD segment: {:.1}ms, {} samples",
                                                   duration_ms, segment.samples.len());
 
-                                            let transcription_chunk = AudioChunk {
-                                                data: segment.samples,
-                                                sample_rate: 16000,
-                                                timestamp: segment.start_timestamp_ms / 1000.0,
-                                                chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone,  // Mixed audio
-                                            };
+                                            let transcription_chunk = self.transcription_chunk(segment);
 
                                             if let Err(e) = self.transcription_sender.send(transcription_chunk) {
                                                 warn!("Failed to send VAD segment: {}", e);
@@ -922,6 +921,26 @@ impl AudioPipeline {
         Ok(())
     }
 
+    /// Builds the chunk sent to transcription. The audio is the mixed signal;
+    /// `device_type` carries which side was speaking (Me = Microphone,
+    /// Others = System).
+    fn transcription_chunk(&self, segment: SpeechSegment) -> AudioChunk {
+        let (source, mic_rms, sys_rms) = self
+            .speaker_timeline
+            .source_for(segment.start_timestamp_ms, segment.end_timestamp_ms);
+        info!(
+            "Segment {:.0}-{:.0}ms labelled {:?} (mic rms {:.4}, system rms {:.4})",
+            segment.start_timestamp_ms, segment.end_timestamp_ms, source, mic_rms, sys_rms
+        );
+        AudioChunk {
+            data: segment.samples,
+            sample_rate: 16000,
+            timestamp: segment.start_timestamp_ms / 1000.0,
+            chunk_id: self.chunk_id_counter,
+            device_type: source,
+        }
+    }
+
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
 
@@ -936,13 +955,7 @@ impl AudioPipeline {
                         info!("📤 Sending final VAD segment to Whisper: {:.1}ms duration, {} samples",
                               duration_ms, segment.samples.len());
 
-                        let transcription_chunk = AudioChunk {
-                            data: segment.samples,
-                            sample_rate: 16000,
-                            timestamp: segment.start_timestamp_ms / 1000.0,
-                            chunk_id: self.chunk_id_counter,
-                            device_type: DeviceType::Microphone,
-                        };
+                        let transcription_chunk = self.transcription_chunk(segment);
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
                             warn!("Failed to send final VAD segment: {}", e);

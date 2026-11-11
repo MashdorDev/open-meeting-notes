@@ -8,7 +8,12 @@ import { ConfidenceIndicator } from "./ConfidenceIndicator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
-import { TranscriptSegmentData } from "@/types";
+import { TranscriptSegmentData, TranscriptSpeaker } from "@/types";
+
+const SPEAKER_LABELS: Record<TranscriptSpeaker, { text: string; className: string }> = {
+    mic: { text: "Me", className: "text-blue-600" },
+    system: { text: "Others", className: "text-emerald-600" },
+};
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -69,6 +74,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     timestamp,
     text,
     confidence,
+    speaker,
     isStreaming,
     showConfidence,
 }: {
@@ -76,10 +82,18 @@ const TranscriptSegment = memo(function TranscriptSegment({
     timestamp: number;
     text: string;
     confidence?: number;
+    speaker?: TranscriptSpeaker;
     isStreaming: boolean;
     showConfidence: boolean;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const label = speaker ? SPEAKER_LABELS[speaker] : undefined;
+    const content = (
+        <p className="text-base text-gray-800 leading-relaxed">
+            {label && <span className={`font-semibold mr-1 ${label.className}`}>{label.text}:</span>}
+            {displayText}
+        </p>
+    );
 
     return (
         <div id={`segment-${id}`} className="mb-3">
@@ -99,10 +113,10 @@ const TranscriptSegment = memo(function TranscriptSegment({
                 <div className="flex-1">
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
-                            <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                            {content}
                         </div>
                     ) : (
-                        <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                        content
                     )}
                 </div>
             </div>
@@ -294,6 +308,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />
@@ -350,6 +365,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />

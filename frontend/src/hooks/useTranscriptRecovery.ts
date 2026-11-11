@@ -11,6 +11,7 @@ import { indexedDBService, MeetingMetadata, StoredTranscript } from '@/services/
 import { storageService } from '@/services/storageService';
 import { applyPinnedSummaryLanguageToMeeting } from '@/lib/summary-language-preferences';
 import { toast } from 'sonner';
+import { toTranscriptSpeaker } from '@/types';
 
 interface AudioRecoveryStatus {
   status: string; // "success" | "partial" | "failed" | "none"
@@ -173,6 +174,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         audio_start_time: (t as any).audio_start_time,
         audio_end_time: (t as any).audio_end_time,
         duration: (t as any).duration,
+        speaker: toTranscriptSpeaker(t.source),
       }));
 
       // 6. Save to backend database using existing save utilities
