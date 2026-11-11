@@ -434,6 +434,17 @@ async fn run_retranscription<R: Runtime>(
         .await
         .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
 
+    // Read the Me/Others labels before the rows are replaced.
+    let old_speakers: Vec<(f64, f64, String)> = sqlx::query_as(
+        "SELECT audio_start_time, audio_end_time, speaker FROM transcripts
+         WHERE meeting_id = ? AND speaker IS NOT NULL
+           AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL",
+    )
+    .bind(&meeting_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| anyhow!("Failed to read existing speakers: {}", e))?;
+
     sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
         .bind(&meeting_id)
         .execute(&mut *tx)
@@ -442,8 +453,8 @@ async fn run_retranscription<R: Runtime>(
 
     for segment in &segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -452,6 +463,12 @@ async fn run_retranscription<R: Runtime>(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(match (segment.audio_start_time, segment.audio_end_time) {
+            (Some(start), Some(end)) => {
+                crate::audio::speaker_source::speaker_by_overlap(&old_speakers, start, end)
+            }
+            _ => None,
+        })
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;

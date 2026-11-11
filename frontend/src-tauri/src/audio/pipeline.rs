@@ -708,8 +708,11 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
-    // Per-window mic/system energy, used to label each segment Me or Others
+    // Per-window mic/system energy and mic-only speech, used to label each
+    // segment Me or Others
     speaker_timeline: SpeakerEnergyTimeline,
+    // Detects speech on the mic channel alone (labelling only, never transcribed)
+    mic_vad: ContinuousVadProcessor,
 }
 
 impl AudioPipeline {
@@ -760,6 +763,7 @@ impl AudioPipeline {
         // are tracked in #756.
         let vad_processor =
             ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+        let mic_vad = ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
         info!(
             "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
             VAD_REDEMPTION_TIME_MS
@@ -789,6 +793,7 @@ impl AudioPipeline {
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
             speaker_timeline: SpeakerEnergyTimeline::default(),
+            mic_vad,
         })
     }
 
@@ -852,6 +857,15 @@ impl AudioPipeline {
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
                             self.speaker_timeline.push_window(&mic_window, &sys_window, self.sample_rate);
+                            match self.mic_vad.process_audio(&mic_window) {
+                                Ok(mic_segments) => {
+                                    for s in mic_segments {
+                                        self.speaker_timeline
+                                            .add_mic_speech(s.start_timestamp_ms, s.end_timestamp_ms);
+                                    }
+                                }
+                                Err(e) => warn!("Mic VAD error: {}", e),
+                            }
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
@@ -925,12 +939,19 @@ impl AudioPipeline {
     /// `device_type` carries which side was speaking (Me = Microphone,
     /// Others = System).
     fn transcription_chunk(&self, segment: SpeechSegment) -> AudioChunk {
-        let (source, mic_rms, sys_rms) = self
-            .speaker_timeline
-            .source_for(segment.start_timestamp_ms, segment.end_timestamp_ms);
+        let (source, evidence) = self.speaker_timeline.source_for(
+            segment.start_timestamp_ms,
+            segment.end_timestamp_ms,
+            self.mic_vad.active_speech_start_ms(),
+        );
         info!(
-            "Segment {:.0}-{:.0}ms labelled {:?} (mic rms {:.4}, system rms {:.4})",
-            segment.start_timestamp_ms, segment.end_timestamp_ms, source, mic_rms, sys_rms
+            "Segment {:.0}-{:.0}ms labelled {:?} (mic rms {:.4}, system rms {:.4}, mic speech {:.0}%)",
+            segment.start_timestamp_ms,
+            segment.end_timestamp_ms,
+            source,
+            evidence.mic_rms,
+            evidence.sys_rms,
+            evidence.mic_speech_share * 100.0
         );
         AudioChunk {
             data: segment.samples,
@@ -943,6 +964,16 @@ impl AudioPipeline {
 
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
+
+        // Close any mic speech still open so the final segments can be labelled
+        match self.mic_vad.flush() {
+            Ok(mic_segments) => {
+                for s in mic_segments {
+                    self.speaker_timeline.add_mic_speech(s.start_timestamp_ms, s.end_timestamp_ms);
+                }
+            }
+            Err(e) => warn!("Failed to flush mic VAD: {}", e),
+        }
 
         // Flush any remaining audio from VAD processor and send segments to transcription
         match self.vad_processor.flush() {

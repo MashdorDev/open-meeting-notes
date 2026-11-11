@@ -164,6 +164,12 @@ impl ContinuousVadProcessor {
         Ok(resampled)
     }
 
+    /// Start of the speech currently in progress, in ms on the VAD timeline.
+    pub fn active_speech_start_ms(&self) -> Option<f64> {
+        self.in_speech
+            .then(|| self.speech_start_sample as f64 * 1000.0 / VAD_SAMPLE_RATE as f64)
+    }
+
     /// Flush any remaining audio and return final speech segments
     pub fn flush(&mut self) -> Result<Vec<SpeechSegment>> {
         debug!("VAD flush: in_speech={}, current_speech_len={}, buffer_len={}, speech_segments_queued={}",
