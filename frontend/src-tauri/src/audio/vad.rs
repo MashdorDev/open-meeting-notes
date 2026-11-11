@@ -117,12 +117,18 @@ impl ContinuousVadProcessor {
     /// Improved resampling from input sample rate to 16kHz with anti-aliasing
     /// Uses linear interpolation and basic low-pass filtering for better quality
     fn resample_to_16k(&self, samples: &[f32]) -> Result<Vec<f32>> {
-        if self.sample_rate == 16000 {
-            return Ok(samples.to_vec());
+        Ok(Self::resample_rate_to_16k(samples, self.sample_rate))
+    }
+
+    /// Stateless form of `resample_to_16k`, also used to cut single-channel
+    /// audio for transcription when both sides talk at once.
+    pub(crate) fn resample_rate_to_16k(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+        if sample_rate == 16000 {
+            return samples.to_vec();
         }
 
         // Calculate downsampling ratio
-        let ratio = self.sample_rate as f64 / 16000.0;
+        let ratio = sample_rate as f64 / 16000.0;
         let output_len = (samples.len() as f64 / ratio) as usize;
         let mut resampled = Vec::with_capacity(output_len);
 
@@ -131,7 +137,7 @@ impl ContinuousVadProcessor {
         let mut filtered_samples = Vec::with_capacity(samples.len());
         
         // Simple moving average filter (basic low-pass)
-        let filter_size = (self.sample_rate as f64 / (cutoff_freq * self.sample_rate as f64)) as usize;
+        let filter_size = (sample_rate as f64 / (cutoff_freq * sample_rate as f64)) as usize;
         let filter_size = std::cmp::max(1, std::cmp::min(filter_size, 5)); // Limit filter size
         
         for i in 0..samples.len() {
@@ -159,9 +165,9 @@ impl ContinuousVadProcessor {
         }
 
         debug!("Resampled from {} samples ({}Hz) to {} samples (16kHz) with anti-aliasing",
-               samples.len(), self.sample_rate, resampled.len());
+               samples.len(), sample_rate, resampled.len());
 
-        Ok(resampled)
+        resampled
     }
 
     /// Start of the speech currently in progress, in ms on the VAD timeline.
