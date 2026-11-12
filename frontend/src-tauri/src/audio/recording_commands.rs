@@ -329,6 +329,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         ));
     }
 
+    // Notify frontend that startup has begun (surfaces STARTING state)
+    app.emit("recording-starting", serde_json::json!({
+        "message": "Recording initialization started"
+    })).map_err(|e| e.to_string())?;
+
     // Validate that transcription models are available before starting recording
     info!("🔍 Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -347,10 +352,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Notify frontend that startup has begun (surfaces STARTING state)
-    app.emit("recording-starting", serde_json::json!({
-        "message": "Recording initialization started"
-    })).map_err(|e| e.to_string())?;
 
     // Load recording preferences to get auto_save AND device preferences
     let (auto_save, preferred_mic_name, preferred_system_name) =
@@ -520,6 +521,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         ));
     }
 
+    // Notify frontend that startup has begun (surfaces STARTING state)
+    app.emit("recording-starting", serde_json::json!({
+        "message": "Recording initialization started"
+    })).map_err(|e| e.to_string())?;
+
     // Validate that transcription models are available before starting recording
     info!("🔍 Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -538,10 +544,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Notify frontend that startup has begun (surfaces STARTING state)
-    app.emit("recording-starting", serde_json::json!({
-        "message": "Recording initialization started"
-    })).map_err(|e| e.to_string())?;
 
     #[cfg(not(target_os = "macos"))]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());

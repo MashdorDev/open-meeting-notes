@@ -1158,7 +1158,7 @@ impl AudioPipelineManager {
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
         mic_and_system: bool,
-    ) -> Result<()> {
+    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
         info!("   Microphone: '{}' ({:?})", mic_device_name, mic_device_kind);
@@ -1166,28 +1166,44 @@ impl AudioPipelineManager {
 
         // Create audio processing channel
         let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
-
-
-        // Create and start pipeline with device information for adaptive mixing
-        let mut pipeline = AudioPipeline::new(
-            audio_receiver,
-            transcription_sender,
-            state.clone(),
-            target_chunk_duration_ms,
-            sample_rate,
-            mic_device_name,
-            mic_device_kind,
-            system_device_name,
-            system_device_kind,
-            mic_and_system,
-        )?;
         state.set_audio_sender(audio_sender.clone());
 
-        // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
-        // This ensures both mic AND system audio are captured in recordings
-        pipeline.recording_sender_for_mixed = recording_sender;
-
+        // Building the VAD and echo-cancellation sessions takes a few hundred
+        // ms. Build them off the async runtime while the capture streams start;
+        // their chunks queue in the unbounded channel until the pipeline runs.
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
+            let built = tokio::task::spawn_blocking(move || {
+                AudioPipeline::new(
+                    audio_receiver,
+                    transcription_sender,
+                    state,
+                    target_chunk_duration_ms,
+                    sample_rate,
+                    mic_device_name,
+                    mic_device_kind,
+                    system_device_name,
+                    system_device_kind,
+                    mic_and_system,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Pipeline setup task failed: {}", e))
+            .and_then(|built| built);
+            let mut pipeline = match built {
+                Ok(pipeline) => {
+                    let _ = ready_sender.send(Ok(()));
+                    pipeline
+                }
+                Err(e) => {
+                    let _ = ready_sender.send(Err(e.to_string()));
+                    return Err(e);
+                }
+            };
+
+            // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
+            // This ensures both mic AND system audio are captured in recordings
+            pipeline.recording_sender_for_mixed = recording_sender;
             pipeline.run().await
         });
 
@@ -1195,7 +1211,7 @@ impl AudioPipelineManager {
         self.audio_sender = Some(audio_sender);
 
         info!("Audio pipeline manager started with mixed audio recording");
-        Ok(())
+        Ok(ready_receiver)
     }
 
     /// Stop the audio pipeline

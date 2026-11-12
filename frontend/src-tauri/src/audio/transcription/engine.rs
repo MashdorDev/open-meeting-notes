@@ -51,7 +51,9 @@ impl TranscriptionEngine {
 // MODEL VALIDATION AND INITIALIZATION
 // ============================================================================
 
-/// Validate that transcription models (Whisper or Parakeet) are ready before starting recording
+/// Validate that transcription models (Whisper or Parakeet) are ready before starting recording.
+/// A Parakeet model is only checked to be downloaded here; the transcription
+/// task loads it (see get_or_init_transcription_engine) while capture runs.
 pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // Check transcript configuration to determine which engine to validate
     let config = match crate::api::api::api_get_transcript_config(
@@ -122,11 +124,13 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 ));
             }
 
-            // Use the validation command that includes auto-discovery and loading
-            // This matches the Whisper behavior for consistency
-            match crate::parakeet_engine::commands::parakeet_validate_model_ready_with_config(app).await {
-                Ok(model_name) => {
-                    info!("✅ Parakeet model validation successful: {} is ready", model_name);
+            match crate::parakeet_engine::commands::parakeet_pick_model_with_config(app).await {
+                Ok(crate::parakeet_engine::commands::ParakeetModelChoice::Loaded(model_name)) => {
+                    info!("✅ Parakeet model validation successful: {} is loaded", model_name);
+                    Ok(())
+                }
+                Ok(crate::parakeet_engine::commands::ParakeetModelChoice::ToLoad(model_name)) => {
+                    info!("✅ Parakeet model validation successful: {} will load in the background", model_name);
                     Ok(())
                 }
                 Err(e) => {
@@ -197,15 +201,12 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
 
             match engine {
                 Some(engine) => {
-                    // Check if model is loaded
-                    if engine.is_model_loaded().await {
-                        let model_name = engine.get_current_model().await
-                            .unwrap_or_else(|| "unknown".to_string());
-                        info!("✅ Parakeet model '{}' already loaded", model_name);
-                        Ok(TranscriptionEngine::Parakeet(engine))
-                    } else {
-                        Err("Parakeet engine initialized but no model loaded. This should not happen after validation.".to_string())
-                    }
+                    // Recording start only checked the model is downloaded;
+                    // load it now while captured audio queues.
+                    let model_name =
+                        crate::parakeet_engine::commands::parakeet_validate_model_ready_with_config(app).await?;
+                    info!("✅ Parakeet model '{}' loaded", model_name);
+                    Ok(TranscriptionEngine::Parakeet(engine))
                 }
                 None => {
                     Err("Parakeet engine not initialized. This should not happen after validation.".to_string())

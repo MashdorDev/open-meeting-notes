@@ -261,7 +261,7 @@ impl RecordingManager {
         // Start the audio processing pipeline with FFmpeg adaptive mixer
         // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
         // 3) Apply VAD and send speech segments to transcription
-        if let Err(error) = self.pipeline_manager.start(
+        let pipeline_ready = match self.pipeline_manager.start(
             self.state.clone(),
             transcription_sender,
             0, // Ignored - using dynamic sizing internally
@@ -273,9 +273,12 @@ impl RecordingManager {
             sys_kind,
             microphone_device.is_some() && system_device.is_some(), // Mic echo cancellation needs both
         ) {
-            self.state.stop_recording();
-            return Err(RecordingStartError::TranscriptionRuntime(error));
-        }
+            Ok(ready) => ready,
+            Err(error) => {
+                self.state.stop_recording();
+                return Err(RecordingStartError::TranscriptionRuntime(error));
+            }
+        };
 
         self.recording_saver.start_accumulation(auto_save, recording_receiver);
         self.recording_saver.set_device_info(
@@ -283,12 +286,22 @@ impl RecordingManager {
             system_device.as_ref().map(|d| d.name.clone())
         );
 
-        // Give the pipeline a moment to fully initialize before starting streams
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
         // Start audio streams - they send RAW unmixed chunks to pipeline for mixing
-        // Pipeline handles mixing and distribution to both recording and transcription
+        // Pipeline handles mixing and distribution to both recording and transcription.
+        // The pipeline is still being built; chunks queue until it runs.
         self.stream_manager.start_streams(microphone_device.clone(), system_device.clone(), None).await?;
+
+        let setup_error = match pipeline_ready.await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some("Audio pipeline setup ended unexpectedly".to_string()),
+        };
+        if let Some(e) = setup_error {
+            let _ = self.stream_manager.stop_streams();
+            let _ = self.pipeline_manager.stop().await;
+            self.state.stop_recording();
+            return Err(RecordingStartError::TranscriptionRuntime(anyhow::anyhow!(e)));
+        }
 
         // Start device monitoring to detect disconnects
         if let Some(ref mut monitor) = self.device_monitor {
