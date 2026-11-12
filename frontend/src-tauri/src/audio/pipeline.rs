@@ -713,8 +713,7 @@ pub struct AudioPipeline {
     /// canceller needs the mic without time-varying gain or limiting.
     mic_normalizer: Option<LoudnessNormalizer>,
     /// Removes speaker playback from the mic, with the system window as the
-    /// reference, before the windows are mixed (macOS).
-    #[cfg(target_os = "macos")]
+    /// reference, before the windows are mixed.
     echo_canceller: Option<super::echo_cancellation::MicEchoCanceller>,
 }
 
@@ -792,7 +791,6 @@ impl AudioPipeline {
         // Needs both sources: the system audio is the canceller's reference.
         // Left on with headphones: with no echo in the mic the model leaves the
         // voice as it is, and the output route can change mid-call.
-        #[cfg(target_os = "macos")]
         let echo_canceller = if !mic_and_system {
             None
         } else if std::env::var("MEETILY_AEC").as_deref() == Ok("off") {
@@ -803,8 +801,6 @@ impl AudioPipeline {
                 .map_err(|e| warn!("🔇 Mic echo cancellation unavailable: {e}"))
                 .ok()
         };
-        #[cfg(not(target_os = "macos"))]
-        let _ = mic_and_system;
 
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
@@ -829,7 +825,6 @@ impl AudioPipeline {
             mic_vad,
             sys_vad,
             mic_normalizer,
-            #[cfg(target_os = "macos")]
             echo_canceller,
         })
     }
@@ -967,15 +962,12 @@ impl AudioPipeline {
         }
     }
 
-    /// Echo cancellation (macOS), then mic loudness normalization, of one
-    /// aligned window, before it is mixed.
+    /// Echo cancellation, then mic loudness normalization, of one aligned
+    /// window, before it is mixed.
     fn condition_mic(&mut self, mic_window: &mut Vec<f32>, sys_window: &mut Vec<f32>) {
-        #[cfg(target_os = "macos")]
         if let Some(aec) = self.echo_canceller.as_mut() {
             aec.process(mic_window, sys_window);
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = sys_window;
         self.normalize_mic(mic_window);
     }
 
@@ -1060,7 +1052,6 @@ impl AudioPipeline {
         }
         // The canceller holds back its last LEAD_MS; release it before the VAD
         // flushes. Stop sends several flush signals: only the first gets audio.
-        #[cfg(target_os = "macos")]
         if let Some((mut mic_window, sys_window)) = self.echo_canceller.as_mut().and_then(|aec| aec.drain()) {
             self.normalize_mic(&mut mic_window);
             self.mix_and_dispatch(&mic_window, &sys_window, 0.0);
