@@ -52,12 +52,6 @@ struct Proposal {
     line: usize,
 }
 
-#[derive(Debug, Deserialize)]
-struct Reply {
-    #[serde(default)]
-    names: Vec<Proposal>,
-}
-
 fn side_of(speaker: &str) -> Option<Side> {
     match speaker {
         "mic" => Some(Side::Me),
@@ -102,8 +96,30 @@ fn numbered_excerpt(lines: &[Line]) -> String {
 
 fn parse_reply(raw: &str) -> Option<Vec<Proposal>> {
     let visible = visible_reply(raw)?;
-    let json = &visible[visible.find('{')?..=visible.rfind('}')?];
-    serde_json::from_str::<Reply>(json).ok().map(|r| r.names)
+    // The first JSON object from the first "{"; text after it is ignored.
+    let value: serde_json::Value = serde_json::Deserializer::from_str(&visible[visible.find('{')?..])
+        .into_iter()
+        .next()?
+        .ok()?;
+    let names = match value.get("names") {
+        Some(serde_json::Value::Array(items)) => items,
+        _ => return Some(Vec::new()),
+    };
+    // A malformed entry ("line": "3", a null name) drops that entry only.
+    Some(
+        names
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name")?.as_str()?.to_string();
+                let line = match item.get("line")? {
+                    serde_json::Value::Number(n) => usize::try_from(n.as_u64()?).ok()?,
+                    serde_json::Value::String(t) => t.trim().parse().ok()?,
+                    _ => return None,
+                };
+                Some(Proposal { name, line })
+            })
+            .collect(),
+    )
 }
 
 /// Words of `text` without surrounding punctuation, as written.
@@ -127,15 +143,20 @@ fn is_self_intro(words: &[String], at: usize, name_len: usize) -> bool {
     let before = |phrase: &[&str]| {
         at >= phrase.len() && words[at - phrase.len()..at].iter().zip(phrase).all(|(w, p)| w == p)
     };
+    // "this is Dan" and "Dan here" introduce the speaker only at the start
+    // of what they say: "is Dan here yet?" asks about someone else.
+    let opens_line = |offset: usize| {
+        offset == 0 || (offset == 1 && ["hi", "hey", "hello", "היי", "שלום"].contains(&words[0].as_str()))
+    };
     before(&["i'm"])
         || before(&["im"])
         || before(&["i", "am"])
         || before(&["my", "name", "is"])
-        || before(&["this", "is"])
+        || (before(&["this", "is"]) && opens_line(at - 2))
         || before(&["אני"])
         || before(&["שמי"])
         || before(&["קוראים", "לי"])
-        || words.get(at + name_len).is_some_and(|w| w == "here")
+        || (opens_line(at) && words.get(at + name_len).is_some_and(|w| w == "here"))
 }
 
 /// Names Dor types are kept as written ("J. R. Smith", "Dr. Cohen"), only
@@ -159,12 +180,16 @@ fn clean_name(name: &str) -> Option<String> {
 /// scripts with case, so "I will" does not back "Will") and that are not a
 /// name Dor introduces himself with. In order, without duplicates.
 fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
-    let own_name = |name_words: &[String]| {
-        lines.iter().filter(|l| l.side == Side::Me).any(|l| {
+    let introduces = |side: Side, name_words: &[String]| {
+        lines.iter().filter(|l| l.side == side).any(|l| {
             let w = lowercase(&raw_words(&l.text));
             find_name(&w, name_words).is_some_and(|at| is_self_intro(&w, at, name_words.len()))
         })
     };
+    // When the other side introduces themselves with it too, it is theirs
+    // ("this is Sarah, our new designer" from Dor, then "I'm Sarah").
+    let own_name =
+        |name_words: &[String]| introduces(Side::Me, name_words) && !introduces(Side::Others, name_words);
 
     let mut accepted: Vec<String> = Vec::new();
     for proposal in proposals {
@@ -345,6 +370,30 @@ mod tests {
     fn the_users_own_name_is_dropped() {
         let lines = vec![me("Hi, I'm Dor."), others("Hi Dor, thanks for joining.")];
         assert!(accept_names(&lines, &[proposal("Dor", 1)]).is_empty());
+    }
+
+    #[test]
+    fn asking_about_someone_is_not_a_self_introduction() {
+        let lines = vec![me("Is Dan here yet?"), others("Hi, I'm Dan.")];
+        assert_eq!(accept_names(&lines, &[proposal("Dan", 1)]), vec!["Dan".to_string()]);
+        let lines = vec![me("Dan here, can you hear me?"), others("Yes, loud and clear, Dan.")];
+        assert!(accept_names(&lines, &[proposal("Dan", 1)]).is_empty());
+    }
+
+    #[test]
+    fn a_person_dor_introduces_who_then_speaks_is_kept() {
+        let lines = vec![me("This is Sarah, our new designer."), others("Hi everyone, I'm Sarah.")];
+        assert_eq!(accept_names(&lines, &[proposal("Sarah", 1)]), vec!["Sarah".to_string()]);
+    }
+
+    #[test]
+    fn replies_with_stray_braces_or_bad_entries_still_parse() {
+        let after = r#"{"names":[{"name":"Sarah","line":3}]} Format used: {name, line}"#;
+        assert_eq!(parse_reply(after).unwrap().len(), 1);
+        assert!(parse_reply("} oops {").is_none());
+        let mixed = r#"{"names":[{"name":"Dan","line":"2"},{"name":null,"line":1},{"name":"Ana","line":4}]}"#;
+        let names: Vec<String> = parse_reply(mixed).unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["Dan".to_string(), "Ana".to_string()]);
     }
 
     #[test]
