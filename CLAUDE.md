@@ -96,7 +96,7 @@ Raw Audio (Mic + System)
 
 **Key Insight**: The pipeline performs **professional audio mixing** (RMS-based ducking, clipping prevention) for recording, while simultaneously applying **Voice Activity Detection (VAD)** to send only speech segments to Whisper for transcription.
 
-**Mic conditioning before the mix**: capture applies only the high-pass filter (and optional RNNoise) to the mic. For each aligned (mic, system) window, the pipeline then runs echo cancellation on macOS (`echo_cancellation.rs`: DTLN-aec, system audio as the reference, only when both sources record; `MEETILY_AEC=off` disables it), and after that the EBU R128 mic loudness normalization. Keep this order: a canceller must see the mic before any time-varying gain or limiting. The canceller delays both tracks by 750 ms: the mic waits 700 ms before the model, so the echo-lag estimator (which runs on the incoming audio) locks onto a delay change before the model reaches that audio. The flush releases that tail once.
+**Mic conditioning before the mix**: capture applies only the high-pass filter (and optional RNNoise) to the mic. For each aligned (mic, system) window, the pipeline then runs echo cancellation (`echo_cancellation.rs`: DTLN-aec, system audio as the reference, only when both sources record; `MEETILY_AEC=off` disables it), and after that the EBU R128 mic loudness normalization. Keep this order: a canceller must see the mic before any time-varying gain or limiting. The canceller delays both tracks by 750 ms: the mic waits 700 ms before the model, so the echo-lag estimator (which runs on the incoming audio) locks onto a delay change before the model reaches that audio. The flush releases that tail once.
 
 ### Audio Device Modularization (Recently Completed)
 
@@ -119,7 +119,7 @@ audio/
 │   └── core_audio.rs          # macOS ScreenCaptureKit integration
 ├── pipeline.rs                # Audio mixing and VAD processing
 ├── echo_cancellation.rs       # macOS: remove speaker playback from the mic
-├── neural_echo.rs             # macOS: DTLN-aec ONNX streaming (models in resources/dtln-aec/)
+├── neural_echo.rs             # DTLN-aec ONNX streaming (models in resources/dtln-aec/)
 ├── recording_manager.rs       # High-level recording coordination
 ├── recording_commands.rs      # Tauri command interface
 └── recording_saver.rs         # Audio file writing
@@ -203,7 +203,7 @@ pub async fn load_model(&self, model_name: &str) -> Result<()> {
 - Ring buffer accumulates samples until both streams have a full window (600 ms), so the two tracks stay aligned sample for sample
 - A stream that is a full window behind the other (stalled, or not recorded) is padded with silence; a flush mixes the remaining samples
 - Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
-- Before mixing, each mic window goes through echo cancellation (macOS) and then loudness normalization
+- Before mixing, each mic window goes through echo cancellation and then loudness normalization
 - Uses `VecDeque` for efficient windowed processing
 
 ### 2. Thread Safety and Async Boundaries
