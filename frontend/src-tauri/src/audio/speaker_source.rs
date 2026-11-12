@@ -34,7 +34,9 @@ const MIN_MIC_SPEECH_SHARE: f64 = 0.5;
 
 /// Share of mic speech above which a segment with active system audio is
 /// treated as both sides talking, as long as the mic is not quieter than the
-/// system channel (quieter mic speech is speaker echo, not the local user).
+/// system channel while the mic hears speech (quieter mic speech is speaker
+/// echo, not the local user). Comparing over the whole segment would count
+/// the user's pauses and lose a short sentence said over a loud video.
 const MIN_OVERLAP_MIC_SPEECH_SHARE: f64 = 0.2;
 
 /// Share of system speech needed for a segment to count as both sides talking.
@@ -71,6 +73,9 @@ pub struct SourceEvidence {
     pub sys_rms: f64,
     pub mic_speech_share: f64,
     pub sys_speech_share: f64,
+    /// Levels over the windows where the mic heard speech.
+    pub mic_rms_in_speech: f64,
+    pub sys_rms_in_speech: f64,
 }
 
 #[derive(Default)]
@@ -153,17 +158,27 @@ impl SpeakerEnergyTimeline {
         mic_speech_since: Option<f64>,
         sys_speech_since: Option<f64>,
     ) -> (Attribution, SourceEvidence) {
-        let (mut mic, mut sys, mut samples) = (0.0, 0.0, 0usize);
-        for w in self.windows.iter().filter(|w| w.end_ms > start_ms && w.start_ms < end_ms) {
-            mic += w.mic_sum_sq;
-            sys += w.sys_sum_sq;
-            samples += w.mic.len().max(w.sys.len());
-        }
-        let (mic_rms, sys_rms) = if samples == 0 {
-            (0.0, 0.0)
-        } else {
-            ((mic / samples as f64).sqrt(), (sys / samples as f64).sqrt())
+        let rms = |windows: &mut dyn Iterator<Item = &Window>| {
+            let (mut mic, mut sys, mut samples) = (0.0, 0.0, 0usize);
+            for w in windows {
+                mic += w.mic_sum_sq;
+                sys += w.sys_sum_sq;
+                samples += w.mic.len().max(w.sys.len());
+            }
+            if samples == 0 {
+                (0.0, 0.0)
+            } else {
+                ((mic / samples as f64).sqrt(), (sys / samples as f64).sqrt())
+            }
         };
+        let in_segment = |w: &&Window| w.end_ms > start_ms && w.start_ms < end_ms;
+        let (mic_rms, sys_rms) = rms(&mut self.windows.iter().filter(in_segment));
+        let mic_speaking = |w: &&Window| {
+            self.mic_speech.iter().any(|&(s, e)| overlap(w.start_ms, w.end_ms, s, e) > 0.0)
+                || mic_speech_since.is_some_and(|since| w.end_ms > since)
+        };
+        let (mic_rms_in_speech, sys_rms_in_speech) =
+            rms(&mut self.windows.iter().filter(in_segment).filter(mic_speaking));
 
         let mic_speech_share =
             speech_share(&self.mic_speech, mic_speech_since, self.elapsed_ms, start_ms, end_ms);
@@ -171,11 +186,18 @@ impl SpeakerEnergyTimeline {
             speech_share(&self.sys_speech, sys_speech_since, self.elapsed_ms, start_ms, end_ms);
         let system_active = sys_rms >= SYSTEM_SILENCE_RMS;
 
-        let evidence = SourceEvidence { mic_rms, sys_rms, mic_speech_share, sys_speech_share };
+        let evidence = SourceEvidence {
+            mic_rms,
+            sys_rms,
+            mic_speech_share,
+            sys_speech_share,
+            mic_rms_in_speech,
+            sys_rms_in_speech,
+        };
         let both_spoke = system_active
             && mic_speech_share >= MIN_OVERLAP_MIC_SPEECH_SHARE
             && sys_speech_share >= MIN_OVERLAP_SYS_SPEECH_SHARE
-            && mic_rms >= sys_rms
+            && mic_rms_in_speech >= sys_rms_in_speech
             && self.covers(start_ms);
         let attribution = if both_spoke {
             Attribution::Split
@@ -330,6 +352,23 @@ mod tests {
         assert_eq!(cut.len(), WINDOW);
         assert_eq!(cut[0], (WINDOW / 2) as f32);
         assert_eq!(t.channel_audio(&DeviceType::System, 0.0, 600.0, RATE).unwrap().len(), WINDOW);
+    }
+
+    #[test]
+    fn a_short_sentence_over_a_loud_video_is_split() {
+        // Seen live: Dor talks for 2.4 of 6 s over a video. Averaged over the
+        // whole segment the mic is quieter than the video, during his speech
+        // it is louder.
+        let mut t = SpeakerEnergyTimeline::default();
+        for i in 0..10 {
+            let mic = if i < 4 { tone(0.09) } else { tone(0.0) };
+            t.push_window(&mic, &tone(0.06), RATE);
+        }
+        t.add_mic_speech(0.0, 2400.0);
+        t.add_sys_speech(0.0, 6000.0);
+        let (attribution, evidence) = t.source_for(0.0, 6000.0, None, None);
+        assert!(evidence.mic_rms < evidence.sys_rms);
+        assert_eq!(attribution, Attribution::Split);
     }
 
     #[test]

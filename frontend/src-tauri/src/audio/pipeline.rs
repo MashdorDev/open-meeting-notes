@@ -951,14 +951,16 @@ impl AudioPipeline {
             self.sys_vad.active_speech_start_ms(),
         );
         info!(
-            "Segment {:.0}-{:.0}ms attributed {:?} (mic rms {:.4}, system rms {:.4}, mic speech {:.0}%, system speech {:.0}%)",
+            "Segment {:.0}-{:.0}ms attributed {:?} (mic rms {:.4}, system rms {:.4}, mic speech {:.0}%, system speech {:.0}%, while mic speaks: mic {:.4} system {:.4})",
             start_ms,
             end_ms,
             attribution,
             evidence.mic_rms,
             evidence.sys_rms,
             evidence.mic_speech_share * 100.0,
-            evidence.sys_speech_share * 100.0
+            evidence.sys_speech_share * 100.0,
+            evidence.mic_rms_in_speech,
+            evidence.sys_rms_in_speech
         );
 
         let parts = match attribution {
