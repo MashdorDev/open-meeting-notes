@@ -34,6 +34,25 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     setAiSummary(summaryData);
   }, [summaryData]); // Only trigger when parent prop changes, not when aiSummary changes
 
+  // Names of the people on the other side, found in the transcript after saving
+  const [otherSpeakerNames, setOtherSpeakerNames] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    setOtherSpeakerNames([]);
+    invokeTauri<string[]>('api_get_meeting_speakers', { meetingId: meeting.id })
+      .then(names => { if (!cancelled) setOtherSpeakerNames(names); })
+      .catch(error => console.error('Failed to load speaker names:', error));
+    const unlisten = listen<{ meeting_id: string; names: string[] }>('meeting-speakers-identified', (event) => {
+      if (event.payload.meeting_id === meeting.id) {
+        setOtherSpeakerNames(event.payload.names);
+      }
+    });
+    return () => {
+      cancelled = true;
+      unlisten.then(fn => fn());
+    };
+  }, [meeting.id]);
+
   useEffect(() => {
     const unlisten = listen<{ meeting_id: string; title: string }>('meeting-title-generated', (event) => {
       if (event.payload.meeting_id === meeting.id) {
@@ -99,6 +118,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
   return {
     // State
     transcripts,
+    otherSpeakerNames,
     meetingTitle,
     aiSummary,
     isSaving,

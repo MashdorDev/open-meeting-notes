@@ -24,6 +24,9 @@ interface TranscriptPanelProps {
   loadedCount?: number;
   onLoadMore?: () => void;
 
+  // Names of the other side, when found in the transcript
+  othersLabel?: string;
+
   // Retranscription props
   meetingId?: string;
   meetingFolderPath?: string | null;
@@ -45,6 +48,7 @@ export function TranscriptPanel({
   totalCount,
   loadedCount,
   onLoadMore,
+  othersLabel,
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
@@ -89,6 +93,7 @@ export function TranscriptPanel({
           isStopping={false}
           enableStreaming={false}
           showConfidence={true}
+          othersLabel={othersLabel}
           disableAutoScroll={disableAutoScroll}
           hasMore={hasMore}
           isLoadingMore={isLoadingMore}

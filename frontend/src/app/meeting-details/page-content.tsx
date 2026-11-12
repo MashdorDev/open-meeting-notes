@@ -215,6 +215,9 @@ export default function PageContent({
               totalCount={totalCount}
               loadedCount={loadedCount}
               onLoadMore={onLoadMore}
+              othersLabel={meetingData.otherSpeakerNames.length > 0
+                ? meetingData.otherSpeakerNames.join(' or ')
+                : undefined}
               meetingId={meeting.id}
               meetingFolderPath={meeting.folder_path}
               onRefetchTranscripts={onRefetchTranscripts}

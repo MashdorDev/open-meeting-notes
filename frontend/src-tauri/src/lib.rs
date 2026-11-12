@@ -732,6 +732,7 @@ pub fn run() {
             api::api_delete_meeting,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
+            api::api_get_meeting_speakers,
             api::api_get_meeting_transcripts,
             api::api_save_meeting_title,
             api::api_save_transcript,

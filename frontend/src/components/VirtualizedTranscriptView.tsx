@@ -28,6 +28,8 @@ export interface VirtualizedTranscriptViewProps {
     isStopping?: boolean;
     /** Enable streaming effect for latest segment */
     enableStreaming?: boolean;
+    /** Label for system-audio lines when the other side's name is known */
+    othersLabel?: string;
     /** Show confidence indicators */
     showConfidence?: boolean;
     /** Completely disable auto-scroll behavior (for meeting details page) */
@@ -75,6 +77,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     text,
     confidence,
     speaker,
+    othersLabel,
     isStreaming,
     showConfidence,
 }: {
@@ -83,14 +86,16 @@ const TranscriptSegment = memo(function TranscriptSegment({
     text: string;
     confidence?: number;
     speaker?: TranscriptSpeaker;
+    othersLabel?: string;
     isStreaming: boolean;
     showConfidence: boolean;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
     const label = speaker ? SPEAKER_LABELS[speaker] : undefined;
+    const labelText = speaker === 'system' && othersLabel ? othersLabel : label?.text;
     const content = (
         <p className="text-base text-gray-800 leading-relaxed">
-            {label && <span className={`font-semibold mr-1 ${label.className}`}>{label.text}:</span>}
+            {label && <span className={`font-semibold mr-1 ${label.className}`}>{labelText}:</span>}
             {displayText}
         </p>
     );
@@ -131,6 +136,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     isProcessing = false,
     isStopping = false,
     enableStreaming = false,
+    othersLabel,
     showConfidence = true,
     disableAutoScroll = false,
     hasMore = false,
@@ -309,6 +315,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
                                         speaker={segment.speaker}
+                                        othersLabel={othersLabel}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />
@@ -366,6 +373,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
                                         speaker={segment.speaker}
+                                        othersLabel={othersLabel}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />

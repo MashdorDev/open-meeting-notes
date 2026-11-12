@@ -814,6 +814,17 @@ pub async fn api_get_meeting<R: Runtime>(
     }
 }
 
+/// Names of the people on the other side of a meeting, found in its transcript.
+#[tauri::command]
+pub async fn api_get_meeting_speakers(
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    crate::summary::speaker_names::get_other_speaker_names(state.db_manager.pool(), &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to read speaker names: {}", e))
+}
+
 /// Get meeting metadata without transcripts (for pagination)
 #[tauri::command]
 pub async fn api_get_meeting_metadata<R: Runtime>(
@@ -998,13 +1009,20 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
-            tauri::async_runtime::spawn(crate::summary::title::generate_meeting_title(
-                app.clone(),
-                pool.clone(),
-                meeting_id.clone(),
-                transcript_text,
-                None,
-            ));
+            // Title first, then names: both use the summary model, which the
+            // built-in AI runs one request at a time.
+            let (app_bg, pool_bg, meeting_bg) = (app.clone(), pool.clone(), meeting_id.clone());
+            tauri::async_runtime::spawn(async move {
+                crate::summary::title::generate_meeting_title(
+                    app_bg.clone(),
+                    pool_bg.clone(),
+                    meeting_bg.clone(),
+                    transcript_text,
+                    None,
+                )
+                .await;
+                crate::summary::speaker_names::identify_other_speakers(app_bg, pool_bg, meeting_bg).await;
+            });
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",
