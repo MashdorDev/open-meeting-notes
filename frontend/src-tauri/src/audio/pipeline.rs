@@ -711,8 +711,9 @@ pub struct AudioPipeline {
     // Per-window mic/system energy and mic-only speech, used to label each
     // segment Me or Others
     speaker_timeline: SpeakerEnergyTimeline,
-    // Detects speech on the mic channel alone (labelling only, never transcribed)
+    // Detect speech on each channel alone (labelling only, never transcribed)
     mic_vad: ContinuousVadProcessor,
+    sys_vad: ContinuousVadProcessor,
 }
 
 impl AudioPipeline {
@@ -764,6 +765,7 @@ impl AudioPipeline {
         let vad_processor =
             ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
         let mic_vad = ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+        let sys_vad = ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
         info!(
             "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
             VAD_REDEMPTION_TIME_MS
@@ -794,6 +796,7 @@ impl AudioPipeline {
             recording_sender_for_mixed: None,  // Will be set by manager
             speaker_timeline: SpeakerEnergyTimeline::default(),
             mic_vad,
+            sys_vad,
         })
     }
 
@@ -865,6 +868,15 @@ impl AudioPipeline {
                                     }
                                 }
                                 Err(e) => warn!("Mic VAD error: {}", e),
+                            }
+                            match self.sys_vad.process_audio(&sys_window) {
+                                Ok(sys_segments) => {
+                                    for s in sys_segments {
+                                        self.speaker_timeline
+                                            .add_sys_speech(s.start_timestamp_ms, s.end_timestamp_ms);
+                                    }
+                                }
+                                Err(e) => warn!("System VAD error: {}", e),
                             }
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
@@ -939,15 +951,17 @@ impl AudioPipeline {
             start_ms,
             end_ms,
             self.mic_vad.active_speech_start_ms(),
+            self.sys_vad.active_speech_start_ms(),
         );
         info!(
-            "Segment {:.0}-{:.0}ms attributed {:?} (mic rms {:.4}, system rms {:.4}, mic speech {:.0}%)",
+            "Segment {:.0}-{:.0}ms attributed {:?} (mic rms {:.4}, system rms {:.4}, mic speech {:.0}%, system speech {:.0}%)",
             start_ms,
             end_ms,
             attribution,
             evidence.mic_rms,
             evidence.sys_rms,
-            evidence.mic_speech_share * 100.0
+            evidence.mic_speech_share * 100.0,
+            evidence.sys_speech_share * 100.0
         );
 
         let parts = match attribution {
@@ -990,6 +1004,14 @@ impl AudioPipeline {
                 }
             }
             Err(e) => warn!("Failed to flush mic VAD: {}", e),
+        }
+        match self.sys_vad.flush() {
+            Ok(sys_segments) => {
+                for s in sys_segments {
+                    self.speaker_timeline.add_sys_speech(s.start_timestamp_ms, s.end_timestamp_ms);
+                }
+            }
+            Err(e) => warn!("Failed to flush system VAD: {}", e),
         }
 
         // Flush any remaining audio from VAD processor and send segments to transcription

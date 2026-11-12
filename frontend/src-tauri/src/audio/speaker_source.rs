@@ -12,7 +12,10 @@
 //! When the local user talks over the other side, transcribing the mix keeps
 //! only one of the two voices, so such segments are split: the raw mic and
 //! system audio of the last minute is kept, and each channel is transcribed
-//! on its own for that stretch.
+//! on its own for that stretch. A split needs speech on both channels (a VAD
+//! runs on the system channel too, so background noise there does not count).
+//! Speaker echo is not removed yet: on laptop speakers, the other side's words
+//! can show up in both lines of a split.
 
 use super::recording_state::DeviceType;
 use std::collections::VecDeque;
@@ -33,6 +36,9 @@ const MIN_MIC_SPEECH_SHARE: f64 = 0.5;
 /// treated as both sides talking, as long as the mic is not quieter than the
 /// system channel (quieter mic speech is speaker echo, not the local user).
 const MIN_OVERLAP_MIC_SPEECH_SHARE: f64 = 0.2;
+
+/// Share of system speech needed for a segment to count as both sides talking.
+const MIN_OVERLAP_SYS_SPEECH_SHARE: f64 = 0.2;
 
 /// Windows and speech intervals older than this behind the newest window are
 /// dropped (about 23 MB of raw audio at 48 kHz). A VAD segment longer than
@@ -64,12 +70,14 @@ pub struct SourceEvidence {
     pub mic_rms: f64,
     pub sys_rms: f64,
     pub mic_speech_share: f64,
+    pub sys_speech_share: f64,
 }
 
 #[derive(Default)]
 pub struct SpeakerEnergyTimeline {
     windows: VecDeque<Window>,
     mic_speech: VecDeque<(f64, f64)>,
+    sys_speech: VecDeque<(f64, f64)>,
     elapsed_ms: f64,
 }
 
@@ -79,6 +87,21 @@ fn sum_sq(samples: &[f32]) -> f64 {
 
 fn overlap(a_start: f64, a_end: f64, b_start: f64, b_end: f64) -> f64 {
     (a_end.min(b_end) - a_start.max(b_start)).max(0.0)
+}
+
+fn speech_share(
+    intervals: &VecDeque<(f64, f64)>,
+    since: Option<f64>,
+    now_ms: f64,
+    start_ms: f64,
+    end_ms: f64,
+) -> f64 {
+    let mut speech_ms: f64 = intervals.iter().map(|&(s, e)| overlap(start_ms, end_ms, s, e)).sum();
+    if let Some(since) = since {
+        speech_ms += overlap(start_ms, end_ms, since, now_ms);
+    }
+    let duration = end_ms - start_ms;
+    if duration > 0.0 { (speech_ms / duration).min(1.0) } else { 0.0 }
 }
 
 impl SpeakerEnergyTimeline {
@@ -103,8 +126,10 @@ impl SpeakerEnergyTimeline {
         while self.windows.front().is_some_and(|w| w.end_ms < cutoff) {
             self.windows.pop_front();
         }
-        while self.mic_speech.front().is_some_and(|&(_, end)| end < cutoff) {
-            self.mic_speech.pop_front();
+        for speech in [&mut self.mic_speech, &mut self.sys_speech] {
+            while speech.front().is_some_and(|&(_, end)| end < cutoff) {
+                speech.pop_front();
+            }
         }
     }
 
@@ -113,13 +138,20 @@ impl SpeakerEnergyTimeline {
         self.mic_speech.push_back((start_ms, end_ms));
     }
 
+    /// Records a finished stretch of speech heard on the system audio alone.
+    pub fn add_sys_speech(&mut self, start_ms: f64, end_ms: f64) {
+        self.sys_speech.push_back((start_ms, end_ms));
+    }
+
     /// Picks the attribution for a segment spanning `[start_ms, end_ms)`.
-    /// `mic_speech_since` is the start of mic speech still in progress, if any.
+    /// `mic_speech_since` and `sys_speech_since` are the starts of speech
+    /// still in progress on each channel, if any.
     pub fn source_for(
         &self,
         start_ms: f64,
         end_ms: f64,
         mic_speech_since: Option<f64>,
+        sys_speech_since: Option<f64>,
     ) -> (Attribution, SourceEvidence) {
         let (mut mic, mut sys, mut samples) = (0.0, 0.0, 0usize);
         for w in self.windows.iter().filter(|w| w.end_ms > start_ms && w.start_ms < end_ms) {
@@ -133,21 +165,16 @@ impl SpeakerEnergyTimeline {
             ((mic / samples as f64).sqrt(), (sys / samples as f64).sqrt())
         };
 
-        let mut speech_ms: f64 = self
-            .mic_speech
-            .iter()
-            .map(|&(s, e)| overlap(start_ms, end_ms, s, e))
-            .sum();
-        if let Some(since) = mic_speech_since {
-            speech_ms += overlap(start_ms, end_ms, since, self.elapsed_ms);
-        }
-        let duration = end_ms - start_ms;
-        let mic_speech_share = if duration > 0.0 { (speech_ms / duration).min(1.0) } else { 0.0 };
-
-        let evidence = SourceEvidence { mic_rms, sys_rms, mic_speech_share };
+        let mic_speech_share =
+            speech_share(&self.mic_speech, mic_speech_since, self.elapsed_ms, start_ms, end_ms);
+        let sys_speech_share =
+            speech_share(&self.sys_speech, sys_speech_since, self.elapsed_ms, start_ms, end_ms);
         let system_active = sys_rms >= SYSTEM_SILENCE_RMS;
+
+        let evidence = SourceEvidence { mic_rms, sys_rms, mic_speech_share, sys_speech_share };
         let both_spoke = system_active
             && mic_speech_share >= MIN_OVERLAP_MIC_SPEECH_SHARE
+            && sys_speech_share >= MIN_OVERLAP_SYS_SPEECH_SHARE
             && mic_rms >= sys_rms
             && self.covers(start_ms);
         let attribution = if both_spoke {
@@ -198,13 +225,25 @@ impl SpeakerEnergyTimeline {
 
 /// Carries speaker labels over to re-segmented lines (retranscription keeps
 /// only the mixed audio, so labels cannot be rebuilt from it). Each new line
-/// takes the label of the old line it overlaps most.
+/// takes the label whose old lines overlap it for the longest total time.
+/// Ties (a split, where both sides cover the same range) go to the other
+/// side, so the result does not depend on row order.
 pub fn speaker_by_overlap(old: &[(f64, f64, String)], start: f64, end: f64) -> Option<String> {
-    old.iter()
-        .map(|(s, e, speaker)| (overlap(start, end, *s, *e), speaker))
-        .filter(|(o, _)| *o > 0.0)
-        .max_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, speaker)| speaker.clone())
+    let mut totals: Vec<(&str, f64)> = Vec::new();
+    for (s, e, speaker) in old {
+        let o = overlap(start, end, *s, *e);
+        if o <= 0.0 {
+            continue;
+        }
+        match totals.iter_mut().find(|(name, _)| *name == speaker.as_str()) {
+            Some((_, total)) => *total += o,
+            None => totals.push((speaker.as_str(), o)),
+        }
+    }
+    totals
+        .into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| (a.0 == "system").cmp(&(b.0 == "system"))))
+        .map(|(speaker, _)| speaker.to_string())
 }
 
 #[cfg(test)]
@@ -219,7 +258,7 @@ mod tests {
     }
 
     fn label(t: &SpeakerEnergyTimeline, start: f64, end: f64) -> Attribution {
-        t.source_for(start, end, None).0
+        t.source_for(start, end, None, None).0
     }
 
     const MIC: Attribution = Attribution::Single(DeviceType::Microphone);
@@ -256,7 +295,17 @@ mod tests {
         let mut t = SpeakerEnergyTimeline::default();
         t.push_window(&tone(0.09), &tone(0.025), RATE);
         t.add_mic_speech(0.0, 600.0);
+        t.add_sys_speech(0.0, 600.0);
         assert_eq!(label(&t, 0.0, 600.0), Attribution::Split);
+    }
+
+    #[test]
+    fn talking_over_background_noise_is_mic() {
+        // The other side is unmuted with a fan running: audible, but not speech.
+        let mut t = SpeakerEnergyTimeline::default();
+        t.push_window(&tone(0.09), &tone(0.006), RATE);
+        t.add_mic_speech(0.0, 600.0);
+        assert_eq!(label(&t, 0.0, 600.0), MIC);
     }
 
     #[test]
@@ -266,6 +315,7 @@ mod tests {
             t.push_window(&tone(0.06), &tone(0.04), RATE);
         }
         t.add_mic_speech(0.0, 800.0); // 800 of 3000 ms
+        t.add_sys_speech(0.0, 3000.0);
         assert_eq!(label(&t, 0.0, 3000.0), Attribution::Split);
     }
 
@@ -289,6 +339,7 @@ mod tests {
             t.push_window(&tone(0.09), &tone(0.025), RATE);
         }
         t.add_mic_speech(0.0, 120_000.0);
+        t.add_sys_speech(0.0, 120_000.0);
         assert!(t.channel_audio(&DeviceType::Microphone, 0.0, 600.0, RATE).is_none());
         assert_ne!(label(&t, 0.0, 600.0), Attribution::Split);
     }
@@ -308,7 +359,7 @@ mod tests {
         let mut t = SpeakerEnergyTimeline::default();
         t.push_window(&tone(0.1), &tone(0.0), RATE);
         t.push_window(&tone(0.1), &tone(0.0), RATE);
-        assert_eq!(t.source_for(0.0, 1200.0, Some(100.0)).0, MIC);
+        assert_eq!(t.source_for(0.0, 1200.0, Some(100.0), None).0, MIC);
     }
 
     #[test]
@@ -336,6 +387,21 @@ mod tests {
         assert_eq!(speaker_by_overlap(&old, 3.5, 6.0).as_deref(), Some("mic"));
         assert_eq!(speaker_by_overlap(&old, 0.5, 4.5).as_deref(), Some("system"));
         assert_eq!(speaker_by_overlap(&old, 7.0, 8.0), None);
+    }
+
+    #[test]
+    fn retranscribed_label_sums_overlap_per_speaker() {
+        let old = vec![
+            (0.0, 3.0, "system".to_string()),
+            (3.0, 6.0, "system".to_string()),
+            (6.0, 10.0, "mic".to_string()),
+        ];
+        assert_eq!(speaker_by_overlap(&old, 0.0, 10.0).as_deref(), Some("system"));
+        // A split row pair ties: the label does not depend on row order.
+        let split_a = vec![(0.0, 4.0, "mic".to_string()), (0.0, 4.0, "system".to_string())];
+        let split_b = vec![(0.0, 4.0, "system".to_string()), (0.0, 4.0, "mic".to_string())];
+        assert_eq!(speaker_by_overlap(&split_a, 0.0, 4.0).as_deref(), Some("system"));
+        assert_eq!(speaker_by_overlap(&split_b, 0.0, 4.0).as_deref(), Some("system"));
     }
 
     #[test]
