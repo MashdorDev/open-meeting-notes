@@ -1,3 +1,11 @@
+/** Who spoke a transcript line: the local user (mic) or the other side (system audio). */
+export type TranscriptSpeaker = 'mic' | 'system';
+
+/** Maps the `source` field of a transcript-update event to a speaker. */
+export function toTranscriptSpeaker(source?: string): TranscriptSpeaker | undefined {
+  return source === 'mic' || source === 'system' ? source : undefined;
+}
+
 export interface Message {
   id: string;
   content: string;
@@ -16,6 +24,7 @@ export interface Transcript {
   audio_start_time?: number; // Seconds from recording start (e.g., 125.3)
   audio_end_time?: number;   // Seconds from recording start (e.g., 128.6)
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
+  speaker?: TranscriptSpeaker;
 }
 
 export interface TranscriptUpdate {
@@ -141,4 +150,5 @@ export interface TranscriptSegmentData {
   endTime?: number; // audio_end_time in seconds
   text: string;
   confidence?: number;
+  speaker?: TranscriptSpeaker;
 }
