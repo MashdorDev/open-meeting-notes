@@ -290,8 +290,10 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
           });
           setIsProcessing(false);
 
-          if (event.payload.phase === 'active') {
-            console.log('Calling onRecordingStop(false) due to active transcription error');
+          // Only a failed model load ends the recording (the backend stops it
+          // too); a single chunk that fails to transcribe does not.
+          if (event.payload.phase === 'active' && event.payload.actionable) {
+            console.log('Calling onRecordingStop(false) due to transcription init failure');
             onRecordingStop(false);
           }
 
