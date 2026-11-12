@@ -218,6 +218,8 @@ export default function PageContent({
               othersLabel={meetingData.otherSpeakerNames.length > 0
                 ? meetingData.otherSpeakerNames.join(' or ')
                 : undefined}
+              otherSpeakerNames={meetingData.otherSpeakerNames}
+              onSaveOtherSpeakerNames={meetingData.saveOtherSpeakerNames}
               meetingId={meeting.id}
               meetingFolderPath={meeting.folder_path}
               onRefetchTranscripts={onRefetchTranscripts}

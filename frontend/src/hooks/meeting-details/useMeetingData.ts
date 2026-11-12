@@ -115,10 +115,21 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     setCurrentMeeting({ id: meeting.id, title: newTitle });
   }, [meeting.id, sidebarMeetings, setMeetings, setCurrentMeeting]);
 
+  const saveOtherSpeakerNames = useCallback(async (names: string[]) => {
+    try {
+      const saved = await invokeTauri<string[]>('api_set_meeting_speakers', { meetingId: meeting.id, names });
+      setOtherSpeakerNames(saved);
+    } catch (error) {
+      console.error('Failed to save speaker names:', error);
+      toast.error('Could not save the name', { description: String(error) });
+    }
+  }, [meeting.id]);
+
   return {
     // State
     transcripts,
     otherSpeakerNames,
+    saveOtherSpeakerNames,
     meetingTitle,
     aiSummary,
     isSaving,

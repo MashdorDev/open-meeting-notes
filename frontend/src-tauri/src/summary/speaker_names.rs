@@ -1,10 +1,12 @@
 //! Finds the names of the people on the other side of a call from what is
 //! said in it ("I'm Sarah", "thanks, Dan"), after the transcript is saved.
 //!
-//! The model only proposes names with the line they come from. A name is kept
-//! only if that line really contains it, and only as a self-introduction on
-//! an Others line or as Dor addressing someone on a Me line that the other
-//! side answers. Mentions of third people ("I talked to John") are dropped.
+//! The model proposes names with the line each comes from. Whether a name
+//! addresses or introduces someone is left to the model: word rules for that
+//! kept rejecting real addresses or passing mentions. Only cheap facts are
+//! checked here (the quoted line contains the name, it is not Dor's own
+//! name), and the meeting page lets Dor rename or clear the result. A name Dor
+//! set by hand is never replaced by a later automatic pass.
 
 use crate::summary::title::{ask_llm, visible_reply};
 use serde::{Deserialize, Serialize};
@@ -17,14 +19,6 @@ const HEAD_CHARS: usize = 4500;
 const TAIL_CHARS: usize = 1500;
 const MAX_NAME_CHARS: usize = 40;
 const MAX_NAMES: usize = 5;
-// Lines after a Me line in which the other side has to answer.
-const REPLY_WINDOW: usize = 2;
-// Words right before a name that address that person ("thanks Dan").
-const GREETINGS: &[&str] = &[
-    "hi", "hey", "hello", "morning", "afternoon", "evening", "thanks", "bye", "welcome", "cheers",
-    "היי", "שלום", "תודה", "ביי", "בוקר",
-];
-const GREETING_PAIRS: &[(&str, &str)] = &[("thank", "you"), ("meet", "you"), ("see", "you")];
 
 const SYSTEM_PROMPT: &str = "You find the names of the people on the other side of a call. \
 Each transcript line is numbered and starts with Me: (the user) or Others: (the other side). \
@@ -112,36 +106,16 @@ fn parse_reply(raw: &str) -> Option<Vec<Proposal>> {
     serde_json::from_str::<Reply>(json).ok().map(|r| r.names)
 }
 
-/// Lowercased words of `text` without surrounding punctuation.
-fn words(text: &str) -> Vec<String> {
-    tokens(text).into_iter().map(|t| t.word).collect()
-}
-
-struct Token {
-    /// Lowercased, without surrounding punctuation.
-    word: String,
-    /// Starts with a capital letter, or is in a script without case (Hebrew).
-    capital: bool,
-    /// Followed by a comma, question mark or exclamation mark.
-    ends_clause: bool,
-    /// Followed by a full stop, question mark or exclamation mark.
-    ends_sentence: bool,
-}
-
-fn tokens(text: &str) -> Vec<Token> {
+/// Words of `text` without surrounding punctuation, as written.
+fn raw_words(text: &str) -> Vec<&str> {
     text.split_whitespace()
-        .filter_map(|raw| {
-            let core = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
-            let first = core.chars().next()?;
-            let tail = raw.trim_end_matches(|c: char| c == '"' || c == '\'' || c == ')');
-            Some(Token {
-                word: core.to_lowercase(),
-                capital: !first.is_lowercase(),
-                ends_clause: tail.ends_with([',', '?', '!']),
-                ends_sentence: tail.ends_with(['.', '?', '!']),
-            })
-        })
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\''))
+        .filter(|w| !w.is_empty())
         .collect()
+}
+
+fn lowercase(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_lowercase()).collect()
 }
 
 /// Position of the name's words inside `words`, if they appear in order.
@@ -164,48 +138,6 @@ fn is_self_intro(words: &[String], at: usize, name_len: usize) -> bool {
         || words.get(at + name_len).is_some_and(|w| w == "here")
 }
 
-/// The name at `at..at + len` speaks to someone: "Dan, ...", "... Dan?" as a
-/// sentence of its own, "thanks Dan", or "that works, Dan" at the end.
-fn is_vocative(t: &[Token], at: usize, len: usize) -> bool {
-    let last = at + len - 1;
-    let line_end = last + 1 == t.len();
-    let sentence_start = at == 0 || t[at - 1].ends_sentence;
-    let greeted = (at >= 1 && GREETINGS.contains(&t[at - 1].word.as_str()))
-        || (at >= 2 && GREETING_PAIRS.contains(&(t[at - 2].word.as_str(), t[at - 1].word.as_str())));
-    let leads = sentence_start && (t[last].ends_clause || t[last].ends_sentence || line_end);
-    let trails = line_end && at >= 1 && t[at - 1].ends_clause;
-    greeted || leads || trails
-}
-
-/// Whether the name at `at..at + len` on line `idx` names the other side.
-fn backed(lines: &[Line], idx: usize, at: usize, len: usize) -> bool {
-    let t = tokens(&lines[idx].text);
-    // A lowercase "will" or "may" is a word, not a name.
-    if !t[at].capital {
-        return false;
-    }
-    let w: Vec<String> = t.iter().map(|t| t.word.clone()).collect();
-    match lines[idx].side {
-        Side::Others => is_self_intro(&w, at, len),
-        Side::Me => {
-            let answered = lines[idx + 1..].iter().take(REPLY_WINDOW).any(|l| l.side == Side::Others);
-            answered && !is_self_intro(&w, at, len) && is_vocative(&t, at, len)
-        }
-    }
-}
-
-/// Cheap check before asking the model: does any word sit where a name of
-/// the other side could? Most calls have no introductions or greetings by
-/// name, and the model call would hold up the summary.
-fn has_name_candidates(lines: &[Line]) -> bool {
-    lines.iter().enumerate().any(|(idx, line)| {
-        let t = tokens(&line.text);
-        (0..t.len()).any(|at| {
-            t[at].word.chars().all(char::is_alphabetic) && t[at].word != "i" && backed(lines, idx, at, 1)
-        })
-    })
-}
-
 fn clean_name(name: &str) -> Option<String> {
     let name = name.trim().trim_matches(|c: char| !c.is_alphanumeric());
     let ok = !name.is_empty()
@@ -215,12 +147,13 @@ fn clean_name(name: &str) -> Option<String> {
     ok.then(|| name.to_string())
 }
 
-/// Keeps the proposals the transcript backs up, in order, without duplicates.
+/// Keeps proposals whose quoted line holds the name (capitalised there, in
+/// scripts with case, so "I will" does not back "Will") and that are not a
+/// name Dor introduces himself with. In order, without duplicates.
 fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
-    // Names Dor introduces himself with are his own, never the other side's.
     let own_name = |name_words: &[String]| {
         lines.iter().filter(|l| l.side == Side::Me).any(|l| {
-            let w = words(&l.text);
+            let w = lowercase(&raw_words(&l.text));
             find_name(&w, name_words).is_some_and(|at| is_self_intro(&w, at, name_words.len()))
         })
     };
@@ -229,14 +162,16 @@ fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
     for proposal in proposals {
         let Some(name) = clean_name(&proposal.name) else { continue };
         let Some(line) = lines.get(proposal.line) else { continue };
-        let name_words = words(&name);
-        let Some(at) = find_name(&words(&line.text), &name_words) else { continue };
-        if !backed(lines, proposal.line, at, name_words.len()) || own_name(&name_words) {
+        let name_words = lowercase(&raw_words(&name));
+        let written = raw_words(&line.text);
+        let Some(at) = find_name(&lowercase(&written), &name_words) else { continue };
+        let capitalised = written[at].chars().next().is_some_and(|c| !c.is_lowercase());
+        if !capitalised || own_name(&name_words) {
             continue;
         }
         // "Ana" and "Ana Silva" are the same person.
         let same_person = |a: &String| {
-            let a = words(a);
+            let a = lowercase(&raw_words(a));
             find_name(&a, &name_words).is_some() || find_name(&name_words, &a).is_some()
         };
         if !accepted.iter().any(same_person) {
@@ -274,7 +209,8 @@ async fn ensure_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS meeting_speaker_names (
             meeting_id TEXT PRIMARY KEY,
-            names TEXT NOT NULL
+            names TEXT NOT NULL,
+            edited INTEGER NOT NULL DEFAULT 0
         )",
     )
     .execute(pool)
@@ -292,6 +228,37 @@ pub async fn get_other_speaker_names(pool: &SqlitePool, meeting_id: &str) -> Res
     Ok(stored.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default())
 }
 
+/// Names Dor typed on the meeting page. An empty list clears the label but
+/// still marks the meeting as edited, so an automatic pass will not refill it.
+pub async fn set_other_speaker_names(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    names: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let names: Vec<String> = names.iter().filter_map(|n| clean_name(n)).take(MAX_NAMES).collect();
+    ensure_table(pool).await?;
+    sqlx::query("INSERT OR REPLACE INTO meeting_speaker_names (meeting_id, names, edited) VALUES (?, ?, 1)")
+        .bind(meeting_id)
+        .bind(serde_json::to_string(&names).unwrap_or_default())
+        .execute(pool)
+        .await?;
+    Ok(names)
+}
+
+/// Stores names found automatically, unless Dor already set them by hand.
+async fn store_found_names(pool: &SqlitePool, meeting_id: &str, names: &[String]) -> Result<bool, sqlx::Error> {
+    ensure_table(pool).await?;
+    let stored = sqlx::query(
+        "INSERT INTO meeting_speaker_names (meeting_id, names, edited) VALUES (?, ?, 0)
+         ON CONFLICT(meeting_id) DO UPDATE SET names = excluded.names WHERE edited = 0",
+    )
+    .bind(meeting_id)
+    .bind(serde_json::to_string(names).unwrap_or_default())
+    .execute(pool)
+    .await?;
+    Ok(stored.rows_affected() > 0)
+}
+
 /// Finds and stores the other side's names for a saved meeting. Failures are
 /// logged and otherwise ignored: the lines just stay labelled "Others".
 pub async fn identify_other_speakers<R: Runtime>(app: AppHandle<R>, pool: SqlitePool, meeting_id: String) {
@@ -302,7 +269,7 @@ pub async fn identify_other_speakers<R: Runtime>(app: AppHandle<R>, pool: Sqlite
             return;
         }
     };
-    if !lines.iter().any(|l| l.side == Side::Others) || !has_name_candidates(&lines) {
+    if !lines.iter().any(|l| l.side == Side::Others) {
         return;
     }
 
@@ -325,19 +292,11 @@ pub async fn identify_other_speakers<R: Runtime>(app: AppHandle<R>, pool: Sqlite
         return;
     }
 
-    let saved = match ensure_table(&pool).await {
-        Ok(()) => sqlx::query("INSERT OR REPLACE INTO meeting_speaker_names (meeting_id, names) VALUES (?, ?)")
-            .bind(&meeting_id)
-            .bind(serde_json::to_string(&names).unwrap_or_default())
-            .execute(&pool)
-            .await
-            .map(|_| ()),
-        Err(e) => Err(e),
-    };
-    match saved {
-        Ok(()) => {
+    match store_found_names(&pool, &meeting_id, &names).await {
+        Ok(true) => {
             let _ = app.emit("meeting-speakers-identified", MeetingSpeakersIdentified { meeting_id, names });
         }
+        Ok(false) => info!("Speaker names for {meeting_id}: kept the names set by hand"),
         Err(e) => warn!("Speaker names for {meeting_id}: failed to save: {e}"),
     }
 }
@@ -357,33 +316,16 @@ mod tests {
     }
 
     #[test]
-    fn self_introduction_on_the_other_side_is_kept() {
-        let lines = vec![me("Hello?"), others("Hi, this is Sarah from finance."), me("Great.")];
+    fn a_name_in_the_quoted_line_is_kept() {
+        let lines = vec![me("Hello?"), others("Hi, this is Sarah from finance."), me("Okay Sarah let's start")];
         assert_eq!(accept_names(&lines, &[proposal("Sarah", 1)]), vec!["Sarah"]);
+        assert_eq!(accept_names(&lines, &[proposal("Sarah", 2)]), vec!["Sarah"]);
     }
 
     #[test]
-    fn addressing_someone_who_answers_is_kept() {
-        let lines = vec![me("Dan, what do you think?"), others("I think we should wait.")];
-        assert_eq!(accept_names(&lines, &[proposal("Dan", 0)]), vec!["Dan"]);
-        let lines = vec![me("That works, thanks Dan."), others("Sure.")];
-        assert_eq!(accept_names(&lines, &[proposal("Dan", 0)]), vec!["Dan"]);
-    }
-
-    #[test]
-    fn people_only_talked_about_are_dropped() {
-        let lines = vec![me("I spoke with John about the budget yesterday afternoon."), others("Okay.")];
-        assert!(accept_names(&lines, &[proposal("John", 0)]).is_empty());
-        for (line, name) in [
-            ("So John called me about the contract", "John"),
-            ("I'll check with Sarah", "Sarah"),
-            ("Did Mark send it?", "Mark"),
-        ] {
-            let lines = vec![me(line), others("Not yet.")];
-            assert!(accept_names(&lines, &[proposal(name, 0)]).is_empty(), "{line}");
-        }
-        let lines = vec![others("Honestly it's John who decides."), me("Right.")];
-        assert!(accept_names(&lines, &[proposal("John", 0)]).is_empty());
+    fn misquoted_proposals_are_dropped() {
+        let lines = vec![others("This is Sarah."), me("Hi.")];
+        assert!(accept_names(&lines, &[proposal("Maria", 0), proposal("Sarah", 7)]).is_empty());
     }
 
     #[test]
@@ -393,43 +335,20 @@ mod tests {
     }
 
     #[test]
-    fn calls_without_candidates_skip_the_model() {
-        let lines = vec![me("So what about pricing?"), others("Too high for small teams."), me("Let's ask Maria from sales."), others("Good idea.")];
-        assert!(!has_name_candidates(&lines));
-        let lines = vec![me("Hello?"), others("Hi, this is Sarah.")];
-        assert!(has_name_candidates(&lines));
-        let lines = vec![me("Nice. Dan, did you see the report?"), others("Yes.")];
-        assert!(has_name_candidates(&lines));
-        let lines = vec![others("Maybe ask Lisa about the budget next week."), me("Sure.")];
-        assert!(accept_names(&lines, &[proposal("Lisa", 0)]).is_empty());
-    }
-
-    #[test]
-    fn the_other_side_greeting_the_user_does_not_name_them() {
+    fn the_users_own_name_is_dropped() {
         let lines = vec![me("Hi, I'm Dor."), others("Hi Dor, thanks for joining.")];
         assert!(accept_names(&lines, &[proposal("Dor", 1)]).is_empty());
-        // Even when the model points at a line where Dor is addressed.
-        let lines = vec![me("Hi, I'm Dor."), others("Nice."), me("Dor here, can you hear me?"), others("Yes.")];
-        assert!(accept_names(&lines, &[proposal("Dor", 2)]).is_empty());
-    }
-
-    #[test]
-    fn unanswered_or_misquoted_proposals_are_dropped() {
-        let lines = vec![me("Thanks Dan."), me("Anyway.")];
-        assert!(accept_names(&lines, &[proposal("Dan", 0)]).is_empty());
-        let lines = vec![others("This is Sarah."), me("Hi.")];
-        assert!(accept_names(&lines, &[proposal("Maria", 0), proposal("Sarah", 7)]).is_empty());
     }
 
     #[test]
     fn names_are_cleaned_and_deduplicated() {
         let lines = vec![others("I'm Ana Silva."), me("Ana, welcome."), others("Thanks.")];
-        let names = accept_names(&lines, &[proposal(" Ana Silva ", 0), proposal("ana", 1), proposal("<x>", 0)]);
+        let names = accept_names(&lines, &[proposal(" Ana Silva ", 0), proposal("Ana", 1), proposal("<x>", 0)]);
         assert_eq!(names, vec!["Ana Silva"]);
     }
 
     #[test]
-    fn hebrew_self_introduction_is_kept() {
+    fn hebrew_names_are_kept() {
         let lines = vec![me("שלום"), others("היי, אני דנה מהשיווק")];
         assert_eq!(accept_names(&lines, &[proposal("דנה", 1)]), vec!["דנה"]);
     }
@@ -452,5 +371,25 @@ mod tests {
         assert!(excerpt.starts_with("[0] Others: This is Sarah."));
         assert!(excerpt.ends_with("[399] Me: Thanks Sarah, bye."));
         assert!(excerpt.contains("[...]"));
+    }
+
+    #[tokio::test]
+    async fn names_set_by_hand_survive_an_automatic_pass() {
+        // One connection: each in-memory connection is its own database.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        assert!(store_found_names(&pool, "m1", &["Sarah".to_string()]).await.unwrap());
+        assert_eq!(get_other_speaker_names(&pool, "m1").await.unwrap(), vec!["Sarah"]);
+        // Dor corrects it; a retranscription then finds "Sara" again.
+        set_other_speaker_names(&pool, "m1", &["Sarah Cohen".to_string()]).await.unwrap();
+        assert!(!store_found_names(&pool, "m1", &["Sara".to_string()]).await.unwrap());
+        assert_eq!(get_other_speaker_names(&pool, "m1").await.unwrap(), vec!["Sarah Cohen"]);
+        // Clearing by hand also sticks.
+        set_other_speaker_names(&pool, "m1", &[]).await.unwrap();
+        assert!(!store_found_names(&pool, "m1", &["Sara".to_string()]).await.unwrap());
+        assert!(get_other_speaker_names(&pool, "m1").await.unwrap().is_empty());
     }
 }

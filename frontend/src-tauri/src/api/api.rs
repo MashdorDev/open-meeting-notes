@@ -825,6 +825,18 @@ pub async fn api_get_meeting_speakers(
         .map_err(|e| format!("Failed to read speaker names: {}", e))
 }
 
+/// Names Dor sets or clears on the meeting page; automatic passes keep them.
+#[tauri::command]
+pub async fn api_set_meeting_speakers(
+    meeting_id: String,
+    names: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    crate::summary::speaker_names::set_other_speaker_names(state.db_manager.pool(), &meeting_id, &names)
+        .await
+        .map_err(|e| format!("Failed to save speaker names: {}", e))
+}
+
 /// Get meeting metadata without transcripts (for pagination)
 #[tauri::command]
 pub async fn api_get_meeting_metadata<R: Runtime>(
