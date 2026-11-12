@@ -17,11 +17,14 @@ const HEAD_CHARS: usize = 4500;
 const TAIL_CHARS: usize = 1500;
 const MAX_NAME_CHARS: usize = 40;
 const MAX_NAMES: usize = 5;
-// Words from the start or end of a Me line where a name addresses someone.
-const VOCATIVE_LEAD_WORDS: usize = 3;
-const VOCATIVE_TAIL_WORDS: usize = 2;
 // Lines after a Me line in which the other side has to answer.
 const REPLY_WINDOW: usize = 2;
+// Words right before a name that address that person ("thanks Dan").
+const GREETINGS: &[&str] = &[
+    "hi", "hey", "hello", "morning", "afternoon", "evening", "thanks", "bye", "welcome", "cheers",
+    "היי", "שלום", "תודה", "ביי", "בוקר",
+];
+const GREETING_PAIRS: &[(&str, &str)] = &[("thank", "you"), ("meet", "you"), ("see", "you")];
 
 const SYSTEM_PROMPT: &str = "You find the names of the people on the other side of a call. \
 Each transcript line is numbered and starts with Me: (the user) or Others: (the other side). \
@@ -111,9 +114,33 @@ fn parse_reply(raw: &str) -> Option<Vec<Proposal>> {
 
 /// Lowercased words of `text` without surrounding punctuation.
 fn words(text: &str) -> Vec<String> {
+    tokens(text).into_iter().map(|t| t.word).collect()
+}
+
+struct Token {
+    /// Lowercased, without surrounding punctuation.
+    word: String,
+    /// Starts with a capital letter, or is in a script without case (Hebrew).
+    capital: bool,
+    /// Followed by a comma, question mark or exclamation mark.
+    ends_clause: bool,
+    /// Followed by a full stop, question mark or exclamation mark.
+    ends_sentence: bool,
+}
+
+fn tokens(text: &str) -> Vec<Token> {
     text.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase())
-        .filter(|w| !w.is_empty())
+        .filter_map(|raw| {
+            let core = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+            let first = core.chars().next()?;
+            let tail = raw.trim_end_matches(|c: char| c == '"' || c == '\'' || c == ')');
+            Some(Token {
+                word: core.to_lowercase(),
+                capital: !first.is_lowercase(),
+                ends_clause: tail.ends_with([',', '?', '!']),
+                ends_sentence: tail.ends_with(['.', '?', '!']),
+            })
+        })
         .collect()
 }
 
@@ -131,11 +158,52 @@ fn is_self_intro(words: &[String], at: usize, name_len: usize) -> bool {
         || before(&["i", "am"])
         || before(&["my", "name", "is"])
         || before(&["this", "is"])
-        || before(&["it's"])
         || before(&["אני"])
         || before(&["שמי"])
         || before(&["קוראים", "לי"])
         || words.get(at + name_len).is_some_and(|w| w == "here")
+}
+
+/// The name at `at..at + len` speaks to someone: "Dan, ...", "... Dan?" as a
+/// sentence of its own, "thanks Dan", or "that works, Dan" at the end.
+fn is_vocative(t: &[Token], at: usize, len: usize) -> bool {
+    let last = at + len - 1;
+    let line_end = last + 1 == t.len();
+    let sentence_start = at == 0 || t[at - 1].ends_sentence;
+    let greeted = (at >= 1 && GREETINGS.contains(&t[at - 1].word.as_str()))
+        || (at >= 2 && GREETING_PAIRS.contains(&(t[at - 2].word.as_str(), t[at - 1].word.as_str())));
+    let leads = sentence_start && (t[last].ends_clause || t[last].ends_sentence || line_end);
+    let trails = line_end && at >= 1 && t[at - 1].ends_clause;
+    greeted || leads || trails
+}
+
+/// Whether the name at `at..at + len` on line `idx` names the other side.
+fn backed(lines: &[Line], idx: usize, at: usize, len: usize) -> bool {
+    let t = tokens(&lines[idx].text);
+    // A lowercase "will" or "may" is a word, not a name.
+    if !t[at].capital {
+        return false;
+    }
+    let w: Vec<String> = t.iter().map(|t| t.word.clone()).collect();
+    match lines[idx].side {
+        Side::Others => is_self_intro(&w, at, len),
+        Side::Me => {
+            let answered = lines[idx + 1..].iter().take(REPLY_WINDOW).any(|l| l.side == Side::Others);
+            answered && !is_self_intro(&w, at, len) && is_vocative(&t, at, len)
+        }
+    }
+}
+
+/// Cheap check before asking the model: does any word sit where a name of
+/// the other side could? Most calls have no introductions or greetings by
+/// name, and the model call would hold up the summary.
+fn has_name_candidates(lines: &[Line]) -> bool {
+    lines.iter().enumerate().any(|(idx, line)| {
+        let t = tokens(&line.text);
+        (0..t.len()).any(|at| {
+            t[at].word.chars().all(char::is_alphabetic) && t[at].word != "i" && backed(lines, idx, at, 1)
+        })
+    })
 }
 
 fn clean_name(name: &str) -> Option<String> {
@@ -162,23 +230,8 @@ fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
         let Some(name) = clean_name(&proposal.name) else { continue };
         let Some(line) = lines.get(proposal.line) else { continue };
         let name_words = words(&name);
-        let line_words = words(&line.text);
-        let Some(at) = find_name(&line_words, &name_words) else { continue };
-
-        let backed = match line.side {
-            Side::Others => is_self_intro(&line_words, at, name_words.len()),
-            Side::Me => {
-                let end = at + name_words.len();
-                let vocative = at < VOCATIVE_LEAD_WORDS
-                    || end + VOCATIVE_TAIL_WORDS >= line_words.len();
-                let answered = lines[proposal.line + 1..]
-                    .iter()
-                    .take(REPLY_WINDOW)
-                    .any(|l| l.side == Side::Others);
-                vocative && answered && !is_self_intro(&line_words, at, name_words.len())
-            }
-        };
-        if !backed || own_name(&name_words) {
+        let Some(at) = find_name(&words(&line.text), &name_words) else { continue };
+        if !backed(lines, proposal.line, at, name_words.len()) || own_name(&name_words) {
             continue;
         }
         // "Ana" and "Ana Silva" are the same person.
@@ -214,16 +267,29 @@ async fn load_lines(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<Line>, sq
         .collect())
 }
 
+/// Names live in their own table, created on first use instead of by a
+/// migration: sqlx refuses to open a database that has a migration it does
+/// not know, which would lock out an upstream Meetily build on the same data.
+async fn ensure_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS meeting_speaker_names (
+            meeting_id TEXT PRIMARY KEY,
+            names TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn get_other_speaker_names(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<String>, sqlx::Error> {
-    let stored: Option<Option<String>> =
-        sqlx::query_scalar("SELECT other_speaker_names FROM meetings WHERE id = ?")
+    ensure_table(pool).await?;
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT names FROM meeting_speaker_names WHERE meeting_id = ?")
             .bind(meeting_id)
             .fetch_optional(pool)
             .await?;
-    Ok(stored
-        .flatten()
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default())
+    Ok(stored.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default())
 }
 
 /// Finds and stores the other side's names for a saved meeting. Failures are
@@ -236,7 +302,7 @@ pub async fn identify_other_speakers<R: Runtime>(app: AppHandle<R>, pool: Sqlite
             return;
         }
     };
-    if !lines.iter().any(|l| l.side == Side::Others) {
+    if !lines.iter().any(|l| l.side == Side::Others) || !has_name_candidates(&lines) {
         return;
     }
 
@@ -259,13 +325,17 @@ pub async fn identify_other_speakers<R: Runtime>(app: AppHandle<R>, pool: Sqlite
         return;
     }
 
-    let saved = sqlx::query("UPDATE meetings SET other_speaker_names = ? WHERE id = ?")
-        .bind(serde_json::to_string(&names).unwrap_or_default())
-        .bind(&meeting_id)
-        .execute(&pool)
-        .await;
+    let saved = match ensure_table(&pool).await {
+        Ok(()) => sqlx::query("INSERT OR REPLACE INTO meeting_speaker_names (meeting_id, names) VALUES (?, ?)")
+            .bind(&meeting_id)
+            .bind(serde_json::to_string(&names).unwrap_or_default())
+            .execute(&pool)
+            .await
+            .map(|_| ()),
+        Err(e) => Err(e),
+    };
     match saved {
-        Ok(_) => {
+        Ok(()) => {
             let _ = app.emit("meeting-speakers-identified", MeetingSpeakersIdentified { meeting_id, names });
         }
         Err(e) => warn!("Speaker names for {meeting_id}: failed to save: {e}"),
@@ -304,6 +374,32 @@ mod tests {
     fn people_only_talked_about_are_dropped() {
         let lines = vec![me("I spoke with John about the budget yesterday afternoon."), others("Okay.")];
         assert!(accept_names(&lines, &[proposal("John", 0)]).is_empty());
+        for (line, name) in [
+            ("So John called me about the contract", "John"),
+            ("I'll check with Sarah", "Sarah"),
+            ("Did Mark send it?", "Mark"),
+        ] {
+            let lines = vec![me(line), others("Not yet.")];
+            assert!(accept_names(&lines, &[proposal(name, 0)]).is_empty(), "{line}");
+        }
+        let lines = vec![others("Honestly it's John who decides."), me("Right.")];
+        assert!(accept_names(&lines, &[proposal("John", 0)]).is_empty());
+    }
+
+    #[test]
+    fn ordinary_words_are_not_names() {
+        let lines = vec![me("I will, thanks."), others("Great.")];
+        assert!(accept_names(&lines, &[proposal("Will", 0)]).is_empty());
+    }
+
+    #[test]
+    fn calls_without_candidates_skip_the_model() {
+        let lines = vec![me("So what about pricing?"), others("Too high for small teams."), me("Let's ask Maria from sales."), others("Good idea.")];
+        assert!(!has_name_candidates(&lines));
+        let lines = vec![me("Hello?"), others("Hi, this is Sarah.")];
+        assert!(has_name_candidates(&lines));
+        let lines = vec![me("Nice. Dan, did you see the report?"), others("Yes.")];
+        assert!(has_name_candidates(&lines));
         let lines = vec![others("Maybe ask Lisa about the budget next week."), me("Sure.")];
         assert!(accept_names(&lines, &[proposal("Lisa", 0)]).is_empty());
     }
@@ -357,5 +453,4 @@ mod tests {
         assert!(excerpt.ends_with("[399] Me: Thanks Sarah, bye."));
         assert!(excerpt.contains("[...]"));
     }
-
 }
