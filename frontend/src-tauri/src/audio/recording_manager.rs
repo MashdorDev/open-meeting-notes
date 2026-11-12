@@ -280,12 +280,6 @@ impl RecordingManager {
             }
         };
 
-        self.recording_saver.start_accumulation(auto_save, recording_receiver);
-        self.recording_saver.set_device_info(
-            microphone_device.as_ref().map(|d| d.name.clone()),
-            system_device.as_ref().map(|d| d.name.clone())
-        );
-
         // Start audio streams - they send RAW unmixed chunks to pipeline for mixing
         // Pipeline handles mixing and distribution to both recording and transcription.
         // The pipeline is still being built; chunks queue until it runs.
@@ -302,6 +296,14 @@ impl RecordingManager {
             self.state.stop_recording();
             return Err(RecordingStartError::TranscriptionRuntime(anyhow::anyhow!(e)));
         }
+
+        // Only now create the meeting folder, so a failed setup leaves none
+        // behind; the mixed audio waits in the recording channel meanwhile.
+        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+        self.recording_saver.set_device_info(
+            microphone_device.as_ref().map(|d| d.name.clone()),
+            system_device.as_ref().map(|d| d.name.clone())
+        );
 
         // Start device monitoring to detect disconnects
         if let Some(ref mut monitor) = self.device_monitor {

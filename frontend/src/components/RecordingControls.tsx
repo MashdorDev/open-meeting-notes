@@ -274,7 +274,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         });
 
         // Transcription error listener - handles structured error objects with actionable flag
-        const transcriptionErrorUnsubscribe = await listen<TranscriptionErrorPayload>('transcription-error', (event) => {
+        const transcriptionErrorUnsubscribe = await listen<TranscriptionErrorPayload>('transcription-error', async (event) => {
           console.log('transcription-error event received:', event);
           console.error('Transcription error received:', event.payload);
 
@@ -291,6 +291,14 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
           setIsProcessing(false);
 
           if (event.payload.phase === 'active') {
+            // Capture keeps running after the transcription task fails (for
+            // example the speech model fails to load once recording is live),
+            // so stop the backend too; the audio recorded so far is kept.
+            try {
+              await invoke('stop_recording', { args: { save_path: '' } });
+            } catch (error) {
+              console.warn('stop_recording after transcription error:', error);
+            }
             console.log('Calling onRecordingStop(false) due to active transcription error');
             onRecordingStop(false);
           }
