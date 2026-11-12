@@ -44,7 +44,9 @@ struct AudioMixerRingBuffer {
 /// A source whose samples fall this far behind the recording clock had a gap
 /// (WASAPI loopback sends nothing while no app plays audio, a Bluetooth mic
 /// drops out). Larger than callback jitter, small enough that the echo
-/// canceller's 500 ms lag search still covers what is left.
+/// canceller's 500 ms lag search still covers what is left. A device clock
+/// that runs slow against the wall clock also crosses it now and then (every
+/// half hour at 100 ppm), which costs a 200 ms hole in that track.
 const GAP_FILL_MS: f64 = 200.0;
 
 impl AudioMixerRingBuffer {
@@ -87,7 +89,10 @@ impl AudioMixerRingBuffer {
         let end = position + samples.len() as u64;
         let tolerance = (GAP_FILL_MS * self.sample_rate as f64 / 1000.0) as u64;
         if expected_end > end + tolerance {
-            let gap = (expected_end - end) as usize;
+            // While one source is silent the stalled-source padding in
+            // extract_window keeps it within two windows of the other, so a
+            // real gap left to fill is never longer than that.
+            let gap = ((expected_end - end) as usize).min(2 * self.window_size_samples);
             debug!("Filling a {:.0} ms gap in {:?} audio with silence",
                    gap as f64 * 1000.0 / self.sample_rate as f64, device_type);
             self.add_samples(device_type.clone(), vec![0.0; gap]);
@@ -130,12 +135,14 @@ impl AudioMixerRingBuffer {
                   self.system_buffer.len() - self.max_buffer_size);
         }
 
-        // Safety: prevent buffer overflow (keep only last 200ms)
+        // Safety: prevent buffer overflow. Dropped samples leave the timeline.
         while self.mic_buffer.len() > self.max_buffer_size {
             self.mic_buffer.pop_front();
+            self.mic_position -= 1;
         }
         while self.system_buffer.len() > self.max_buffer_size {
             self.system_buffer.pop_front();
+            self.system_position -= 1;
         }
     }
 
@@ -621,8 +628,9 @@ impl AudioCapture {
         //     }
         // }
 
-        // Use global recording timestamp for proper synchronization
-        let timestamp = self.state.get_recording_duration().unwrap_or(0.0);
+        // Recording clock without paused time: chunks are dropped while paused,
+        // so the mixer must not take a pause for a capture gap.
+        let timestamp = self.state.get_active_recording_duration().unwrap_or(0.0);
 
         // RAW AUDIO CHUNK: No gain applied - will be mixed and gained downstream
         // Use 48kHz if we resampled, otherwise use original rate
