@@ -189,6 +189,7 @@ impl LoudnessNormalizer {
         }
 
         const TARGET_LUFS: f64 = -23.0;
+        const MAX_GAIN_DB: f64 = 20.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
 
         let mut normalized_samples = Vec::with_capacity(samples.len());
@@ -205,7 +206,11 @@ impl LoudnessNormalizer {
                     // Update gain based on cumulative loudness
                     if let Ok(current_lufs) = self.ebur128.loudness_global() {
                         if current_lufs.is_finite() && current_lufs < 0.0 {
-                            let gain_db = TARGET_LUFS - current_lufs;
+                            // Capped: a mic that has carried only room noise or
+                            // echo left after cancellation would otherwise be
+                            // boosted by 40 dB or more, up to the level of real
+                            // speech (and of the call audio it is compared to).
+                            let gain_db = (TARGET_LUFS - current_lufs).min(MAX_GAIN_DB);
                             self.gain_linear = 10_f32.powf(gain_db as f32 / 20.0);
                         }
                     }

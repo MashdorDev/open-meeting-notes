@@ -14,8 +14,8 @@
 //! system audio of the last minute is kept, and each channel is transcribed
 //! on its own for that stretch. A split needs speech on both channels (a VAD
 //! runs on the system channel too, so background noise there does not count).
-//! Speaker echo is not removed yet: on laptop speakers, the other side's words
-//! can show up in both lines of a split.
+//! Speaker echo is removed from the mic before it gets here; what is left is
+//! held down by the cap on the mic normalizer's gain.
 
 use super::recording_state::DeviceType;
 use std::collections::VecDeque;
@@ -158,27 +158,38 @@ impl SpeakerEnergyTimeline {
         mic_speech_since: Option<f64>,
         sys_speech_since: Option<f64>,
     ) -> (Attribution, SourceEvidence) {
-        let rms = |windows: &mut dyn Iterator<Item = &Window>| {
-            let (mut mic, mut sys, mut samples) = (0.0, 0.0, 0usize);
-            for w in windows {
-                mic += w.mic_sum_sq;
-                sys += w.sys_sum_sq;
-                samples += w.mic.len().max(w.sys.len());
+        let (mut mic, mut sys, mut samples) = (0.0, 0.0, 0usize);
+        for w in self.windows.iter().filter(|w| w.end_ms > start_ms && w.start_ms < end_ms) {
+            mic += w.mic_sum_sq;
+            sys += w.sys_sum_sq;
+            samples += w.mic.len().max(w.sys.len());
+        }
+        let level = |sum: f64, n: usize| if n == 0 { 0.0 } else { (sum / n as f64).sqrt() };
+        let (mic_rms, sys_rms) = (level(mic, samples), level(sys, samples));
+
+        // Levels over exactly the stretches the mic VAD marked as speech (the
+        // raw samples are kept), so a short "yeah, exactly" is not averaged
+        // with the silence around it.
+        let mut speech: Vec<(f64, f64)> = self.mic_speech.iter().copied().collect();
+        if let Some(since) = mic_speech_since {
+            speech.push((since, self.elapsed_ms));
+        }
+        let (mut mic, mut sys, mut samples) = (0.0, 0.0, 0usize);
+        for w in self.windows.iter().filter(|w| w.end_ms > start_ms && w.start_ms < end_ms) {
+            let per_ms = w.mic.len().max(w.sys.len()) as f64 / (w.end_ms - w.start_ms);
+            for &(s, e) in &speech {
+                let (from_ms, to_ms) = (s.max(w.start_ms).max(start_ms), e.min(w.end_ms).min(end_ms));
+                if to_ms <= from_ms {
+                    continue;
+                }
+                let from = ((from_ms - w.start_ms) * per_ms) as usize;
+                let to = ((to_ms - w.start_ms) * per_ms) as usize;
+                mic += sum_sq(&w.mic[from.min(w.mic.len())..to.min(w.mic.len())]);
+                sys += sum_sq(&w.sys[from.min(w.sys.len())..to.min(w.sys.len())]);
+                samples += to - from;
             }
-            if samples == 0 {
-                (0.0, 0.0)
-            } else {
-                ((mic / samples as f64).sqrt(), (sys / samples as f64).sqrt())
-            }
-        };
-        let in_segment = |w: &&Window| w.end_ms > start_ms && w.start_ms < end_ms;
-        let (mic_rms, sys_rms) = rms(&mut self.windows.iter().filter(in_segment));
-        let mic_speaking = |w: &&Window| {
-            self.mic_speech.iter().any(|&(s, e)| overlap(w.start_ms, w.end_ms, s, e) > 0.0)
-                || mic_speech_since.is_some_and(|since| w.end_ms > since)
-        };
-        let (mic_rms_in_speech, sys_rms_in_speech) =
-            rms(&mut self.windows.iter().filter(in_segment).filter(mic_speaking));
+        }
+        let (mic_rms_in_speech, sys_rms_in_speech) = (level(mic, samples), level(sys, samples));
 
         let mic_speech_share =
             speech_share(&self.mic_speech, mic_speech_since, self.elapsed_ms, start_ms, end_ms);
@@ -202,7 +213,7 @@ impl SpeakerEnergyTimeline {
         let attribution = if both_spoke {
             Attribution::Split
         } else if mic_speech_share >= MIN_MIC_SPEECH_SHARE
-            && (!system_active || mic_rms >= sys_rms * MIC_DOMINANCE)
+            && (!system_active || mic_rms_in_speech >= sys_rms_in_speech * MIC_DOMINANCE)
         {
             Attribution::Single(DeviceType::Microphone)
         } else {
@@ -368,6 +379,31 @@ mod tests {
         t.add_sys_speech(0.0, 6000.0);
         let (attribution, evidence) = t.source_for(0.0, 6000.0, None, None);
         assert!(evidence.mic_rms < evidence.sys_rms);
+        assert_eq!(attribution, Attribution::Split);
+    }
+
+    #[test]
+    fn a_short_interjection_is_not_averaged_with_silence() {
+        // "yeah, exactly": 500 ms at 0.09 over a video at 0.06, inside two
+        // 600 ms windows.
+        let mut t = SpeakerEnergyTimeline::default();
+        let mut speech = vec![0.0f32; WINDOW];
+        for (i, s) in speech.iter_mut().enumerate().skip(WINDOW / 2) {
+            *s = if i % 2 == 0 { 0.09 } else { -0.09 };
+        }
+        t.push_window(&speech, &tone(0.06), RATE);
+        let mut rest = vec![0.0f32; WINDOW];
+        for (i, s) in rest.iter_mut().enumerate().take(WINDOW / 3) {
+            *s = if i % 2 == 0 { 0.09 } else { -0.09 };
+        }
+        t.push_window(&rest, &tone(0.06), RATE);
+        for _ in 0..2 {
+            t.push_window(&tone(0.0), &tone(0.06), RATE);
+        }
+        t.add_mic_speech(300.0, 800.0); // 500 of 2400 ms
+        t.add_sys_speech(0.0, 2400.0);
+        let (attribution, evidence) = t.source_for(0.0, 2400.0, None, None);
+        assert!(evidence.mic_rms_in_speech > evidence.sys_rms_in_speech);
         assert_eq!(attribution, Attribution::Split);
     }
 
