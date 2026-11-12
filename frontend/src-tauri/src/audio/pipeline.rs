@@ -80,15 +80,35 @@ impl AudioMixerRingBuffer {
     /// seconds on the recording clock. If the source fell behind that clock
     /// (it delivered nothing for a while), the gap is filled with silence
     /// first, so audio after the gap lines up with the other source again.
-    fn add_samples_at(&mut self, device_type: DeviceType, samples: Vec<f32>, timestamp: f64) {
-        let position = match device_type {
-            DeviceType::Microphone => self.mic_position,
-            DeviceType::System => self.system_position,
+    /// If it ran ahead (a backlog delivered after its gap was filled, or a
+    /// device clock that runs fast), the surplus is dropped.
+    fn add_samples_at(&mut self, device_type: DeviceType, mut samples: Vec<f32>, timestamp: f64) {
+        let (position, other_position) = match device_type {
+            DeviceType::Microphone => (self.mic_position, self.system_position),
+            DeviceType::System => (self.system_position, self.mic_position),
         };
         let expected_end = (timestamp.max(0.0) * self.sample_rate as f64) as u64;
         let end = position + samples.len() as u64;
         let tolerance = (GAP_FILL_MS * self.sample_rate as f64 / 1000.0) as u64;
-        if expected_end > end + tolerance {
+        if expected_end > end + tolerance && other_position + tolerance < expected_end {
+            // Both sources are behind: the whole process stalled or the
+            // machine slept. Nothing was lost relative to the other source,
+            // so move both along the clock instead of writing the stall out
+            // as silence.
+            debug!("Both sources resumed {:.0} ms behind the clock; not filling",
+                   (expected_end - end) as f64 * 1000.0 / self.sample_rate as f64);
+            let (own, other) = match device_type {
+                DeviceType::Microphone => (&mut self.mic_position, &mut self.system_position),
+                DeviceType::System => (&mut self.system_position, &mut self.mic_position),
+            };
+            *own = expected_end - samples.len() as u64;
+            *other = expected_end;
+        } else if end > expected_end + tolerance {
+            let surplus = ((end - expected_end) as usize).min(samples.len());
+            debug!("Dropping {:.0} ms of {:?} audio that ran ahead of the clock",
+                   surplus as f64 * 1000.0 / self.sample_rate as f64, device_type);
+            samples.drain(..surplus);
+        } else if expected_end > end + tolerance {
             // While one source is silent the stalled-source padding in
             // extract_window keeps it within two windows of the other, so a
             // real gap left to fill is never longer than that.
@@ -1338,6 +1358,58 @@ mod ring_buffer_tests {
         let (mic_click, sys_click) = (peak(&mic_out), peak(&sys_out));
         assert_eq!(mic_click, click);
         assert!(sys_click.abs_diff(mic_click) < 48 * 250, "system click {} vs mic {}", sys_click, mic_click);
+    }
+
+    #[test]
+    fn a_backlog_after_a_filled_gap_is_trimmed_back_into_line() {
+        // macOS: the system reader runs 300 ms late, then delivers the
+        // queued audio stamped "now". A click at 5 s must stay aligned.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480;
+        let click = 5 * rate as usize;
+        let late = 2 * rate as usize;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        let mut backlog: Vec<Vec<f32>> = Vec::new();
+        for i in 0..(8 * rate as usize / chunk) {
+            let start = i * chunk;
+            let samples: Vec<f32> = (start..start + chunk).map(|n| if n == click { 1.0 } else { 0.01 }).collect();
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            ring.add_samples_at(DeviceType::Microphone, samples.clone(), timestamp);
+            if start >= late && start < late + 300 * 48 {
+                backlog.push(samples);
+            } else {
+                for queued in backlog.drain(..) {
+                    ring.add_samples_at(DeviceType::System, queued, timestamp);
+                }
+                ring.add_samples_at(DeviceType::System, samples, timestamp);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+        let peak = |v: &[f32]| v.iter().position(|&x| x == 1.0).unwrap();
+        assert!(peak(&sys_out).abs_diff(peak(&mic_out)) < 48 * 250);
+    }
+
+    #[test]
+    fn a_stall_of_both_sources_is_not_written_out_as_silence() {
+        // Lid closed for 60 s without pausing: both resume far behind.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480;
+        let mut out = 0usize;
+        for i in 0..400usize {
+            let start = i * chunk + if i >= 200 { 60 * rate as usize } else { 0 };
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            ring.add_samples_at(DeviceType::Microphone, vec![0.01; chunk], timestamp);
+            ring.add_samples_at(DeviceType::System, vec![0.01; chunk], timestamp);
+            while let Some((mic, _)) = ring.extract_window() {
+                out += mic.len();
+            }
+        }
+        assert!(out <= 400 * chunk, "{} samples out of {} captured", out, 400 * chunk);
     }
 
     #[test]
