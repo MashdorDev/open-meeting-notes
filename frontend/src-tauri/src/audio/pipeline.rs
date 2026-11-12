@@ -90,29 +90,19 @@ impl AudioMixerRingBuffer {
         let expected_end = (timestamp.max(0.0) * self.sample_rate as f64) as u64;
         let end = position + samples.len() as u64;
         let tolerance = (GAP_FILL_MS * self.sample_rate as f64 / 1000.0) as u64;
-        if expected_end > end + tolerance && other_position + tolerance < expected_end {
-            // Both sources are behind: the whole process stalled or the
-            // machine slept. Nothing was lost relative to the other source,
-            // so move both along the clock instead of writing the stall out
-            // as silence.
-            debug!("Both sources resumed {:.0} ms behind the clock; not filling",
-                   (expected_end - end) as f64 * 1000.0 / self.sample_rate as f64);
-            let (own, other) = match device_type {
-                DeviceType::Microphone => (&mut self.mic_position, &mut self.system_position),
-                DeviceType::System => (&mut self.system_position, &mut self.mic_position),
-            };
-            *own = expected_end - samples.len() as u64;
-            *other = expected_end;
-        } else if end > expected_end + tolerance {
+        if end > expected_end + tolerance {
             let surplus = ((end - expected_end) as usize).min(samples.len());
             debug!("Dropping {:.0} ms of {:?} audio that ran ahead of the clock",
                    surplus as f64 * 1000.0 / self.sample_rate as f64, device_type);
             samples.drain(..surplus);
-        } else if expected_end > end + tolerance {
-            // While one source is silent the stalled-source padding in
-            // extract_window keeps it within two windows of the other, so a
+        } else if expected_end > end + tolerance && other_position > end + tolerance {
+            // Filled only up to where the other source is: when both fell
+            // behind together (the machine slept, the process stalled) nothing
+            // was lost against each other and the stall is not written out as
+            // silence. While one source is silent the stalled-source padding
+            // in extract_window keeps it within two windows of the other, so a
             // real gap left to fill is never longer than that.
-            let gap = ((expected_end - end) as usize).min(2 * self.window_size_samples);
+            let gap = ((expected_end - end).min(other_position - end) as usize).min(2 * self.window_size_samples);
             debug!("Filling a {:.0} ms gap in {:?} audio with silence",
                    gap as f64 * 1000.0 / self.sample_rate as f64, device_type);
             self.add_samples(device_type.clone(), vec![0.0; gap]);
@@ -1410,6 +1400,36 @@ mod ring_buffer_tests {
             }
         }
         assert!(out <= 400 * chunk, "{} samples out of {} captured", out, 400 * chunk);
+    }
+
+    #[test]
+    fn a_mic_dropout_while_loopback_is_idle_keeps_the_tracks_aligned() {
+        // Windows: nothing plays, so loopback sends nothing for 3 s; the
+        // Bluetooth mic drops out for 400 ms in the middle. A click at 5 s
+        // on both sources must still line up.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480;
+        let click = 5 * rate as usize;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        for i in 0..(8 * rate as usize / chunk) {
+            let start = i * chunk;
+            let samples: Vec<f32> = (start..start + chunk).map(|n| if n == click { 1.0 } else { 0.01 }).collect();
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            if !(start >= 3 * rate as usize && start < 3 * rate as usize + 400 * 48) {
+                ring.add_samples_at(DeviceType::Microphone, samples.clone(), timestamp);
+            }
+            if !(start >= rate as usize && start < 4 * rate as usize) {
+                ring.add_samples_at(DeviceType::System, samples, timestamp);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+        let peak = |v: &[f32]| v.iter().position(|&x| x == 1.0).unwrap();
+        assert!(peak(&sys_out).abs_diff(peak(&mic_out)) < 48 * 250,
+                "system click {} vs mic {}", peak(&sys_out), peak(&mic_out));
     }
 
     #[test]
