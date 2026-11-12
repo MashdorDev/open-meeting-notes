@@ -266,7 +266,7 @@ async fn delete_meeting_with_transaction(
         .await?;
 
     // 4. Names found for the other side (the table may not exist yet)
-    let _ = sqlx::query("DELETE FROM meeting_speaker_names WHERE meeting_id = ?")
+    let _ = sqlx::query("DELETE FROM meeting_other_speakers WHERE meeting_id = ?")
         .bind(meeting_id)
         .execute(&mut *transaction)
         .await;

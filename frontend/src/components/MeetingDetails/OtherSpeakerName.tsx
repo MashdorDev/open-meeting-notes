@@ -23,6 +23,8 @@ export function OtherSpeakerName({ names, onSave }: OtherSpeakerNameProps) {
     try {
       await onSave(draft.split(',').map(n => n.trim()).filter(Boolean));
       setEditing(false);
+    } catch {
+      // The caller showed the error; keep the editor open with what was typed.
     } finally {
       setSaving(false);
     }

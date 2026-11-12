@@ -122,6 +122,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     } catch (error) {
       console.error('Failed to save speaker names:', error);
       toast.error('Could not save the name', { description: String(error) });
+      throw error;
     }
   }, [meeting.id]);
 

@@ -138,6 +138,14 @@ fn is_self_intro(words: &[String], at: usize, name_len: usize) -> bool {
         || words.get(at + name_len).is_some_and(|w| w == "here")
 }
 
+/// Names Dor types are kept as written ("J. R. Smith", "Dr. Cohen"), only
+/// trimmed and capped.
+fn clean_typed_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.chars().take(2 * MAX_NAME_CHARS).collect())
+}
+
+/// Names from the model must look like a name.
 fn clean_name(name: &str) -> Option<String> {
     let name = name.trim().trim_matches(|c: char| !c.is_alphanumeric());
     let ok = !name.is_empty()
@@ -207,7 +215,7 @@ async fn load_lines(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<Line>, sq
 /// not know, which would lock out an upstream Meetily build on the same data.
 async fn ensure_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS meeting_speaker_names (
+        "CREATE TABLE IF NOT EXISTS meeting_other_speakers (
             meeting_id TEXT PRIMARY KEY,
             names TEXT NOT NULL,
             edited INTEGER NOT NULL DEFAULT 0
@@ -221,7 +229,7 @@ async fn ensure_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 pub async fn get_other_speaker_names(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<String>, sqlx::Error> {
     ensure_table(pool).await?;
     let stored: Option<String> =
-        sqlx::query_scalar("SELECT names FROM meeting_speaker_names WHERE meeting_id = ?")
+        sqlx::query_scalar("SELECT names FROM meeting_other_speakers WHERE meeting_id = ?")
             .bind(meeting_id)
             .fetch_optional(pool)
             .await?;
@@ -235,9 +243,9 @@ pub async fn set_other_speaker_names(
     meeting_id: &str,
     names: &[String],
 ) -> Result<Vec<String>, sqlx::Error> {
-    let names: Vec<String> = names.iter().filter_map(|n| clean_name(n)).take(MAX_NAMES).collect();
+    let names: Vec<String> = names.iter().filter_map(|n| clean_typed_name(n)).take(MAX_NAMES).collect();
     ensure_table(pool).await?;
-    sqlx::query("INSERT OR REPLACE INTO meeting_speaker_names (meeting_id, names, edited) VALUES (?, ?, 1)")
+    sqlx::query("INSERT OR REPLACE INTO meeting_other_speakers (meeting_id, names, edited) VALUES (?, ?, 1)")
         .bind(meeting_id)
         .bind(serde_json::to_string(&names).unwrap_or_default())
         .execute(pool)
@@ -249,7 +257,7 @@ pub async fn set_other_speaker_names(
 async fn store_found_names(pool: &SqlitePool, meeting_id: &str, names: &[String]) -> Result<bool, sqlx::Error> {
     ensure_table(pool).await?;
     let stored = sqlx::query(
-        "INSERT INTO meeting_speaker_names (meeting_id, names, edited) VALUES (?, ?, 0)
+        "INSERT INTO meeting_other_speakers (meeting_id, names, edited) VALUES (?, ?, 0)
          ON CONFLICT(meeting_id) DO UPDATE SET names = excluded.names WHERE edited = 0",
     )
     .bind(meeting_id)
@@ -286,11 +294,10 @@ pub async fn identify_other_speakers<R: Runtime>(app: AppHandle<R>, pool: Sqlite
         warn!("Speaker names for {meeting_id}: unusable model output {raw:?}");
         return;
     };
+    // An empty result is stored too: after a retranscription it replaces a
+    // name the earlier, worse transcript produced (unless Dor set one).
     let names = accept_names(&lines, &proposals);
     info!("Speaker names for {meeting_id}: proposed {proposals:?}, kept {names:?}");
-    if names.is_empty() {
-        return;
-    }
 
     match store_found_names(&pool, &meeting_id, &names).await {
         Ok(true) => {
@@ -387,6 +394,9 @@ mod tests {
         set_other_speaker_names(&pool, "m1", &["Sarah Cohen".to_string()]).await.unwrap();
         assert!(!store_found_names(&pool, "m1", &["Sara".to_string()]).await.unwrap());
         assert_eq!(get_other_speaker_names(&pool, "m1").await.unwrap(), vec!["Sarah Cohen"]);
+        // Names typed by hand are kept as written.
+        let typed = set_other_speaker_names(&pool, "m1", &["J. R. Smith".to_string(), " ".to_string()]).await.unwrap();
+        assert_eq!(typed, vec!["J. R. Smith"]);
         // Clearing by hand also sticks.
         set_other_speaker_names(&pool, "m1", &[]).await.unwrap();
         assert!(!store_found_names(&pool, "m1", &["Sara".to_string()]).await.unwrap());
