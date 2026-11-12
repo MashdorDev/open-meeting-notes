@@ -34,7 +34,18 @@ struct AudioMixerRingBuffer {
     system_buffer: VecDeque<f32>,
     window_size_samples: usize,  // Fixed mixing window (e.g., 50ms)
     max_buffer_size: usize,  // Safety limit (e.g., 100ms)
+    sample_rate: u32,
+    // Samples each source has put on the shared timeline so far, silence
+    // padding included
+    mic_position: u64,
+    system_position: u64,
 }
+
+/// A source whose samples fall this far behind the recording clock had a gap
+/// (WASAPI loopback sends nothing while no app plays audio, a Bluetooth mic
+/// drops out). Larger than callback jitter, small enough that the echo
+/// canceller's 500 ms lag search still covers what is left.
+const GAP_FILL_MS: f64 = 200.0;
 
 impl AudioMixerRingBuffer {
     fn new(sample_rate: u32) -> Self {
@@ -57,7 +68,31 @@ impl AudioMixerRingBuffer {
             system_buffer: VecDeque::with_capacity(max_buffer_size),
             window_size_samples,
             max_buffer_size,
+            sample_rate,
+            mic_position: 0,
+            system_position: 0,
         }
+    }
+
+    /// Adds a capture chunk whose last sample was taken at `timestamp`
+    /// seconds on the recording clock. If the source fell behind that clock
+    /// (it delivered nothing for a while), the gap is filled with silence
+    /// first, so audio after the gap lines up with the other source again.
+    fn add_samples_at(&mut self, device_type: DeviceType, samples: Vec<f32>, timestamp: f64) {
+        let position = match device_type {
+            DeviceType::Microphone => self.mic_position,
+            DeviceType::System => self.system_position,
+        };
+        let expected_end = (timestamp.max(0.0) * self.sample_rate as f64) as u64;
+        let end = position + samples.len() as u64;
+        let tolerance = (GAP_FILL_MS * self.sample_rate as f64 / 1000.0) as u64;
+        if expected_end > end + tolerance {
+            let gap = (expected_end - end) as usize;
+            debug!("Filling a {:.0} ms gap in {:?} audio with silence",
+                   gap as f64 * 1000.0 / self.sample_rate as f64, device_type);
+            self.add_samples(device_type.clone(), vec![0.0; gap]);
+        }
+        self.add_samples(device_type, samples);
     }
 
     fn add_samples(&mut self, device_type: DeviceType, samples: Vec<f32>) {
@@ -72,8 +107,14 @@ impl AudioMixerRingBuffer {
         }
 
         match device_type {
-            DeviceType::Microphone => self.mic_buffer.extend(samples),
-            DeviceType::System => self.system_buffer.extend(samples),
+            DeviceType::Microphone => {
+                self.mic_position += samples.len() as u64;
+                self.mic_buffer.extend(samples);
+            }
+            DeviceType::System => {
+                self.system_position += samples.len() as u64;
+                self.system_buffer.extend(samples);
+            }
         }
 
         // CRITICAL FIX: Add warnings before dropping samples
@@ -130,48 +171,17 @@ impl AudioMixerRingBuffer {
             return None;
         }
 
-        // Extract mic window with zero-padding for incomplete buffers
-        // Zero-padding (silence) is preferred over last-sample-hold to prevent artifacts
-
-        // Extract mic window (or pad with zeros if insufficient data)
-        let mic_window = if self.mic_buffer.len() >= self.window_size_samples {
-            // Enough mic data - drain window
-            self.mic_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.mic_buffer.is_empty() {
-            // Some mic data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.mic_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No mic data - return silence
-            vec![0.0; self.window_size_samples]
+        // A short source is padded with silence (not last-sample-hold, which
+        // repeats); the padding moves it along the timeline like real samples.
+        let window = self.window_size_samples;
+        let take = |buffer: &mut VecDeque<f32>, position: &mut u64| -> Vec<f32> {
+            let mut out: Vec<f32> = buffer.drain(..buffer.len().min(window)).collect();
+            *position += (window - out.len()) as u64;
+            out.resize(window, 0.0);
+            out
         };
-
-        // Extract system window (or pad with zeros if insufficient data)
-        let sys_window = if self.system_buffer.len() >= self.window_size_samples {
-            // Enough system data - drain window
-            self.system_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.system_buffer.is_empty() {
-            // Some system data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.system_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No system data - return silence
-            vec![0.0; self.window_size_samples]
-        };
+        let mic_window = take(&mut self.mic_buffer, &mut self.mic_position);
+        let sys_window = take(&mut self.system_buffer, &mut self.system_position);
 
         Some((mic_window, sys_window))
     }
@@ -882,7 +892,7 @@ impl AudioPipeline {
 
                     // STEP 1: Add raw audio to ring buffer for mixing
                     // Both sources arrive here without loudness normalization
-                    self.ring_buffer.add_samples(chunk.device_type.clone(), chunk.data);
+                    self.ring_buffer.add_samples_at(chunk.device_type.clone(), chunk.data, chunk.timestamp);
 
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
@@ -1292,6 +1302,34 @@ mod ring_buffer_tests {
         ring.add_samples(DeviceType::Microphone, vec![0.5; 2 * window]);
         let (mic, sys) = ring.extract_window().expect("mixes once a window behind");
         assert_eq!((mic.len(), sys), (window, vec![0.0; window]));
+    }
+
+    #[test]
+    fn a_source_that_resumes_after_a_gap_lines_up_again() {
+        // WASAPI loopback: system audio stops for 3 s while nothing plays.
+        // A click at 5 s on both sources must land on the same mixed sample.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480; // 10 ms
+        let click = 5 * rate as usize;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        for i in 0..(8 * rate as usize / chunk) {
+            let start = i * chunk;
+            let samples: Vec<f32> = (start..start + chunk).map(|n| if n == click { 1.0 } else { 0.01 }).collect();
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            ring.add_samples_at(DeviceType::Microphone, samples.clone(), timestamp);
+            if !(start >= 2 * rate as usize && start < 4 * rate as usize + 300 * 48) {
+                ring.add_samples_at(DeviceType::System, samples, timestamp);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+        let peak = |v: &[f32]| v.iter().position(|&x| x == 1.0).unwrap();
+        let (mic_click, sys_click) = (peak(&mic_out), peak(&sys_out));
+        assert_eq!(mic_click, click);
+        assert!(sys_click.abs_diff(mic_click) < 48 * 250, "system click {} vs mic {}", sys_click, mic_click);
     }
 
     #[test]
