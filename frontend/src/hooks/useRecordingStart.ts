@@ -122,6 +122,8 @@ export function useRecordingStart(
       return;
     }
     isStartingRef.current = true;
+    // Show STARTING on the click itself, not after the model checks.
+    setStatus(RecordingStatus.STARTING, 'Initializing recording...');
     try {
       console.log('handleRecordingStart called - checking selected transcription model status');
 
@@ -152,9 +154,6 @@ export function useRecordingStart(
       const randomTitle = generateMeetingTitle();
       setMeetingTitle(randomTitle);
 
-      // Set STARTING status before initiating backend recording
-      setStatus(RecordingStatus.STARTING, 'Initializing recording...');
-
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
       await recordingService.startRecordingWithDevices(
@@ -172,8 +171,9 @@ export function useRecordingStart(
       setIsMeetingActive(true);
       Analytics.trackButtonClick('start_recording', 'home_page');
 
-      // Show recording notification if enabled
-      await showRecordingNotification();
+      // Show recording notification if enabled; the recording is already live
+      void showRecordingNotification().catch((error) =>
+        console.error('Failed to show recording notification:', error));
     } catch (error) {
       console.error('Failed to start recording:', error);
       const errorMsg = error instanceof Error ? error.message : String(error);

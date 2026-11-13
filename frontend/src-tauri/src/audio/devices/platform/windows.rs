@@ -192,6 +192,14 @@ pub fn get_windows_device(audio_device: &AudioDevice) -> Result<(cpal::Device, c
                     if name == base_name || name.contains(base_name) {
                         // info!("Found matching output device: {}", name);
 
+                        // Loopback captures in the shared-mode mix format, which is
+                        // the default config: one call, where probing every
+                        // supported config takes hundreds of ms.
+                        if let Ok(default_config) = device.default_output_config() {
+                            info!("Using default output config: {:?}", default_config);
+                            return Ok((device, default_config));
+                        }
+
                         // For output devices, we want to use them in loopback mode
                         if let Ok(supported_configs) = device.supported_output_configs() {
                             let configs: Vec<_> = supported_configs.collect();

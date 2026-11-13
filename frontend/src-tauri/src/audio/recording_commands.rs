@@ -76,11 +76,16 @@ fn session_live(s: &Arc<super::RecordingState>) -> bool {
 /// This unwind-clears behaviour depends on `panic = "unwind"` (the default).
 /// If a release profile ever sets `panic = "abort"`, Drop won't run on panic
 /// and the stuck-flag failure mode returns — add a start-time reset then.
+///
+/// Only one stop runs at a time: a second one (Stop clicked while a stop
+/// started by a failed model load drains, or the tray) gets None.
 struct StoppingGuard;
 impl StoppingGuard {
-    fn new() -> Self {
-        IS_RECORDING_STOPPING.store(true, Ordering::SeqCst);
-        StoppingGuard
+    fn try_new() -> Option<Self> {
+        IS_RECORDING_STOPPING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| StoppingGuard)
     }
 }
 impl Drop for StoppingGuard {
@@ -329,6 +334,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         ));
     }
 
+    // Notify frontend that startup has begun (surfaces STARTING state)
+    app.emit("recording-starting", serde_json::json!({
+        "message": "Recording initialization started"
+    })).map_err(|e| e.to_string())?;
+
     // Validate that transcription models are available before starting recording
     info!("🔍 Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -347,10 +357,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Notify frontend that startup has begun (surfaces STARTING state)
-    app.emit("recording-starting", serde_json::json!({
-        "message": "Recording initialization started"
-    })).map_err(|e| e.to_string())?;
 
     // Load recording preferences to get auto_save AND device preferences
     let (auto_save, preferred_mic_name, preferred_system_name) =
@@ -520,6 +526,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         ));
     }
 
+    // Notify frontend that startup has begun (surfaces STARTING state)
+    app.emit("recording-starting", serde_json::json!({
+        "message": "Recording initialization started"
+    })).map_err(|e| e.to_string())?;
+
     // Validate that transcription models are available before starting recording
     info!("🔍 Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -538,10 +549,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Notify frontend that startup has begun (surfaces STARTING state)
-    app.emit("recording-starting", serde_json::json!({
-        "message": "Recording initialization started"
-    })).map_err(|e| e.to_string())?;
 
     #[cfg(not(target_os = "macos"))]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());
@@ -689,6 +696,16 @@ pub async fn stop_recording<R: Runtime>(
         return Ok(());
     }
 
+    // Mark the stop tail as in progress so a mic-disconnect fallback that was
+    // queued before Stop short-circuits instead of retrying against the taken
+    // manager. IS_RECORDING itself stays true until the tail completes — the
+    // frontend polls it to keep the stop UI up. RAII so a panic in the tail
+    // below can't leave the flag stuck true.
+    let Some(_stopping_guard) = StoppingGuard::try_new() else {
+        info!("Recording stop already in progress");
+        return Ok(());
+    };
+
     // Emit shutdown progress to frontend
     let _ = app.emit(
         "recording-shutdown-progress",
@@ -704,13 +721,6 @@ pub async fn stop_recording<R: Runtime>(
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         global_manager.take()
     };
-
-    // Mark the stop tail as in progress so a mic-disconnect fallback that was
-    // queued before Stop short-circuits instead of retrying against the taken
-    // manager. IS_RECORDING itself stays true until the tail completes — the
-    // frontend polls it to keep the stop UI up. RAII so a panic in the tail
-    // below can't leave the flag stuck true.
-    let _stopping_guard = StoppingGuard::new();
 
     let stop_result = if let Some(mut manager) = manager_for_cleanup {
         // Use FORCE FLUSH to immediately process all accumulated audio - eliminates 30s delay!

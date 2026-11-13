@@ -234,13 +234,46 @@ pub async fn parakeet_validate_model_ready_with_config<R: tauri::Runtime>(
         let guard = PARAKEET_ENGINE.lock().unwrap();
         guard.as_ref().cloned()
     };
+    let Some(engine) = engine else {
+        return Err("Parakeet engine not initialized".to_string());
+    };
+    match parakeet_pick_model_with_config(app).await? {
+        ParakeetModelChoice::Loaded(current_model) => Ok(current_model),
+        ParakeetModelChoice::ToLoad(model_name) => {
+            engine
+                .load_model(&model_name)
+                .await
+                .map_err(|e| format!("Failed to load Parakeet model {}: {}", model_name, e))?;
+            Ok(model_name)
+        }
+    }
+}
+
+pub enum ParakeetModelChoice {
+    /// A model is already in memory.
+    Loaded(String),
+    /// This downloaded model will be loaded.
+    ToLoad(String),
+}
+
+/// Picks the model a recording will use (the configured one, else the first
+/// available int8 model) and checks it is downloaded, without loading it.
+/// Loading takes about a second, so a recording starts capture first and the
+/// transcription task loads the model while audio queues.
+pub async fn parakeet_pick_model_with_config<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<ParakeetModelChoice, String> {
+    let engine = {
+        let guard = PARAKEET_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
 
     if let Some(engine) = engine {
         // Check if a model is currently loaded
         if engine.is_model_loaded().await {
             if let Some(current_model) = engine.get_current_model().await {
                 log::info!("Parakeet model already loaded: {}", current_model);
-                return Ok(current_model);
+                return Ok(ParakeetModelChoice::Loaded(current_model));
             }
         }
 
@@ -332,12 +365,7 @@ pub async fn parakeet_validate_model_ready_with_config<R: tauri::Runtime>(
                 .clone()
         };
 
-        engine
-            .load_model(&model_name)
-            .await
-            .map_err(|e| format!("Failed to load Parakeet model {}: {}", model_name, e))?;
-
-        Ok(model_name)
+        Ok(ParakeetModelChoice::ToLoad(model_name))
     } else {
         Err("Parakeet engine not initialized".to_string())
     }

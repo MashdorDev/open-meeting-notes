@@ -66,6 +66,16 @@ pub fn start_transcription_task<R: Runtime>(
                     "actionable": true,
                     "phase": "active"
                 }));
+                // The model loads after capture has started, so end the
+                // recording here (the audio so far is kept). Spawned: the stop
+                // waits for this task to finish.
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let args = crate::audio::recording_commands::RecordingArgs { save_path: String::new() };
+                    if let Err(e) = crate::audio::recording_commands::stop_recording(app, args).await {
+                        error!("Failed to stop recording after transcription init failure: {}", e);
+                    }
+                });
                 return;
             }
         };
