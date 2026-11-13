@@ -4,6 +4,7 @@ import { Transcript, TranscriptSegmentData } from '@/types';
 import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
+import { OtherSpeakerName } from './OtherSpeakerName';
 import { useMemo } from 'react';
 
 interface TranscriptPanelProps {
@@ -23,6 +24,11 @@ interface TranscriptPanelProps {
   totalCount?: number;
   loadedCount?: number;
   onLoadMore?: () => void;
+
+  // Names of the other side, when found in the transcript
+  othersLabel?: string;
+  otherSpeakerNames?: string[];
+  onSaveOtherSpeakerNames?: (names: string[]) => Promise<void>;
 
   // Retranscription props
   meetingId?: string;
@@ -45,6 +51,9 @@ export function TranscriptPanel({
   totalCount,
   loadedCount,
   onLoadMore,
+  othersLabel,
+  otherSpeakerNames,
+  onSaveOtherSpeakerNames,
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
@@ -77,6 +86,9 @@ export function TranscriptPanel({
           meetingFolderPath={meetingFolderPath}
           onRefetchTranscripts={onRefetchTranscripts}
         />
+        {onSaveOtherSpeakerNames && convertedSegments.some(s => s.speaker === 'system') && (
+          <OtherSpeakerName names={otherSpeakerNames ?? []} onSave={onSaveOtherSpeakerNames} />
+        )}
       </div>
 
       {/* Transcript content - use virtualized view for better performance */}
@@ -89,6 +101,7 @@ export function TranscriptPanel({
           isStopping={false}
           enableStreaming={false}
           showConfidence={true}
+          othersLabel={othersLabel}
           disableAutoScroll={disableAutoScroll}
           hasMore={hasMore}
           isLoadingMore={isLoadingMore}

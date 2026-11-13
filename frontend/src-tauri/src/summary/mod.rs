@@ -38,6 +38,7 @@ pub mod processor;
 pub mod service;
 pub mod summary_engine;
 pub mod template_commands;
+pub mod speaker_names;
 pub mod title;
 pub mod templates;
 

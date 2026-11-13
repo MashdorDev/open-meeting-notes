@@ -74,17 +74,23 @@ fn transcript_excerpt(text: &str) -> String {
     format!("{head}\n[...]\n{tail}")
 }
 
-/// Turns raw model output into a usable title, or None if it is unusable.
-fn clean_title(raw: &str) -> Option<String> {
+/// The answer part of a model reply, without reasoning blocks, or None if the
+/// reply was cut off while still reasoning.
+pub(crate) fn visible_reply(raw: &str) -> Option<String> {
     let visible = clean_llm_markdown_detailed(raw).markdown;
     // Some chat templates open the think block inside the prompt, so the reply
     // is bare reasoning followed by "</think>" and then the answer.
     // A last marker that opens a block means the reply was cut off mid-reasoning.
-    let visible = match THINK_MARKER_REGEX.find_iter(&visible).last() {
-        Some(marker) if !marker.as_str().starts_with("</") => return None,
-        Some(marker) => &visible[marker.end()..],
-        None => visible.as_str(),
-    };
+    match THINK_MARKER_REGEX.find_iter(&visible).last() {
+        Some(marker) if !marker.as_str().starts_with("</") => None,
+        Some(marker) => Some(visible[marker.end()..].to_string()),
+        None => Some(visible),
+    }
+}
+
+/// Turns raw model output into a usable title, or None if it is unusable.
+fn clean_title(raw: &str) -> Option<String> {
+    let visible = visible_reply(raw)?;
     let line = visible.lines().map(str::trim).find(|l| !l.is_empty())?;
     let line = line.trim_start_matches('#').trim();
     let line = line
@@ -133,10 +139,12 @@ async fn rename_if_unchanged(
     Ok(true)
 }
 
-async fn ask_llm(
+/// One completion from the configured summary model.
+pub(crate) async fn ask_llm(
     pool: &SqlitePool,
     app_data_dir: Option<&PathBuf>,
-    transcript: &str,
+    system_prompt: &str,
+    user_prompt: &str,
 ) -> Result<String, String> {
     let config = SettingsRepository::get_model_config(pool)
         .await
@@ -170,14 +178,13 @@ async fn ask_llm(
     };
     let api_key = if provider == LLMProvider::CustomOpenAI { custom_key } else { api_key };
 
-    let user_prompt = format!("Transcript:\n{}", transcript_excerpt(transcript));
     let completion = generate_summary(
         &reqwest::Client::new(),
         &provider,
         &config.model,
         &api_key,
-        SYSTEM_PROMPT,
-        &user_prompt,
+        system_prompt,
+        user_prompt,
         ollama_endpoint.as_deref(),
         custom_endpoint.as_deref(),
         None,
@@ -242,7 +249,8 @@ pub async fn generate_meeting_title<R: Runtime>(
     }
 
     let app_data_dir = app.path().app_data_dir().ok();
-    let raw = match ask_llm(&pool, app_data_dir.as_ref(), &transcript).await {
+    let user_prompt = format!("Transcript:\n{}", transcript_excerpt(&transcript));
+    let raw = match ask_llm(&pool, app_data_dir.as_ref(), SYSTEM_PROMPT, &user_prompt).await {
         Ok(raw) => raw,
         Err(e) => {
             warn!("Auto title failed for {meeting_id}: {e}");

@@ -113,6 +113,13 @@ pub async fn start_retranscription<R: Runtime>(
 
     match &result {
         Ok(res) => {
+            if let Some(state) = app.try_state::<AppState>() {
+                tauri::async_runtime::spawn(crate::summary::speaker_names::identify_other_speakers(
+                    app.clone(),
+                    state.db_manager.pool().clone(),
+                    res.meeting_id.clone(),
+                ));
+            }
             let _ = app.emit(
                 "retranscription-complete",
                 serde_json::json!({
