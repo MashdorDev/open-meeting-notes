@@ -74,6 +74,19 @@ fn transcript_excerpt(text: &str) -> String {
     format!("{head}\n[...]\n{tail}")
 }
 
+/// True for a title that names nothing, such as "Meeting Recording Title":
+/// small models sometimes answer with a placeholder instead of a topic.
+fn is_placeholder_title(title: &str) -> bool {
+    const GENERIC: &[&str] = &[
+        "a", "an", "the", "of", "for", "meeting", "meetings", "recording", "title", "transcript",
+        "call", "untitled", "new", "conversation", "summary", "notes", "audio", "discussion", "here",
+    ];
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .all(|w| GENERIC.contains(&w.to_lowercase().as_str()))
+}
+
 /// The answer part of a model reply, without reasoning blocks, or None if the
 /// reply was cut off while still reasoning.
 pub(crate) fn visible_reply(raw: &str) -> Option<String> {
@@ -103,7 +116,7 @@ fn clean_title(raw: &str) -> Option<String> {
         .trim_end_matches(|c: char| matches!(c, '.' | ':' | ';' | ','))
         .trim();
 
-    if line.is_empty() || line.contains('<') || is_default_meeting_title(line) {
+    if line.is_empty() || line.contains('<') || is_default_meeting_title(line) || is_placeholder_title(line) {
         return None;
     }
     let title: String = line.chars().take(MAX_TITLE_CHARS).collect();
@@ -306,6 +319,10 @@ mod tests {
         assert_eq!(clean_title("   \n "), None);
         assert_eq!(clean_title("<Add Title here>"), None);
         assert_eq!(clean_title("Meeting 11_11_26_14_05_09"), None);
+        assert_eq!(clean_title("Meeting Recording Title"), None);
+        assert_eq!(clean_title("Title: Untitled meeting"), None);
+        assert_eq!(clean_title("Discussion of Sports Parachute Maneuverability").as_deref(),
+                   Some("Discussion of Sports Parachute Maneuverability"));
         assert_eq!(clean_title("<think>long reasoning</think>"), None);
         // Cut off at the token limit while still reasoning.
         assert_eq!(clean_title("<think>\nOkay, the user wants a short title. Let me"), None);
