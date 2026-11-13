@@ -34,7 +34,20 @@ struct AudioMixerRingBuffer {
     system_buffer: VecDeque<f32>,
     window_size_samples: usize,  // Fixed mixing window (e.g., 50ms)
     max_buffer_size: usize,  // Safety limit (e.g., 100ms)
+    sample_rate: u32,
+    // Samples each source has put on the shared timeline so far, silence
+    // padding included
+    mic_position: u64,
+    system_position: u64,
 }
+
+/// A source whose samples fall this far behind the recording clock had a gap
+/// (WASAPI loopback sends nothing while no app plays audio, a Bluetooth mic
+/// drops out). Larger than callback jitter, small enough that the echo
+/// canceller's 500 ms lag search still covers what is left. A device clock
+/// that runs slow against the wall clock also crosses it now and then (every
+/// half hour at 100 ppm), which costs a 200 ms hole in that track.
+const GAP_FILL_MS: f64 = 200.0;
 
 impl AudioMixerRingBuffer {
     fn new(sample_rate: u32) -> Self {
@@ -57,7 +70,44 @@ impl AudioMixerRingBuffer {
             system_buffer: VecDeque::with_capacity(max_buffer_size),
             window_size_samples,
             max_buffer_size,
+            sample_rate,
+            mic_position: 0,
+            system_position: 0,
         }
+    }
+
+    /// Adds a capture chunk whose last sample was taken at `timestamp`
+    /// seconds on the recording clock. If the source fell behind that clock
+    /// (it delivered nothing for a while), the gap is filled with silence
+    /// first, so audio after the gap lines up with the other source again.
+    /// If it ran ahead (a backlog delivered after its gap was filled, or a
+    /// device clock that runs fast), the surplus is dropped.
+    fn add_samples_at(&mut self, device_type: DeviceType, mut samples: Vec<f32>, timestamp: f64) {
+        let (position, other_position) = match device_type {
+            DeviceType::Microphone => (self.mic_position, self.system_position),
+            DeviceType::System => (self.system_position, self.mic_position),
+        };
+        let expected_end = (timestamp.max(0.0) * self.sample_rate as f64) as u64;
+        let end = position + samples.len() as u64;
+        let tolerance = (GAP_FILL_MS * self.sample_rate as f64 / 1000.0) as u64;
+        if end > expected_end + tolerance {
+            let surplus = ((end - expected_end) as usize).min(samples.len());
+            debug!("Dropping {:.0} ms of {:?} audio that ran ahead of the clock",
+                   surplus as f64 * 1000.0 / self.sample_rate as f64, device_type);
+            samples.drain(..surplus);
+        } else if expected_end > end + tolerance && other_position > end + tolerance {
+            // Filled only up to where the other source is: when both fell
+            // behind together (the machine slept, the process stalled) nothing
+            // was lost against each other and the stall is not written out as
+            // silence. While one source is silent the stalled-source padding
+            // in extract_window keeps it within two windows of the other, so a
+            // real gap left to fill is never longer than that.
+            let gap = ((expected_end - end).min(other_position - end) as usize).min(2 * self.window_size_samples);
+            debug!("Filling a {:.0} ms gap in {:?} audio with silence",
+                   gap as f64 * 1000.0 / self.sample_rate as f64, device_type);
+            self.add_samples(device_type.clone(), vec![0.0; gap]);
+        }
+        self.add_samples(device_type, samples);
     }
 
     fn add_samples(&mut self, device_type: DeviceType, samples: Vec<f32>) {
@@ -72,8 +122,14 @@ impl AudioMixerRingBuffer {
         }
 
         match device_type {
-            DeviceType::Microphone => self.mic_buffer.extend(samples),
-            DeviceType::System => self.system_buffer.extend(samples),
+            DeviceType::Microphone => {
+                self.mic_position += samples.len() as u64;
+                self.mic_buffer.extend(samples);
+            }
+            DeviceType::System => {
+                self.system_position += samples.len() as u64;
+                self.system_buffer.extend(samples);
+            }
         }
 
         // CRITICAL FIX: Add warnings before dropping samples
@@ -89,18 +145,42 @@ impl AudioMixerRingBuffer {
                   self.system_buffer.len() - self.max_buffer_size);
         }
 
-        // Safety: prevent buffer overflow (keep only last 200ms)
+        // Safety: prevent buffer overflow. Dropped samples leave the timeline.
         while self.mic_buffer.len() > self.max_buffer_size {
             self.mic_buffer.pop_front();
+            self.mic_position -= 1;
         }
         while self.system_buffer.len() > self.max_buffer_size {
             self.system_buffer.pop_front();
+            self.system_position -= 1;
         }
     }
 
+    /// Mix only when both sources have a full window, so the two tracks stay
+    /// aligned sample for sample. Mixing as soon as one source had a window
+    /// padded the other with silence at every callback jitter, and each pad
+    /// shifted that source later (tens of ms of drift within a minute). A
+    /// source that is a full window behind the other has stalled or is not
+    /// recorded: then pad it, as before.
     fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples ||
-        self.system_buffer.len() >= self.window_size_samples
+        let (mic, system, window) = (self.mic_buffer.len(), self.system_buffer.len(), self.window_size_samples);
+        (mic >= window && system >= window) || mic.max(system) >= 2 * window
+    }
+
+    /// The samples left at a flush, padded to the same length.
+    fn extract_remaining(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+        let len = self.mic_buffer.len().max(self.system_buffer.len()).min(self.window_size_samples);
+        if len == 0 {
+            return None;
+        }
+        let mut take = |buffer: &mut VecDeque<f32>| -> Vec<f32> {
+            let mut window: Vec<f32> = buffer.drain(..buffer.len().min(len)).collect();
+            window.resize(len, 0.0);
+            window
+        };
+        let mic = take(&mut self.mic_buffer);
+        let system = take(&mut self.system_buffer);
+        Some((mic, system))
     }
 
     fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
@@ -108,48 +188,17 @@ impl AudioMixerRingBuffer {
             return None;
         }
 
-        // Extract mic window with zero-padding for incomplete buffers
-        // Zero-padding (silence) is preferred over last-sample-hold to prevent artifacts
-
-        // Extract mic window (or pad with zeros if insufficient data)
-        let mic_window = if self.mic_buffer.len() >= self.window_size_samples {
-            // Enough mic data - drain window
-            self.mic_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.mic_buffer.is_empty() {
-            // Some mic data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.mic_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No mic data - return silence
-            vec![0.0; self.window_size_samples]
+        // A short source is padded with silence (not last-sample-hold, which
+        // repeats); the padding moves it along the timeline like real samples.
+        let window = self.window_size_samples;
+        let take = |buffer: &mut VecDeque<f32>, position: &mut u64| -> Vec<f32> {
+            let mut out: Vec<f32> = buffer.drain(..buffer.len().min(window)).collect();
+            *position += (window - out.len()) as u64;
+            out.resize(window, 0.0);
+            out
         };
-
-        // Extract system window (or pad with zeros if insufficient data)
-        let sys_window = if self.system_buffer.len() >= self.window_size_samples {
-            // Enough system data - drain window
-            self.system_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.system_buffer.is_empty() {
-            // Some system data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.system_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No system data - return silence
-            vec![0.0; self.window_size_samples]
-        };
+        let mic_window = take(&mut self.mic_buffer, &mut self.mic_position);
+        let sys_window = take(&mut self.system_buffer, &mut self.system_position);
 
         Some((mic_window, sys_window))
     }
@@ -222,8 +271,7 @@ pub struct AudioCapture {
     // Audio enhancement processors (microphone only)
     noise_suppressor: Arc<std::sync::Mutex<Option<NoiseSuppressionProcessor>>>,
     high_pass_filter: Arc<std::sync::Mutex<Option<HighPassFilter>>>,
-    // EBU R128 normalizer for microphone audio (per-device, stateful)
-    normalizer: Arc<std::sync::Mutex<Option<LoudnessNormalizer>>>,
+    // Loudness normalization runs in AudioPipeline, after echo cancellation.
     // Note: Using global recording timestamp for synchronization
 }
 
@@ -281,7 +329,7 @@ impl AudioCapture {
 
         // Initialize audio enhancement processors for MICROPHONE ONLY
         // System audio doesn't need enhancement (already clean)
-        let (noise_suppressor, high_pass_filter, normalizer) = if matches!(device_type, DeviceType::Microphone) {
+        let (noise_suppressor, high_pass_filter) = if matches!(device_type, DeviceType::Microphone) {
             // Initialize noise suppression (RNNoise) at 48kHz - CONDITIONAL based on flag
             let ns = if super::ffmpeg_mixer::RNNOISE_APPLY_ENABLED {
                 match NoiseSuppressionProcessor::new(TARGET_SAMPLE_RATE) {
@@ -307,23 +355,11 @@ impl AudioCapture {
                 Some(filter)
             };
 
-            // Initialize EBU R128 normalizer (professional loudness standard)
-            let norm = match LoudnessNormalizer::new(1, TARGET_SAMPLE_RATE) {
-                Ok(normalizer) => {
-                    info!("✅ EBU R128 normalizer initialized for microphone '{}' (target: -23 LUFS)", device.name);
-                    Some(normalizer)
-                }
-                Err(e) => {
-                    warn!("⚠️ Failed to create normalizer for microphone: {}, normalization disabled", e);
-                    None
-                }
-            };
-
-            (ns, hpf, norm)
+            (ns, hpf)
         } else {
             // System audio: no enhancement needed
             info!("ℹ️ System audio '{}' captured raw (no enhancement)", device.name);
-            (None, None, None)
+            (None, None)
         };
 
         // CRITICAL FIX: Initialize persistent resampler to preserve energy across chunks
@@ -391,7 +427,6 @@ impl AudioCapture {
             resampler_chunk_size: RESAMPLER_CHUNK_SIZE,
             noise_suppressor: Arc::new(std::sync::Mutex::new(noise_suppressor)),
             high_pass_filter: Arc::new(std::sync::Mutex::new(high_pass_filter)),
-            normalizer: Arc::new(std::sync::Mutex::new(normalizer)),
             // Using global recording time for sync
         }
     }
@@ -523,8 +558,9 @@ impl AudioCapture {
         }
 
         // AUDIO ENHANCEMENT PIPELINE (Microphone Only)
-        // Processing order is critical: high-pass → noise suppression → normalization
-        // This ensures noise is removed before being amplified by the normalizer
+        // high-pass → noise suppression here; loudness normalization follows
+        // echo cancellation in AudioPipeline (a canceller must see the mic
+        // before any time-varying gain or limiting).
         if matches!(self.device_type, DeviceType::Microphone) {
             // STEP 1: Apply high-pass filter to remove low-frequency rumble (< 80 Hz)
             if let Ok(mut hpf_lock) = self.high_pass_filter.lock() {
@@ -569,20 +605,6 @@ impl AudioCapture {
                 }
             }
 
-            // STEP 3: Apply EBU R128 normalization (professional loudness standard)
-            if let Ok(mut normalizer_lock) = self.normalizer.lock() {
-                if let Some(ref mut normalizer) = *normalizer_lock {
-                    mono_data = normalizer.normalize_loudness(&mono_data);
-
-                    // Log normalization occasionally for debugging
-                    let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
-                    if chunk_id % 200 == 0 && !mono_data.is_empty() {
-                        let rms = (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt();
-                        let peak = mono_data.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
-                        debug!("🎤 After normalization chunk {}: RMS={:.4}, Peak={:.4}", chunk_id, rms, peak);
-                    }
-                }
-            }
         }
 
         // Create audio chunk with stream-specific timestamp (get ID first for logging)
@@ -616,8 +638,9 @@ impl AudioCapture {
         //     }
         // }
 
-        // Use global recording timestamp for proper synchronization
-        let timestamp = self.state.get_recording_duration().unwrap_or(0.0);
+        // Recording clock without paused time: chunks are dropped while paused,
+        // so the mixer must not take a pause for a capture gap.
+        let timestamp = self.state.get_active_recording_duration().unwrap_or(0.0);
 
         // RAW AUDIO CHUNK: No gain applied - will be mixed and gained downstream
         // Use 48kHz if we resampled, otherwise use original rate
@@ -714,6 +737,12 @@ pub struct AudioPipeline {
     // Detect speech on each channel alone (labelling only, never transcribed)
     mic_vad: ContinuousVadProcessor,
     sys_vad: ContinuousVadProcessor,
+    /// EBU R128 loudness for the mic, applied after echo cancellation: a
+    /// canceller needs the mic without time-varying gain or limiting.
+    mic_normalizer: Option<LoudnessNormalizer>,
+    /// Removes speaker playback from the mic, with the system window as the
+    /// reference, before the windows are mixed.
+    echo_canceller: Option<super::echo_cancellation::MicEchoCanceller>,
 }
 
 impl AudioPipeline {
@@ -727,6 +756,7 @@ impl AudioPipeline {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        mic_and_system: bool,
     ) -> Result<Self> {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
@@ -775,6 +805,31 @@ impl AudioPipeline {
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
         let mixer = ProfessionalAudioMixer::new(sample_rate);
 
+        let mic_normalizer = match LoudnessNormalizer::new(1, sample_rate) {
+            Ok(normalizer) => {
+                info!("✅ EBU R128 normalizer initialized for microphone (target: -23 LUFS)");
+                Some(normalizer)
+            }
+            Err(e) => {
+                warn!("⚠️ Failed to create normalizer for microphone: {}, normalization disabled", e);
+                None
+            }
+        };
+
+        // Needs both sources: the system audio is the canceller's reference.
+        // Left on with headphones: with no echo in the mic the model leaves the
+        // voice as it is, and the output route can change mid-call.
+        let echo_canceller = if !mic_and_system {
+            None
+        } else if std::env::var("MEETILY_AEC").as_deref() == Ok("off") {
+            info!("🔇 Mic echo cancellation off: MEETILY_AEC=off");
+            None
+        } else {
+            super::echo_cancellation::MicEchoCanceller::new(sample_rate)
+                .map_err(|e| warn!("🔇 Mic echo cancellation unavailable: {e}"))
+                .ok()
+        };
+
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
 
@@ -797,6 +852,8 @@ impl AudioPipeline {
             speaker_timeline: SpeakerEnergyTimeline::default(),
             mic_vad,
             sys_vad,
+            mic_normalizer,
+            echo_canceller,
         })
     }
 
@@ -852,74 +909,14 @@ impl AudioPipeline {
                     }
 
                     // STEP 1: Add raw audio to ring buffer for mixing
-                    // Microphone audio is already normalized at capture level (AudioCapture)
-                    // System audio remains raw
-                    self.ring_buffer.add_samples(chunk.device_type.clone(), chunk.data);
+                    // Both sources arrive here without loudness normalization
+                    self.ring_buffer.add_samples_at(chunk.device_type.clone(), chunk.data, chunk.timestamp);
 
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
-                        if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
-                            self.speaker_timeline.push_window(&mic_window, &sys_window, self.sample_rate);
-                            match self.mic_vad.process_audio(&mic_window) {
-                                Ok(mic_segments) => {
-                                    for s in mic_segments {
-                                        self.speaker_timeline
-                                            .add_mic_speech(s.start_timestamp_ms, s.end_timestamp_ms);
-                                    }
-                                }
-                                Err(e) => warn!("Mic VAD error: {}", e),
-                            }
-                            match self.sys_vad.process_audio(&sys_window) {
-                                Ok(sys_segments) => {
-                                    for s in sys_segments {
-                                        self.speaker_timeline
-                                            .add_sys_speech(s.start_timestamp_ms, s.end_timestamp_ms);
-                                    }
-                                }
-                                Err(e) => warn!("System VAD error: {}", e),
-                            }
-                            // Simple mixing without aggressive ducking
-                            let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
-
-                            // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
-                            // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
-                            // System audio at natural levels
-                            // Previous 2x gain was causing excessive limiting/distortion
-                            let mixed_with_gain = mixed_clean;
-
-                            // STEP 3: Send mixed audio for transcription (VAD + Whisper)
-                            match self.vad_processor.process_audio(&mixed_with_gain) {
-                                Ok(speech_segments) => {
-                                    for segment in speech_segments {
-                                        let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
-
-                                        if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
-                                            info!("📤 Sending VAD segment: {:.1}ms, {} samples",
-                                                  duration_ms, segment.samples.len());
-
-                                            self.send_segment(segment);
-                                        } else {
-                                            debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
-                                                   duration_ms, segment.samples.len());
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("⚠️ VAD error: {}", e);
-                                }
-                            }
-
-                            // STEP 4: Send mixed audio for recording (WAV file)
-                            if let Some(ref sender) = self.recording_sender_for_mixed {
-                                let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
-                                    sample_rate: self.sample_rate,
-                                    timestamp: chunk.timestamp,
-                                    chunk_id: self.chunk_id_counter,
-                                    device_type: DeviceType::Microphone,  // Mixed audio
-                                };
-                                let _ = sender.send(recording_chunk);
-                            }
+                        if let Some((mut mic_window, mut sys_window)) = self.ring_buffer.extract_window() {
+                            self.condition_mic(&mut mic_window, &mut sys_window);
+                            self.mix_and_dispatch(&mic_window, &sys_window, chunk.timestamp);
                         }
                     }
                 }
@@ -993,8 +990,100 @@ impl AudioPipeline {
         }
     }
 
+    /// Echo cancellation, then mic loudness normalization, of one aligned
+    /// window, before it is mixed.
+    fn condition_mic(&mut self, mic_window: &mut Vec<f32>, sys_window: &mut Vec<f32>) {
+        if let Some(aec) = self.echo_canceller.as_mut() {
+            aec.process(mic_window, sys_window);
+        }
+        self.normalize_mic(mic_window);
+    }
+
+    fn normalize_mic(&mut self, mic_window: &mut Vec<f32>) {
+        if let Some(normalizer) = self.mic_normalizer.as_mut() {
+            *mic_window = normalizer.normalize_loudness(mic_window);
+        }
+    }
+
+    /// Mix one window and send it to the VAD (transcription) and the recording.
+    fn mix_and_dispatch(&mut self, mic_window: &[f32], sys_window: &[f32], timestamp: f64) {
+        self.speaker_timeline.push_window(mic_window, sys_window, self.sample_rate);
+        match self.mic_vad.process_audio(mic_window) {
+            Ok(mic_segments) => {
+                for s in mic_segments {
+                    self.speaker_timeline.add_mic_speech(s.start_timestamp_ms, s.end_timestamp_ms);
+                }
+            }
+            Err(e) => warn!("Mic VAD error: {}", e),
+        }
+        match self.sys_vad.process_audio(sys_window) {
+            Ok(sys_segments) => {
+                for s in sys_segments {
+                    self.speaker_timeline.add_sys_speech(s.start_timestamp_ms, s.end_timestamp_ms);
+                }
+            }
+            Err(e) => warn!("System VAD error: {}", e),
+        }
+
+        // Simple mixing without aggressive ducking
+        let mixed_clean = self.mixer.mix_window(mic_window, sys_window);
+
+        // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
+        // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
+        // System audio at natural levels
+        // Previous 2x gain was causing excessive limiting/distortion
+        let mixed_with_gain = mixed_clean;
+
+        // STEP 3: Send mixed audio for transcription (VAD + Whisper)
+        match self.vad_processor.process_audio(&mixed_with_gain) {
+            Ok(speech_segments) => {
+                for segment in speech_segments {
+                    let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
+
+                    if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
+                        info!("📤 Sending VAD segment: {:.1}ms, {} samples",
+                              duration_ms, segment.samples.len());
+
+                        self.send_segment(segment);
+                    } else {
+                        debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
+                               duration_ms, segment.samples.len());
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ VAD error: {}", e);
+            }
+        }
+
+        // STEP 4: Send mixed audio for recording (WAV file)
+        if let Some(ref sender) = self.recording_sender_for_mixed {
+            let recording_chunk = AudioChunk {
+                data: mixed_with_gain.clone(),
+                sample_rate: self.sample_rate,
+                timestamp,
+                chunk_id: self.chunk_id_counter,
+                device_type: DeviceType::Microphone,  // Mixed audio
+            };
+            let _ = sender.send(recording_chunk);
+        }
+    }
+
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
+
+        // Mix the samples still waiting for a full window, so the end of the
+        // recording is not lost.
+        while let Some((mut mic_window, mut sys_window)) = self.ring_buffer.extract_remaining() {
+            self.condition_mic(&mut mic_window, &mut sys_window);
+            self.mix_and_dispatch(&mic_window, &sys_window, 0.0);
+        }
+        // The canceller holds back its last LEAD_MS; release it before the VAD
+        // flushes. Stop sends several flush signals: only the first gets audio.
+        if let Some((mut mic_window, sys_window)) = self.echo_canceller.as_mut().and_then(|aec| aec.drain()) {
+            self.normalize_mic(&mut mic_window);
+            self.mix_and_dispatch(&mic_window, &sys_window, 0.0);
+        }
 
         // Close any mic speech still open so the final segments can be labelled
         match self.mic_vad.flush() {
@@ -1068,6 +1157,7 @@ impl AudioPipelineManager {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        mic_and_system: bool,
     ) -> Result<()> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
@@ -1089,6 +1179,7 @@ impl AudioPipelineManager {
             mic_device_kind,
             system_device_name,
             system_device_kind,
+            mic_and_system,
         )?;
         state.set_audio_sender(audio_sender.clone());
 
@@ -1171,6 +1262,186 @@ impl AudioPipelineManager {
 
         // Now stop normally
         self.stop().await
+    }
+}
+
+#[cfg(test)]
+mod ring_buffer_tests {
+    use super::*;
+
+    fn noise(n: usize, seed: &mut u64) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((*seed >> 33) % 2000) as f32 / 1000.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn jittered_callbacks_keep_the_tracks_aligned() {
+        // The same signal on both sources, in real time: every 10 ms each
+        // source delivers what it has, up to 200 ms late, in random order.
+        let mut seed = 1;
+        let total = 48_000 * 30;
+        let signal = noise(total, &mut seed);
+        let mut ring = AudioMixerRingBuffer::new(48_000);
+        let mut sent = [0usize; 2];
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        let mut now = 0usize;
+        while sent[0] < total || sent[1] < total {
+            now += 480;
+            let order = if noise(1, &mut seed)[0] > 0.0 { [0, 1] } else { [1, 0] };
+            for source in order {
+                let late = ((noise(1, &mut seed)[0] + 1.0) * 4_800.0) as usize;
+                let due = now.saturating_sub(late).min(total);
+                if due > sent[source] {
+                    let kind = if source == 0 { DeviceType::Microphone } else { DeviceType::System };
+                    ring.add_samples(kind, signal[sent[source]..due].to_vec());
+                    sent[source] = due;
+                }
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+        while let Some((mic, sys)) = ring.extract_remaining() {
+            mic_out.extend(mic);
+            sys_out.extend(sys);
+        }
+        assert!(mic_out == signal && sys_out == signal, "tracks no longer aligned");
+    }
+
+    #[test]
+    fn a_single_source_is_still_mixed() {
+        let mut ring = AudioMixerRingBuffer::new(48_000);
+        let window = ring.window_size_samples;
+        ring.add_samples(DeviceType::Microphone, vec![0.5; 2 * window]);
+        let (mic, sys) = ring.extract_window().expect("mixes once a window behind");
+        assert_eq!((mic.len(), sys), (window, vec![0.0; window]));
+    }
+
+    #[test]
+    fn a_source_that_resumes_after_a_gap_lines_up_again() {
+        // WASAPI loopback: system audio stops for 3 s while nothing plays.
+        // A click at 5 s on both sources must land on the same mixed sample.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480; // 10 ms
+        let click = 5 * rate as usize;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        for i in 0..(8 * rate as usize / chunk) {
+            let start = i * chunk;
+            let samples: Vec<f32> = (start..start + chunk).map(|n| if n == click { 1.0 } else { 0.01 }).collect();
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            ring.add_samples_at(DeviceType::Microphone, samples.clone(), timestamp);
+            if !(start >= 2 * rate as usize && start < 4 * rate as usize + 300 * 48) {
+                ring.add_samples_at(DeviceType::System, samples, timestamp);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+        let peak = |v: &[f32]| v.iter().position(|&x| x == 1.0).unwrap();
+        let (mic_click, sys_click) = (peak(&mic_out), peak(&sys_out));
+        assert_eq!(mic_click, click);
+        assert!(sys_click.abs_diff(mic_click) < 48 * 250, "system click {} vs mic {}", sys_click, mic_click);
+    }
+
+    #[test]
+    fn a_backlog_after_a_filled_gap_is_trimmed_back_into_line() {
+        // macOS: the system reader runs 300 ms late, then delivers the
+        // queued audio stamped "now". A click at 5 s must stay aligned.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480;
+        let click = 5 * rate as usize;
+        let late = 2 * rate as usize;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        let mut backlog: Vec<Vec<f32>> = Vec::new();
+        for i in 0..(8 * rate as usize / chunk) {
+            let start = i * chunk;
+            let samples: Vec<f32> = (start..start + chunk).map(|n| if n == click { 1.0 } else { 0.01 }).collect();
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            ring.add_samples_at(DeviceType::Microphone, samples.clone(), timestamp);
+            if start >= late && start < late + 300 * 48 {
+                backlog.push(samples);
+            } else {
+                for queued in backlog.drain(..) {
+                    ring.add_samples_at(DeviceType::System, queued, timestamp);
+                }
+                ring.add_samples_at(DeviceType::System, samples, timestamp);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+        let peak = |v: &[f32]| v.iter().position(|&x| x == 1.0).unwrap();
+        assert!(peak(&sys_out).abs_diff(peak(&mic_out)) < 48 * 250);
+    }
+
+    #[test]
+    fn a_stall_of_both_sources_is_not_written_out_as_silence() {
+        // Lid closed for 60 s without pausing: both resume far behind.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480;
+        let mut out = 0usize;
+        for i in 0..400usize {
+            let start = i * chunk + if i >= 200 { 60 * rate as usize } else { 0 };
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            ring.add_samples_at(DeviceType::Microphone, vec![0.01; chunk], timestamp);
+            ring.add_samples_at(DeviceType::System, vec![0.01; chunk], timestamp);
+            while let Some((mic, _)) = ring.extract_window() {
+                out += mic.len();
+            }
+        }
+        assert!(out <= 400 * chunk, "{} samples out of {} captured", out, 400 * chunk);
+    }
+
+    #[test]
+    fn a_mic_dropout_while_loopback_is_idle_keeps_the_tracks_aligned() {
+        // Windows: nothing plays, so loopback sends nothing for 3 s; the
+        // Bluetooth mic drops out for 400 ms in the middle. A click at 5 s
+        // on both sources must still line up.
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate);
+        let chunk = 480;
+        let click = 5 * rate as usize;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        for i in 0..(8 * rate as usize / chunk) {
+            let start = i * chunk;
+            let samples: Vec<f32> = (start..start + chunk).map(|n| if n == click { 1.0 } else { 0.01 }).collect();
+            let timestamp = (start + chunk) as f64 / rate as f64;
+            if !(start >= 3 * rate as usize && start < 3 * rate as usize + 400 * 48) {
+                ring.add_samples_at(DeviceType::Microphone, samples.clone(), timestamp);
+            }
+            if !(start >= rate as usize && start < 4 * rate as usize) {
+                ring.add_samples_at(DeviceType::System, samples, timestamp);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+        let peak = |v: &[f32]| v.iter().position(|&x| x == 1.0).unwrap();
+        assert!(peak(&sys_out).abs_diff(peak(&mic_out)) < 48 * 250,
+                "system click {} vs mic {}", peak(&sys_out), peak(&mic_out));
+    }
+
+    #[test]
+    fn a_flush_returns_the_tail() {
+        let mut ring = AudioMixerRingBuffer::new(48_000);
+        ring.add_samples(DeviceType::Microphone, vec![0.5; 100]);
+        ring.add_samples(DeviceType::System, vec![0.25; 60]);
+        assert!(ring.extract_window().is_none());
+        let (mic, sys) = ring.extract_remaining().unwrap();
+        assert_eq!((mic.len(), sys.len()), (100, 100));
+        assert_eq!(sys[59..61], [0.25, 0.0]);
+        assert!(ring.extract_remaining().is_none());
     }
 }
 
