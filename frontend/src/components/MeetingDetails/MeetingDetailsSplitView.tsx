@@ -57,6 +57,8 @@ interface MeetingDetailsSplitViewProps {
   summary: ReactNode;
   activeTab: MeetingDetailsTab;
   onTabChange: (tab: MeetingDetailsTab) => void;
+  /** Changes when a summary finishes generating, to show it once. */
+  summaryRevealKey?: number;
 }
 
 export function MeetingDetailsSplitView({
@@ -64,6 +66,7 @@ export function MeetingDetailsSplitView({
   summary,
   activeTab,
   onTabChange,
+  summaryRevealKey,
 }: MeetingDetailsSplitViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [ratio, setRatio] = useState(DEFAULT_RATIO);
@@ -82,6 +85,12 @@ export function MeetingDetailsSplitView({
     setRatio(readStoredRatio());
     setSummaryOpenState(readSummaryOpen());
   }, []);
+
+  // A summary that just finished shows itself, without changing the
+  // remembered choice for the next meeting.
+  useEffect(() => {
+    if (summaryRevealKey) setSummaryOpenState(true);
+  }, [summaryRevealKey]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia('(min-width: 768px)');
@@ -187,32 +196,22 @@ export function MeetingDetailsSplitView({
         >
           <div className="h-full w-px bg-gray-200 transition-[width,background-color] duration-150 ease-out group-hover:w-1 group-hover:bg-blue-400 group-active:w-1 group-active:bg-blue-500" />
         </div>
-        {summaryHidden && (
-          <button
-            type="button"
-            onClick={() => setSummaryOpen(true)}
-            className="hidden w-9 flex-shrink-0 items-center justify-center border-l border-gray-200 bg-white text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 md:flex"
-          >
-            <span className="[writing-mode:vertical-rl]">Show summary</span>
-          </button>
-        )}
         <TabsContent
           value="summary"
           forceMount
-          className={`relative mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden md:data-[state=inactive]:flex ${summaryHidden ? 'md:!hidden' : ''}`}
+          className={`mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden md:data-[state=inactive]:flex ${summaryHidden ? 'md:!hidden' : ''}`}
           {...summaryPanelProps}
         >
-          {isDesktop && (
-            <button
-              type="button"
-              onClick={() => setSummaryOpen(false)}
-              className="absolute right-2 top-2 z-20 rounded px-2 py-1 text-xs text-gray-500 hover:bg-gray-100 hover:text-gray-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-            >
-              Hide
-            </button>
-          )}
           {summary}
         </TabsContent>
+        <button
+          type="button"
+          onClick={() => setSummaryOpen(summaryHidden)}
+          aria-expanded={!summaryHidden}
+          className="hidden w-9 flex-shrink-0 items-center justify-center border-l border-gray-200 bg-white text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 md:flex"
+        >
+          <span className="[writing-mode:vertical-rl]">{summaryHidden ? 'Show summary' : 'Hide summary'}</span>
+        </button>
       </div>
     </Tabs>
   );

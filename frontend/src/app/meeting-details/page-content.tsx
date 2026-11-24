@@ -159,6 +159,18 @@ export default function PageContent({
     }
   }, [meeting.id, meetingData.aiSummary, summaryGeneration.summaryStatus]);
 
+  // A summary that finishes generating (auto or asked for) opens the
+  // summary pane even when Dor keeps it hidden.
+  const [summaryRevealKey, setSummaryRevealKey] = useState(0);
+  const previousSummaryStatus = useRef(summaryGeneration.summaryStatus);
+  useEffect(() => {
+    const previous = previousSummaryStatus.current;
+    previousSummaryStatus.current = summaryGeneration.summaryStatus;
+    if (summaryGeneration.summaryStatus === 'completed' && ['processing', 'summarizing', 'regenerating'].includes(previous)) {
+      setSummaryRevealKey(key => key + 1);
+    }
+  }, [summaryGeneration.summaryStatus]);
+
   // Auto-generate only after the model configuration has settled.
   useEffect(() => {
     if (
@@ -197,6 +209,7 @@ export default function PageContent({
       <div className="flex flex-1 min-w-0 overflow-hidden">
         <MeetingDetailsSplitView
           activeTab={activeTab}
+          summaryRevealKey={summaryRevealKey}
           onTabChange={(tab) => {
             manuallySelectedTabMeetingIdsRef.current.add(meeting.id);
             setActiveTab(tab);
