@@ -104,7 +104,7 @@ This document provides a quick overview of all available CI/CD workflows in this
 - All platforms in parallel
 - Uses reusable `build.yml` workflow
 - 30-day artifact retention
-- Artifacts prefixed with `meetily-test-`
+- Artifacts prefixed with `open-meeting-notes-test-`
 
 **Triggers:**
 - Manual dispatch only
@@ -263,13 +263,13 @@ Standalone (don't use build.yml):
 ## Artifact Naming Convention
 
 ```
-meetily-{workflow}-{platform}-{target}-{version}
+open-meeting-notes-{workflow}-{platform}-{target}-{version}
 ```
 
 **Examples:**
-- `meetily-devtest-macOS-aarch64-apple-darwin-0.1.3`
-- `meetily-test-windows-x86_64-pc-windows-msvc-0.1.3`
-- `meetily-macos-aarch64-release-0.1.3`
+- `open-meeting-notes-devtest-macOS-aarch64-apple-darwin-0.1.3`
+- `open-meeting-notes-test-windows-x86_64-pc-windows-msvc-0.1.3`
+- `open-meeting-notes-macos-aarch64-release-0.1.3`
 
 ---
 
@@ -297,8 +297,8 @@ All workflows require these secrets to be configured:
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` - Key password
 
 ### Application Configuration
-- `MEETILY_RSA_PUBLIC_KEY` - License validation public key
-- `MEETILY_DOODLE_URL` - Seasonal sidebar icon URL (repository variable, not a secret; unset = feature off)
+- `OMN_POSTHOG_KEY - Our own PostHog project key (repository secret; unset = no analytics)
+- `OMN_DOODLE_URL` - Seasonal sidebar icon URL (repository variable, not a secret; unset = feature off)
 - `SUPABASE_URL` - Online license verification
 - `SUPABASE_ANON_KEY` - Supabase anonymous key
 
