@@ -1232,6 +1232,13 @@ async fn meeting_speaker_guesses(pool: &sqlx::SqlitePool, meeting_id: &str) -> H
     }
 }
 
+/// The guessed names of the recording in progress, by label, for a page
+/// reloaded mid-call.
+#[tauri::command]
+pub async fn get_live_speaker_guesses() -> Result<HashMap<String, String>, String> {
+    Ok(crate::diarization::session::current_guesses())
+}
+
 /// The names the app guessed for a meeting's voices, by label, shown where
 /// Dor has not named a line himself.
 #[tauri::command]

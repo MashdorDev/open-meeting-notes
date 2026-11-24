@@ -186,6 +186,20 @@ fn quietest_frame_center(samples: &[f32], start: usize, len: usize) -> usize {
         .map_or(start + len / 2, |s| s + QUIET_FRAME_SAMPLES / 2)
 }
 
+/// The current recording's diarization, so a page reloaded mid-call can ask
+/// for the guessed names it missed (they are sent only when they change).
+static CURRENT: std::sync::Mutex<Option<LiveDiarization>> = std::sync::Mutex::new(None);
+
+/// The guessed names of the current recording's voices, by label.
+pub fn current_guesses() -> HashMap<String, String> {
+    CURRENT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|live| live.guesses())
+        .unwrap_or_default()
+}
+
 /// The diarization session of one recording, shared with the transcription
 /// worker. The model downloads and loads in the background; segments that
 /// arrive before it is ready get no label.
@@ -198,6 +212,7 @@ impl LiveDiarization {
     /// Starts loading the model. `OMN_DIARIZATION=off` turns it off.
     pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Self {
         let live = Self::default();
+        *CURRENT.lock().unwrap_or_else(|p| p.into_inner()) = Some(live.clone());
         if std::env::var("OMN_DIARIZATION").as_deref() == Ok("off") {
             log::info!("Speaker diarization off: OMN_DIARIZATION=off");
             return live;

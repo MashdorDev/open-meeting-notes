@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { Transcript, TranscriptUpdate, toTranscriptSpeaker } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
@@ -404,6 +405,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
           setTranscripts(formattedTranscripts);
           console.log('[Reload Sync] ✅ Transcript history synced successfully');
+          setSpeakerGuesses(await invoke<Record<string, string>>('get_live_speaker_guesses'));
 
           // Fetch meeting name from backend
           const meetingName = await recordingService.getRecordingMeetingName();
