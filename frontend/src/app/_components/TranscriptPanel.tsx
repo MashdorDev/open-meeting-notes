@@ -9,7 +9,8 @@ import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { ModalType } from '@/hooks/useModalState';
 import { useIsLinux } from '@/hooks/usePlatform';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 
 /**
  * TranscriptPanel Component
@@ -36,6 +37,20 @@ export function TranscriptPanel({
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
   const isLinux = useIsLinux();
+
+  // Names recognized from earlier meetings, by voice label; the backend
+  // sends the whole map whenever a guess appears or changes. Labels restart
+  // at Speaker 1 each recording, so the last recording's names are dropped.
+  const [speakerGuesses, setSpeakerGuesses] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (isRecording) setSpeakerGuesses({});
+  }, [isRecording]);
+  useEffect(() => {
+    const unlisten = listen<Record<string, string>>('speaker-guesses', event => setSpeakerGuesses(event.payload));
+    return () => {
+      unlisten.then(stop => stop());
+    };
+  }, []);
 
   // Convert transcripts to segments for virtualized view
   const segments = useMemo(() =>
@@ -115,6 +130,7 @@ export function TranscriptPanel({
               isStopping={isStopping}
               enableStreaming={isRecording}
               showConfidence={true}
+              speakerGuesses={speakerGuesses}
             />
           </div>
         </div>
