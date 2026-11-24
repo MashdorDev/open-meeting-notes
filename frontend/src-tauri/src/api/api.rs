@@ -1083,17 +1083,66 @@ pub async fn name_meeting_speaker(
     speaker_label: String,
     name: Option<String>,
 ) -> Result<Vec<String>, String> {
-    sqlx::query_scalar(
+    let name = clean_speaker_name(name);
+    let pool = state.db_manager.pool();
+    let changed = sqlx::query_scalar(
         "UPDATE transcripts SET speaker_name = ?
          WHERE meeting_id = ? AND speaker_label = ? AND COALESCE(speaker_name_pinned, 0) = 0
          RETURNING id",
     )
-    .bind(clean_speaker_name(name))
+    .bind(&name)
     .bind(&meeting_id)
     .bind(&speaker_label)
-    .fetch_all(state.db_manager.pool())
+    .fetch_all(pool)
     .await
-    .map_err(|e| format!("Database error: {}", e))
+    .map_err(|e| format!("Database error: {}", e))?;
+    // The names are saved either way: a missing or unreadable voiceprint
+    // only means this meeting adds nothing to the person's profile.
+    if let Err(e) = record_voice_sample(pool, &meeting_id, &speaker_label, name.as_deref()).await {
+        log_warn!("Speaker named, but its voice was not kept: {}", e);
+    }
+    Ok(changed)
+}
+
+/// Keeps the voice of a speaker just named as a sample of that person, from
+/// the voiceprints saved with the meeting. Clearing the name drops it, and
+/// naming the speaker again replaces it, so a corrected name corrects the
+/// profile too.
+async fn record_voice_sample(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    speaker_label: &str,
+    name: Option<&str>,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM voice_samples WHERE meeting_id = ? AND speaker_label = ?")
+        .bind(meeting_id)
+        .bind(speaker_label)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(name) = name else { return Ok(()) };
+    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let Some(folder) = folder else { return Ok(()) };
+    let voiceprint = crate::diarization::voiceprints::read_voiceprints(std::path::Path::new(&folder))
+        .map_err(|e| format!("reading voiceprints: {}", e))?
+        .into_iter()
+        .find(|v| v.label == speaker_label);
+    let Some(voiceprint) = voiceprint else { return Ok(()) };
+    sqlx::query("INSERT INTO voice_samples (meeting_id, speaker_label, name, segments, embedding) VALUES (?, ?, ?, ?, ?)")
+        .bind(meeting_id)
+        .bind(speaker_label)
+        .bind(name)
+        .bind(voiceprint.segments as i64)
+        .bind(serde_json::to_string(&voiceprint.embedding).map_err(|e| e.to_string())?)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Names one transcript line on its own, so naming its whole voice later
@@ -1593,5 +1642,50 @@ mod external_url_tests {
         ] {
             assert!(parse_external_url(raw).is_err(), "accepted {raw:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diarization::voiceprints::{write_voiceprints, Voiceprint};
+
+    #[tokio::test]
+    async fn naming_a_speaker_keeps_its_voice_and_clearing_drops_it() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::database::manager::ensure_voice_samples_table(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, folder_path TEXT)").execute(&pool).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        write_voiceprints(
+            folder.path(),
+            &[Voiceprint { label: "Speaker 2".into(), segments: 7, embedding: vec![0.6, 0.8] }],
+        )
+        .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m1', ?), ('m2', NULL)")
+            .bind(folder.path().to_string_lossy().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let samples = || async {
+            sqlx::query_as::<_, (String, String, i64, String)>(
+                "SELECT meeting_id, name, segments, embedding FROM voice_samples ORDER BY meeting_id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+
+        record_voice_sample(&pool, "m1", "Speaker 2", Some("Alex")).await.unwrap();
+        record_voice_sample(&pool, "m1", "Speaker 2", Some("Alexa")).await.unwrap();
+        record_voice_sample(&pool, "m1", "Speaker 9", Some("Nobody")).await.unwrap();
+        record_voice_sample(&pool, "m2", "Speaker 1", Some("Sam")).await.unwrap();
+        assert_eq!(samples().await, vec![("m1".into(), "Alexa".into(), 7, "[0.6,0.8]".into())]);
+
+        record_voice_sample(&pool, "m1", "Speaker 2", None).await.unwrap();
+        assert!(samples().await.is_empty());
     }
 }
