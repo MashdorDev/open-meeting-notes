@@ -122,6 +122,27 @@ impl RecordingSaver {
         }
     }
 
+    /// Gives the lines of each folded voice the label it was folded into
+    /// (none when it matched no one) and rewrites transcripts.json, which
+    /// the final save skips when audio saving is off.
+    pub fn apply_speaker_folds(&self, folds: &std::collections::HashMap<String, Option<String>>) {
+        if folds.is_empty() {
+            return;
+        }
+        if let Ok(mut segments) = self.transcript_segments.lock() {
+            for segment in segments.iter_mut() {
+                if let Some(target) = segment.speaker_label.as_ref().and_then(|l| folds.get(l)) {
+                    segment.speaker_label = target.clone();
+                }
+            }
+        }
+        if let Some(folder) = &self.meeting_folder {
+            if self.write_transcripts_json(folder).is_err() {
+                warn!("Failed to write transcripts after folding speakers");
+            }
+        }
+    }
+
     /// Legacy method for backward compatibility - converts text to basic segment
     pub fn add_transcript_chunk(&self, text: String) {
         let segment = TranscriptSegment {
