@@ -9,17 +9,17 @@
  *   node scripts/generate-update-manifest-github.js <version> [bundle-dir] [output-file] [notes]
  *
  * Example:
- *   node scripts/generate-update-manifest-github.js 0.1.2 frontend/src-tauri/target/release/bundle/updater latest.json "Release notes here"
+ *   node scripts/generate-update-manifest-github.js 0.1.2 frontend/src-tauri/target/release/bundle/updater update.json "Release notes here"
  */
 
 const fs = require('fs');
 const path = require('path');
 
-const [version, bundleDir = 'frontend/src-tauri/target/release/bundle/updater', outputFile = 'latest.json', notes = ''] = process.argv.slice(2);
+const [version, bundleDir = 'frontend/src-tauri/target/release/bundle/updater', outputFile = 'update.json', notes = ''] = process.argv.slice(2);
 
 if (!version) {
   console.error('Usage: node generate-update-manifest-github.js <version> [bundle-dir] [output-file] [notes]');
-  console.error('Example: node generate-update-manifest-github.js 0.1.2 frontend/src-tauri/target/release/bundle/updater latest.json "Release notes"');
+  console.error('Example: node generate-update-manifest-github.js 0.1.2 frontend/src-tauri/target/release/bundle/updater update.json "Release notes"');
   process.exit(1);
 }
 
@@ -167,11 +167,11 @@ console.log(`1. Create GitHub Release with tag: v${versionClean}`);
 console.log(`   URL: https://github.com/MashdorDev/open-meeting-notes/releases/new?tag=v${versionClean}`);
 console.log(`\n2. Upload this file to the release:`);
 console.log(`   - File: ${outputFile}`);
-console.log(`   - Name: latest.json (must be exact)`);
+console.log(`   - Name: update.json (must be exact)`);
 console.log(`\n3. Upload update bundles to the release:`);
 Object.keys(platforms).forEach(platform => {
   const filename = platforms[platform].url.split('/').pop();
   console.log(`   - ${filename}`);
 });
 console.log(`\n4. Verify the manifest is accessible:`);
-console.log(`   curl https://github.com/MashdorDev/open-meeting-notes/releases/latest/download/latest.json`);
+console.log(`   curl https://github.com/MashdorDev/open-meeting-notes/releases/latest/download/update.json`);

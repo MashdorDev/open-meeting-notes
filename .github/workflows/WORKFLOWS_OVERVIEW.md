@@ -137,7 +137,7 @@ This document provides a quick overview of all available CI/CD workflows in this
 - Version tags from `tauri.conf.json`
 - Uploads release assets
 - **macOS and Windows only** (Linux excluded from production releases)
-- Auto-generates `latest.json` for Tauri updater
+- Auto-generates `update.json` for Tauri updater
 - **Auto-increment versioning**: If tag exists, auto-increments (e.g., `0.1.1` -> `0.1.1.1` -> `0.1.1.2`, up to `.100`)
 
 **Triggers:**
@@ -151,7 +151,7 @@ This document provides a quick overview of all available CI/CD workflows in this
 - GitHub Release (draft)
 - macOS: DMG installer, app.tar.gz (updater), .sig
 - Windows: MSI installer (signed), NSIS installer (signed), .sig files
-- Updater manifest: latest.json
+- Updater manifest: update.json
 - Release notes auto-generated
 
 **Version Behavior:**
