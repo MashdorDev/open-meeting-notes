@@ -83,13 +83,13 @@ impl DiarizationSession {
                 None => return Vec::new(),
             }
         }
-        let any_departure = embeddings
-            .iter()
-            .step_by(2)
-            .flatten()
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|pair| cosine_similarity(pair[0], pair[1]) < CHANGE_SIMILARITY_THRESHOLD);
+        // Also compare windows two apart: a turn in the middle of a window
+        // makes it half of each voice, close enough to both neighbours.
+        let coarse: Vec<&Vec<f32>> = embeddings.iter().step_by(2).flatten().collect();
+        let departs = |a: usize, b: usize| {
+            b < coarse.len() && cosine_similarity(coarse[a], coarse[b]) < CHANGE_SIMILARITY_THRESHOLD
+        };
+        let any_departure = (0..coarse.len()).any(|k| departs(k, k + 1) || departs(k, k + 2));
         if !any_departure {
             return Vec::new();
         }
