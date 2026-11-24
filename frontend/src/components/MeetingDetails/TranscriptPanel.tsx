@@ -8,10 +8,23 @@ import { OtherSpeakerName } from './OtherSpeakerName';
 import { MeetingAudioPlayer } from './MeetingAudioPlayer';
 import { SpeakerNameEditor } from './SpeakerNameEditor';
 import { SpeakerAccuracy } from './SpeakerAccuracy';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+
+/** A line stays lit this long past its end, so pauses between lines don't flicker. */
+const LINGER_SECONDS = 3;
+
+/** The line being played at `seconds`: the latest one to start by then. */
+function lineAt(segments: TranscriptSegmentData[], seconds: number): string | undefined {
+  let line: TranscriptSegmentData | undefined;
+  for (const segment of segments) {
+    if (segment.timestamp <= seconds && (!line || segment.timestamp >= line.timestamp)) line = segment;
+  }
+  if (!line || seconds > (line.endTime ?? line.timestamp) + LINGER_SECONDS) return undefined;
+  return line.id;
+}
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
@@ -81,6 +94,26 @@ export function TranscriptPanel({
       .catch(error => console.error('Failed to load speaker guesses:', error));
     return () => { current = false; };
   }, [meetingId, namesSaved]);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [hasAudio, setHasAudio] = useState(false);
+  const [playhead, setPlayhead] = useState<number | null>(null);
+  // Bumped on each play or seek, so the list follows playback again after
+  // Dor scrolled away.
+  const [followKey, setFollowKey] = useState(0);
+  useEffect(() => setPlayhead(null), [meetingId]);
+  const resumeFollowing = useCallback(() => setFollowKey(k => k + 1), []);
+  const seekTo = useCallback((seconds: number) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.currentTime = seconds;
+    setPlayhead(seconds);
+    resumeFollowing();
+    // With the line's time button still focused, Space would seek back to
+    // it; on the player, Space pauses.
+    audio.focus({ preventScroll: true });
+    audio.play().catch(error => console.error('Failed to play the recording:', error));
+  }, [resumeFollowing]);
+
   // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
     if (usePagination && segments) {
@@ -98,6 +131,19 @@ export function TranscriptPanel({
       speakerName: t.speaker_name,
     }));
   }, [transcripts, usePagination, segments]);
+
+  const activeSegmentId = useMemo(
+    () => (playhead === null ? undefined : lineAt(convertedSegments, playhead)),
+    [convertedSegments, playhead],
+  );
+
+  // Playing past the loaded pages loads the next one, so the line can be lit.
+  const lastLoadedStart = convertedSegments.length ? convertedSegments[convertedSegments.length - 1].timestamp : null;
+  useEffect(() => {
+    if (playhead !== null && lastLoadedStart !== null && playhead > lastLoadedStart && hasMore && !isLoadingMore) {
+      onLoadMore?.();
+    }
+  }, [playhead, lastLoadedStart, hasMore, isLoadingMore, onLoadMore]);
 
   // Guesses for unnamed voices on the loaded pages, so Dor can check them
   // before confirming; confirm touches only these.
@@ -137,7 +183,15 @@ export function TranscriptPanel({
           meetingFolderPath={meetingFolderPath}
           onRefetchTranscripts={onRefetchTranscripts}
         />
-        {meetingId && !isRecording && <MeetingAudioPlayer meetingId={meetingId} />}
+        {meetingId && !isRecording && (
+          <MeetingAudioPlayer
+            meetingId={meetingId}
+            audioRef={audioRef}
+            onAvailable={setHasAudio}
+            onPlayhead={setPlayhead}
+            onPlayOrSeek={resumeFollowing}
+          />
+        )}
         {onSaveOtherSpeakerNames && convertedSegments.some(s => s.speaker === 'system') && (
           <OtherSpeakerName names={otherSpeakerNames ?? []} onSave={onSaveOtherSpeakerNames} />
         )}
@@ -167,6 +221,9 @@ export function TranscriptPanel({
           othersLabel={othersLabel}
           speakerGuesses={speakerGuesses}
           onEditSpeaker={meetingId && !isRecording ? setSpeakerToName : undefined}
+          activeSegmentId={activeSegmentId}
+          onSeek={hasAudio && !isRecording ? seekTo : undefined}
+          followKey={followKey}
           disableAutoScroll={disableAutoScroll}
           hasMore={hasMore}
           isLoadingMore={isLoadingMore}

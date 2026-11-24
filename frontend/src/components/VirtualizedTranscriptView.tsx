@@ -38,6 +38,12 @@ export interface VirtualizedTranscriptViewProps {
     showConfidence?: boolean;
     /** Completely disable auto-scroll behavior (for meeting details page) */
     disableAutoScroll?: boolean;
+    /** The line the recording is playing, lit and kept in view. */
+    activeSegmentId?: string;
+    /** Plays the recording from a line's time; without it times are plain text. */
+    onSeek?: (seconds: number) => void;
+    /** Changes on each play or seek: following resumes after a manual scroll. */
+    followKey?: number;
 
     // Pagination props (infinite scroll)
     hasMore?: boolean;
@@ -88,6 +94,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming,
     showConfidence,
     onEditSpeaker,
+    isActive,
+    onSeek,
 }: {
     id: string;
     timestamp: number;
@@ -101,6 +109,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming: boolean;
     showConfidence: boolean;
     onEditSpeaker?: () => void;
+    isActive: boolean;
+    onSeek?: (seconds: number) => void;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
     const label = speaker ? SPEAKER_LABELS[speaker] : undefined;
@@ -132,13 +142,28 @@ const TranscriptSegment = memo(function TranscriptSegment({
     );
 
     return (
-        <div id={`segment-${id}`} className="mb-3">
+        <div
+            id={`segment-${id}`}
+            aria-current={isActive || undefined}
+            className={`mb-3 -mx-2 px-2 rounded-md transition-colors ${isActive ? 'bg-amber-100' : ''}`}
+        >
             <div className="flex items-start gap-2">
                 <Tooltip>
-                    <TooltipTrigger>
-                        <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
-                            {formatRecordingTime(timestamp)}
-                        </span>
+                    <TooltipTrigger asChild={!!onSeek}>
+                        {onSeek ? (
+                            <button
+                                type="button"
+                                onClick={() => onSeek(timestamp)}
+                                title="Play from here"
+                                className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px] text-left rounded hover:text-gray-700 hover:underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                            >
+                                {formatRecordingTime(timestamp)}
+                            </button>
+                        ) : (
+                            <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
+                                {formatRecordingTime(timestamp)}
+                            </span>
+                        )}
                     </TooltipTrigger>
                     <TooltipContent>
                         {confidence !== undefined && showConfidence && (
@@ -172,6 +197,9 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     onEditSpeaker,
     showConfidence = true,
     disableAutoScroll = false,
+    activeSegmentId,
+    onSeek,
+    followKey,
     hasMore = false,
     isLoadingMore = false,
     totalCount = 0,
@@ -216,6 +244,46 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         virtualizationThreshold: VIRTUALIZATION_THRESHOLD,
         disableAutoScroll,
     });
+
+    // Keep the playing line in view, until Dor scrolls by hand; the next
+    // play or seek (a new followKey) resumes following.
+    const followRef = useRef(true);
+    useEffect(() => {
+        followRef.current = true;
+    }, [followKey]);
+    useEffect(() => {
+        const element = scrollRef.current;
+        if (!element) return;
+        const stopFollowing = () => {
+            followRef.current = false;
+        };
+        // A press on the list itself, not a line, is a grab of its scrollbar.
+        const onPointerDown = (e: PointerEvent) => {
+            if (e.target === element) stopFollowing();
+        };
+        const scrollKeys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (scrollKeys.has(e.key)) stopFollowing();
+        };
+        element.addEventListener('wheel', stopFollowing, { passive: true });
+        element.addEventListener('touchmove', stopFollowing, { passive: true });
+        element.addEventListener('pointerdown', onPointerDown);
+        element.addEventListener('keydown', onKeyDown);
+        return () => {
+            element.removeEventListener('wheel', stopFollowing);
+            element.removeEventListener('touchmove', stopFollowing);
+            element.removeEventListener('pointerdown', onPointerDown);
+            element.removeEventListener('keydown', onKeyDown);
+        };
+    }, []);
+    useEffect(() => {
+        if (!activeSegmentId || !followRef.current) return;
+        const index = segments.findIndex(s => s.id === activeSegmentId);
+        if (index < 0) return;
+        if (segments.length >= VIRTUALIZATION_THRESHOLD) virtualizer.scrollToIndex(index, { align: 'center' });
+        else document.getElementById(`segment-${activeSegmentId}`)?.scrollIntoView({ block: 'center' });
+        // Only a new active line (or a resumed follow) moves the list.
+    }, [activeSegmentId, followKey]);
 
     // Streaming text effect hook (typewriter animation for new transcripts)
     const { streamingSegmentId, getDisplayText } = useTranscriptStreaming(
@@ -362,6 +430,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         onEditSpeaker={onEditSpeaker ? () => onEditSpeaker(segment) : undefined}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        isActive={segment.id === activeSegmentId}
+                                        onSeek={onSeek}
                                     />
                                 </div>
                             );
@@ -424,6 +494,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         onEditSpeaker={onEditSpeaker ? () => onEditSpeaker(segment) : undefined}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        isActive={segment.id === activeSegmentId}
+                                        onSeek={onSeek}
                                     />
                                 </motion.div>
                             );
