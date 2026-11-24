@@ -1245,7 +1245,22 @@ pub async fn get_meeting_speaker_guesses(
     state: tauri::State<'_, AppState>,
     meeting_id: String,
 ) -> Result<HashMap<String, String>, String> {
-    Ok(meeting_speaker_guesses(state.db_manager.pool(), &meeting_id, false).await)
+    let pool = state.db_manager.pool();
+    let mut guesses = meeting_speaker_guesses(pool, &meeting_id, false).await;
+    // A voice already named (on any line, loaded or not) needs no guess.
+    let named: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT speaker_label FROM transcripts
+         WHERE meeting_id = ? AND speaker_label IS NOT NULL AND speaker_name IS NOT NULL
+           AND COALESCE(speaker_name_pinned, 0) = 0",
+    )
+    .bind(&meeting_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Database error: {}", e))?;
+    for label in named {
+        guesses.remove(&label);
+    }
+    Ok(guesses)
 }
 
 async fn meeting_folder(pool: &sqlx::SqlitePool, meeting_id: &str) -> Option<std::path::PathBuf> {
@@ -1279,25 +1294,33 @@ pub async fn dismiss_speaker_guess(
     write_voiceprints(&folder, &voices).map_err(|e| format!("Voices not saved: {}", e))
 }
 
-/// Gives each guessed name to its voice's lines, for every voice none of
-/// whose lines carries a name yet. Returns the changed line ids by name.
+/// Gives the guessed name to the lines of each listed voice (the ones Dor
+/// saw offered) that no unpinned line has named yet. Pinned lines keep
+/// their own names. Returns the changed line ids by name.
 #[tauri::command]
 pub async fn confirm_speaker_guesses(
     state: tauri::State<'_, AppState>,
     meeting_id: String,
+    speaker_labels: Vec<String>,
 ) -> Result<HashMap<String, Vec<String>>, String> {
-    confirm_guesses(state.db_manager.pool(), &meeting_id).await
+    confirm_guesses(state.db_manager.pool(), &meeting_id, &speaker_labels).await
 }
 
-async fn confirm_guesses(pool: &sqlx::SqlitePool, meeting_id: &str) -> Result<HashMap<String, Vec<String>>, String> {
+async fn confirm_guesses(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    labels: &[String],
+) -> Result<HashMap<String, Vec<String>>, String> {
     let meeting_id = meeting_id.to_string();
     let mut changed: HashMap<String, Vec<String>> = HashMap::new();
-    for (label, name) in meeting_speaker_guesses(pool, &meeting_id, false).await {
+    let guesses = meeting_speaker_guesses(pool, &meeting_id, false).await;
+    for (label, name) in guesses.into_iter().filter(|(l, _)| labels.contains(l)) {
         let ids: Vec<String> = sqlx::query_scalar(
             "UPDATE transcripts SET speaker_name = ?
-             WHERE meeting_id = ? AND speaker_label = ?
+             WHERE meeting_id = ? AND speaker_label = ? AND COALESCE(speaker_name_pinned, 0) = 0
                AND NOT EXISTS (SELECT 1 FROM transcripts t
-                               WHERE t.meeting_id = ? AND t.speaker_label = ? AND t.speaker_name IS NOT NULL)
+                               WHERE t.meeting_id = ? AND t.speaker_label = ? AND t.speaker_name IS NOT NULL
+                                 AND COALESCE(t.speaker_name_pinned, 0) = 0)
              RETURNING id",
         )
         .bind(&name)
@@ -1797,11 +1820,13 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Speaker 1 is unnamed, Speaker 2 already has a hand-given name on one
-        // line, Speaker 3's guess was dismissed.
+        // Speaker 1 is unnamed, Speaker 2 is already named, Speaker 3's guess
+        // was dismissed, Speaker 4 has only one line named on its own, and
+        // Speaker 5 was not offered to Dor.
         sqlx::query(
             "INSERT INTO transcripts VALUES ('a', 'm1', 'Speaker 1', NULL, NULL), ('b', 'm1', 'Speaker 1', NULL, NULL),
-             ('c', 'm1', 'Speaker 2', 'Bob', 1), ('d', 'm1', 'Speaker 2', NULL, NULL), ('e', 'm1', 'Speaker 3', NULL, NULL)",
+             ('c', 'm1', 'Speaker 2', 'Bob', NULL), ('d', 'm1', 'Speaker 2', NULL, NULL), ('e', 'm1', 'Speaker 3', NULL, NULL),
+             ('f', 'm1', 'Speaker 4', 'Pat', 1), ('g', 'm1', 'Speaker 4', NULL, NULL), ('h', 'm1', 'Speaker 5', NULL, NULL)",
         )
         .execute(&pool)
         .await
@@ -1812,7 +1837,13 @@ mod tests {
         };
         write_voiceprints(
             folder.path(),
-            &[voice("Speaker 1", "Alex", false), voice("Speaker 2", "Dana", false), voice("Speaker 3", "Sam", true)],
+            &[
+                voice("Speaker 1", "Alex", false),
+                voice("Speaker 2", "Dana", false),
+                voice("Speaker 3", "Sam", true),
+                voice("Speaker 4", "Kim", false),
+                voice("Speaker 5", "Lee", false),
+            ],
         )
         .unwrap();
         sqlx::query("INSERT INTO meetings VALUES ('m1', ?)")
@@ -1821,17 +1852,27 @@ mod tests {
             .await
             .unwrap();
 
-        let mut changed = confirm_guesses(&pool, "m1").await.unwrap();
+        let offered: Vec<String> = ["Speaker 1", "Speaker 2", "Speaker 3", "Speaker 4"].map(String::from).to_vec();
+        let mut changed = confirm_guesses(&pool, "m1", &offered).await.unwrap();
         changed.values_mut().for_each(|ids| ids.sort());
-        assert_eq!(changed, HashMap::from([("Alex".to_string(), vec!["a".to_string(), "b".to_string()])]));
+        assert_eq!(
+            changed,
+            HashMap::from([
+                ("Alex".to_string(), vec!["a".to_string(), "b".to_string()]),
+                ("Kim".to_string(), vec!["g".to_string()]),
+            ])
+        );
         let names: Vec<(String, Option<String>)> =
             sqlx::query_as("SELECT id, speaker_name FROM transcripts ORDER BY id").fetch_all(&pool).await.unwrap();
         assert_eq!(names[3], ("d".to_string(), None));
         assert_eq!(names[4], ("e".to_string(), None));
-        let kept: Vec<String> = sqlx::query_scalar("SELECT name FROM voice_samples").fetch_all(&pool).await.unwrap();
-        assert_eq!(kept, vec!["Alex".to_string()]);
-        assert_eq!(meeting_speaker_guesses(&pool, "m1", true).await.len(), 3);
-        assert_eq!(meeting_speaker_guesses(&pool, "m1", false).await.len(), 2);
+        assert_eq!(names[5], ("f".to_string(), Some("Pat".to_string())));
+        assert_eq!(names[7], ("h".to_string(), None));
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM voice_samples ORDER BY name").fetch_all(&pool).await.unwrap();
+        assert_eq!(kept, vec!["Alex".to_string(), "Kim".to_string()]);
+        assert_eq!(meeting_speaker_guesses(&pool, "m1", true).await.len(), 5);
+        assert_eq!(meeting_speaker_guesses(&pool, "m1", false).await.len(), 4);
     }
 
     #[tokio::test]

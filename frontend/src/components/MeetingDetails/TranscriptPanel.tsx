@@ -68,18 +68,19 @@ export function TranscriptPanel({
   onSpeakerNamesChanged,
 }: TranscriptPanelProps) {
   const [speakerToName, setSpeakerToName] = useState<TranscriptSegmentData | null>(null);
-  const [namesSaved, setNamesSaved] = useState(0);
   // Names recognized from earlier meetings, by voice label.
   const [speakerGuesses, setSpeakerGuesses] = useState<Record<string, string>>({});
+  const [namesSaved, setNamesSaved] = useState(0);
+  useEffect(() => setSpeakerGuesses({}), [meetingId]);
+  // Refetched after each save: the backend drops voices that now have a name.
   useEffect(() => {
-    setSpeakerGuesses({});
     if (!meetingId) return;
     let current = true;
     invoke<Record<string, string>>('get_meeting_speaker_guesses', { meetingId })
       .then(guesses => { if (current) setSpeakerGuesses(guesses); })
       .catch(error => console.error('Failed to load speaker guesses:', error));
     return () => { current = false; };
-  }, [meetingId]);
+  }, [meetingId, namesSaved]);
   // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
     if (usePagination && segments) {
@@ -98,18 +99,21 @@ export function TranscriptPanel({
     }));
   }, [transcripts, usePagination, segments]);
 
-  // Guesses still on show: voices none of whose loaded lines has a name.
+  // Guesses for unnamed voices on the loaded pages, so Dor can check them
+  // before confirming; confirm touches only these.
   const pendingGuesses = useMemo(() => {
-    const named = new Set(convertedSegments.filter(s => s.speakerName && s.speakerLabel).map(s => s.speakerLabel));
     const heard = new Set(convertedSegments.map(s => s.speakerLabel));
-    return Object.entries(speakerGuesses).filter(([label]) => heard.has(label) && !named.has(label));
+    return Object.entries(speakerGuesses).filter(([label]) => heard.has(label));
   }, [convertedSegments, speakerGuesses]);
   const [confirming, setConfirming] = useState(false);
   const confirmGuesses = async () => {
     if (!meetingId) return;
     setConfirming(true);
     try {
-      const changed = await invoke<Record<string, string[]>>('confirm_speaker_guesses', { meetingId });
+      const changed = await invoke<Record<string, string[]>>('confirm_speaker_guesses', {
+        meetingId,
+        speakerLabels: pendingGuesses.map(([label]) => label),
+      });
       if (onSpeakerNamesChanged) Object.entries(changed).forEach(([name, ids]) => onSpeakerNamesChanged(ids, name));
       else await onRefetchTranscripts?.();
       setNamesSaved(n => n + 1);
