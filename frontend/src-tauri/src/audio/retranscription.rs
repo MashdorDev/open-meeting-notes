@@ -145,8 +145,8 @@ pub async fn start_retranscription<R: Runtime>(
 }
 
 /// The hand-given name of the old lines that covered most of a new line on
-/// the same side (Me or the other side), and whether any of them was named
-/// on its own. A new line that only brushes a named old line keeps no name:
+/// the same side (Me or the other side), and whether most of that cover came
+/// from lines named on their own. A new line that only brushes a named old line keeps no name:
 /// names are the accuracy answer key.
 fn carried_speaker_name(
     old: &[(f64, f64, String, Option<String>, Option<i64>)],
@@ -158,7 +158,7 @@ fn carried_speaker_name(
     if length <= 0.0 {
         return None;
     }
-    let mut totals: Vec<(&str, f64, bool)> = Vec::new();
+    let mut totals: Vec<(&str, f64, f64)> = Vec::new();
     for (s, e, name, old_speaker, pinned) in old {
         if old_speaker.as_deref() != speaker {
             continue;
@@ -167,20 +167,21 @@ fn carried_speaker_name(
         if covered <= 0.0 {
             continue;
         }
-        let pinned = pinned.unwrap_or(0) != 0;
+        // Time covered by lines named on their own, to decide the pin.
+        let pinned_covered = if pinned.unwrap_or(0) != 0 { covered } else { 0.0 };
         match totals.iter_mut().find(|(n, _, _)| n == name) {
             Some(entry) => {
                 entry.1 += covered;
-                entry.2 |= pinned;
+                entry.2 += pinned_covered;
             }
-            None => totals.push((name.as_str(), covered, pinned)),
+            None => totals.push((name.as_str(), covered, pinned_covered)),
         }
     }
     totals
         .into_iter()
         .filter(|&(_, covered, _)| covered > length / 2.0)
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(name, _, pinned)| (name.to_string(), pinned))
+        .map(|(name, covered, pinned_covered)| (name.to_string(), pinned_covered > covered / 2.0))
 }
 
 /// Find audio file in meeting folder
