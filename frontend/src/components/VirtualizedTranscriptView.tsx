@@ -145,7 +145,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
         <div
             id={`segment-${id}`}
             aria-current={isActive || undefined}
-            className={`mb-3 -mx-2 px-2 rounded-md transition-colors ${isActive ? 'bg-amber-50' : ''}`}
+            className={`mb-3 -mx-2 px-2 rounded-md transition-colors ${isActive ? 'bg-amber-100' : ''}`}
         >
             <div className="flex items-start gap-2">
                 <Tooltip>
@@ -280,8 +280,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         if (!activeSegmentId || !followRef.current) return;
         const index = segments.findIndex(s => s.id === activeSegmentId);
         if (index < 0) return;
-        if (segments.length >= VIRTUALIZATION_THRESHOLD) virtualizer.scrollToIndex(index, { align: 'auto' });
-        else document.getElementById(`segment-${activeSegmentId}`)?.scrollIntoView({ block: 'nearest' });
+        if (segments.length >= VIRTUALIZATION_THRESHOLD) virtualizer.scrollToIndex(index, { align: 'center' });
+        else document.getElementById(`segment-${activeSegmentId}`)?.scrollIntoView({ block: 'center' });
         // Only a new active line (or a resumed follow) moves the list.
     }, [activeSegmentId, followKey]);
 
