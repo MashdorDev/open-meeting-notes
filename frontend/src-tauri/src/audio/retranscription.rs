@@ -145,20 +145,21 @@ pub async fn start_retranscription<R: Runtime>(
 }
 
 /// The hand-given name of the old lines that covered most of a new line on
-/// the same side (Me or the other side). A new line that only brushes a
-/// named old line keeps no name: names are the accuracy answer key.
+/// the same side (Me or the other side), and whether any of them was named
+/// on its own. A new line that only brushes a named old line keeps no name:
+/// names are the accuracy answer key.
 fn carried_speaker_name(
-    old: &[(f64, f64, String, Option<String>)],
+    old: &[(f64, f64, String, Option<String>, Option<i64>)],
     speaker: Option<&str>,
     start: f64,
     end: f64,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let length = end - start;
     if length <= 0.0 {
         return None;
     }
-    let mut totals: Vec<(&str, f64)> = Vec::new();
-    for (s, e, name, old_speaker) in old {
+    let mut totals: Vec<(&str, f64, bool)> = Vec::new();
+    for (s, e, name, old_speaker, pinned) in old {
         if old_speaker.as_deref() != speaker {
             continue;
         }
@@ -166,16 +167,20 @@ fn carried_speaker_name(
         if covered <= 0.0 {
             continue;
         }
-        match totals.iter_mut().find(|(n, _)| n == name) {
-            Some(entry) => entry.1 += covered,
-            None => totals.push((name.as_str(), covered)),
+        let pinned = pinned.unwrap_or(0) != 0;
+        match totals.iter_mut().find(|(n, _, _)| n == name) {
+            Some(entry) => {
+                entry.1 += covered;
+                entry.2 |= pinned;
+            }
+            None => totals.push((name.as_str(), covered, pinned)),
         }
     }
     totals
         .into_iter()
-        .filter(|&(_, covered)| covered > length / 2.0)
+        .filter(|&(_, covered, _)| covered > length / 2.0)
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(name, _)| name.to_string())
+        .map(|(name, _, pinned)| (name.to_string(), pinned))
 }
 
 /// Find audio file in meeting folder
@@ -496,8 +501,8 @@ async fn run_retranscription<R: Runtime>(
     .map_err(|e| anyhow!("Failed to read existing speaker labels: {}", e))?;
     // Names given by hand are the answer key for speaker accuracy; carry
     // them over the same way, or retranscribing would erase them.
-    let old_names: Vec<(f64, f64, String, Option<String>)> = sqlx::query_as(
-        "SELECT audio_start_time, audio_end_time, speaker_name, speaker FROM transcripts
+    let old_names: Vec<(f64, f64, String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT audio_start_time, audio_end_time, speaker_name, speaker, speaker_name_pinned FROM transcripts
          WHERE meeting_id = ? AND speaker_name IS NOT NULL
            AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL",
     )
@@ -513,7 +518,7 @@ async fn run_retranscription<R: Runtime>(
         .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
 
     for segment in &segments {
-        let (speaker, speaker_label, speaker_name) = match (segment.audio_start_time, segment.audio_end_time) {
+        let (speaker, speaker_label, carried) = match (segment.audio_start_time, segment.audio_end_time) {
             (Some(start), Some(end)) => {
                 let speaker = crate::audio::speaker_source::speaker_by_overlap(&old_speakers, start, end);
                 // Only lines of the other side carry a voice label.
@@ -527,9 +532,13 @@ async fn run_retranscription<R: Runtime>(
             }
             _ => (None, None, None),
         };
+        let (speaker_name, speaker_name_pinned) = match carried {
+            Some((name, pinned)) => (Some(name), pinned as i64),
+            None => (None, 0),
+        };
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, speaker_label, speaker_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, speaker_label, speaker_name, speaker_name_pinned)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -541,6 +550,7 @@ async fn run_retranscription<R: Runtime>(
         .bind(speaker)
         .bind(speaker_label)
         .bind(speaker_name)
+        .bind(speaker_name_pinned)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -931,11 +941,11 @@ mod tests {
     fn a_name_carries_only_onto_a_mostly_covered_line_on_the_same_side() {
         let sys = Some("system".to_string());
         let old = vec![
-            (10.0, 14.0, "Keith".to_string(), sys.clone()),
-            (20.0, 30.0, "Alex".to_string(), Some("mic".to_string())),
+            (10.0, 14.0, "Keith".to_string(), sys.clone(), Some(1)),
+            (20.0, 30.0, "Alex".to_string(), Some("mic".to_string()), None),
         ];
-        // Mostly covered by Keith's old line: keeps the name.
-        assert_eq!(carried_speaker_name(&old, Some("system"), 10.5, 13.5).as_deref(), Some("Keith"));
+        // Mostly covered by Keith's old line: keeps the name and its pin.
+        assert_eq!(carried_speaker_name(&old, Some("system"), 10.5, 13.5), Some(("Keith".to_string(), true)));
         // Only brushes it: no name.
         assert_eq!(carried_speaker_name(&old, Some("system"), 13.7, 18.0), None);
         // Other side's named line does not cross over.

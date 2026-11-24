@@ -1074,9 +1074,8 @@ fn clean_speaker_name(name: Option<String>) -> Option<String> {
 }
 
 /// Names every line one automatic speaker label carries in a meeting
-/// ("Speaker 2" is Alex). Lines already named something else one at a time
-/// keep their own name: only unnamed lines and lines carrying the label's
-/// current name change. A blank name clears them. Returns the ids changed.
+/// ("Speaker 2" is Alex), except lines named one at a time, which keep their
+/// own name. A blank name clears them. Returns the ids changed.
 #[tauri::command]
 pub async fn name_meeting_speaker(
     state: tauri::State<'_, AppState>,
@@ -1084,45 +1083,31 @@ pub async fn name_meeting_speaker(
     speaker_label: String,
     name: Option<String>,
 ) -> Result<Vec<String>, String> {
-    let pool = state.db_manager.pool();
-    // The name most of this label's lines carry, unnamed lines counted too:
-    // a label never named as a whole has no current name, so a line fixed
-    // one at a time is never taken for it.
-    let current: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT speaker_name FROM transcripts
-         WHERE meeting_id = ? AND speaker_label = ?
-         GROUP BY speaker_name ORDER BY COUNT(*) DESC, speaker_name IS NULL DESC LIMIT 1",
-    )
-    .bind(&meeting_id)
-    .bind(&speaker_label)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("Database error: {}", e))?
-    .flatten();
     sqlx::query_scalar(
         "UPDATE transcripts SET speaker_name = ?
-         WHERE meeting_id = ? AND speaker_label = ? AND (speaker_name IS NULL OR speaker_name = ?)
+         WHERE meeting_id = ? AND speaker_label = ? AND COALESCE(speaker_name_pinned, 0) = 0
          RETURNING id",
     )
     .bind(clean_speaker_name(name))
     .bind(&meeting_id)
     .bind(&speaker_label)
-    .bind(current)
-    .fetch_all(pool)
+    .fetch_all(state.db_manager.pool())
     .await
     .map_err(|e| format!("Database error: {}", e))
 }
 
-/// Names one transcript line, overriding its speaker's name. A blank name
-/// clears it.
+/// Names one transcript line on its own, so naming its whole voice later
+/// leaves it. A blank name clears it and lets it follow its voice again.
 #[tauri::command]
 pub async fn set_transcript_speaker_name(
     state: tauri::State<'_, AppState>,
     transcript_id: String,
     name: Option<String>,
 ) -> Result<(), String> {
-    let result = sqlx::query("UPDATE transcripts SET speaker_name = ? WHERE id = ?")
-        .bind(clean_speaker_name(name))
+    let name = clean_speaker_name(name);
+    let result = sqlx::query("UPDATE transcripts SET speaker_name = ?, speaker_name_pinned = ? WHERE id = ?")
+        .bind(&name)
+        .bind(name.is_some() as i64)
         .bind(&transcript_id)
         .execute(state.db_manager.pool())
         .await
