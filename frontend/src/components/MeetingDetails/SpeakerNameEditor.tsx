@@ -14,7 +14,8 @@ interface SpeakerNameEditorProps {
   /** Names already found in this meeting, offered as one-click picks. */
   suggestions: string[];
   onClose: () => void;
-  onSaved: () => Promise<void> | void;
+  /** The ids of the lines whose name changed, and the new name. */
+  onSaved: (transcriptIds: string[], name: string | null) => Promise<void> | void;
 }
 
 /**
@@ -34,12 +35,14 @@ export function SpeakerNameEditor({ meetingId, segment, suggestions, onClose, on
     if (!segment) return;
     setSaving(true);
     try {
+      let changed: string[];
       if (scope === 'speaker' && segment.speakerLabel) {
-        await invoke('name_meeting_speaker', { meetingId, speakerLabel: segment.speakerLabel, name: value });
+        changed = await invoke<string[]>('name_meeting_speaker', { meetingId, speakerLabel: segment.speakerLabel, name: value });
       } else {
         await invoke('set_transcript_speaker_name', { transcriptId: segment.id, name: value });
+        changed = [segment.id];
       }
-      await onSaved();
+      await onSaved(changed, value);
       onClose();
     } catch (error) {
       console.error('Failed to save speaker name:', error);

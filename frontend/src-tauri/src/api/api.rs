@@ -1074,24 +1074,40 @@ fn clean_speaker_name(name: Option<String>) -> Option<String> {
 }
 
 /// Names every line one automatic speaker label carries in a meeting
-/// ("Speaker 2" is Alex). A blank name clears them.
+/// ("Speaker 2" is Alex). Lines already named something else one at a time
+/// keep their own name: only unnamed lines and lines carrying the label's
+/// current name change. A blank name clears them. Returns the ids changed.
 #[tauri::command]
 pub async fn name_meeting_speaker(
     state: tauri::State<'_, AppState>,
     meeting_id: String,
     speaker_label: String,
     name: Option<String>,
-) -> Result<u64, String> {
-    let result = sqlx::query(
-        "UPDATE transcripts SET speaker_name = ? WHERE meeting_id = ? AND speaker_label = ?",
+) -> Result<Vec<String>, String> {
+    let pool = state.db_manager.pool();
+    // The name most of this label's named lines carry, if any.
+    let current: Option<String> = sqlx::query_scalar(
+        "SELECT speaker_name FROM transcripts
+         WHERE meeting_id = ? AND speaker_label = ? AND speaker_name IS NOT NULL
+         GROUP BY speaker_name ORDER BY COUNT(*) DESC, speaker_name LIMIT 1",
+    )
+    .bind(&meeting_id)
+    .bind(&speaker_label)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Database error: {}", e))?;
+    sqlx::query_scalar(
+        "UPDATE transcripts SET speaker_name = ?
+         WHERE meeting_id = ? AND speaker_label = ? AND (speaker_name IS NULL OR speaker_name = ?)
+         RETURNING id",
     )
     .bind(clean_speaker_name(name))
     .bind(&meeting_id)
     .bind(&speaker_label)
-    .execute(state.db_manager.pool())
+    .bind(current)
+    .fetch_all(pool)
     .await
-    .map_err(|e| format!("Database error: {}", e))?;
-    Ok(result.rows_affected())
+    .map_err(|e| format!("Database error: {}", e))
 }
 
 /// Names one transcript line, overriding its speaker's name. A blank name

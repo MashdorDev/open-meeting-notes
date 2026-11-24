@@ -37,6 +37,8 @@ interface TranscriptPanelProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+  /** Applies saved names in place; without it the panel refetches. */
+  onSpeakerNamesChanged?: (transcriptIds: string[], name: string | null) => void;
 }
 
 export function TranscriptPanel({
@@ -60,6 +62,7 @@ export function TranscriptPanel({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  onSpeakerNamesChanged,
 }: TranscriptPanelProps) {
   const [speakerToName, setSpeakerToName] = useState<TranscriptSegmentData | null>(null);
   const [namesSaved, setNamesSaved] = useState(0);
@@ -127,8 +130,10 @@ export function TranscriptPanel({
           segment={speakerToName}
           suggestions={otherSpeakerNames ?? []}
           onClose={() => setSpeakerToName(null)}
-          onSaved={async () => {
-            await onRefetchTranscripts?.();
+          onSaved={async (transcriptIds, name) => {
+            // In place, so a long meeting keeps its loaded pages and scroll.
+            if (onSpeakerNamesChanged) onSpeakerNamesChanged(transcriptIds, name);
+            else await onRefetchTranscripts?.();
             setNamesSaved(n => n + 1);
           }}
         />

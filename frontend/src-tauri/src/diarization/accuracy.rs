@@ -2,7 +2,9 @@
 //
 // How often the automatic speaker labels agree with the names Dor gave.
 // Each meeting's automatic label (Speaker 2) counts as the name most of its
-// named lines carry; a line is right when its own name is that name. Lines
+// named lines carry; a line is right when its own name is that name. A name
+// belongs to one label per meeting (the one with most lines of it): one
+// person split across two labels is a mistake, not two right answers. Lines
 // shorter than MIN_SCORED_SECONDS are left out: one-word replies are
 // deliberately left unlabelled and would only add noise.
 
@@ -52,13 +54,27 @@ pub fn speaker_accuracy(lines: &[ScoredLine]) -> SpeakerAccuracy {
             *votes.entry((meeting, label)).or_default().entry(name).or_default() += 1;
         }
     }
-    let majority: HashMap<(&str, &str), &str> = votes
+    // Each label's top name and how many lines carry it. Ties go to the
+    // alphabetically first name, so the score is stable.
+    let top: Vec<((&str, &str), &str, usize)> = votes
         .into_iter()
         .filter_map(|(key, names)| {
-            // Ties go to the alphabetically first name, so the score is stable.
-            let best = names.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))?;
-            Some((key, best.0))
+            let (name, count) = names.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))?;
+            Some((key, name, count))
         })
+        .collect();
+    // A name goes to the label with most lines of it (ties: first label).
+    let mut owner: HashMap<(&str, &str), ((&str, &str), usize)> = HashMap::new();
+    for &(key, name, count) in &top {
+        let claim = owner.entry((key.0, name)).or_insert((key, count));
+        if count > claim.1 || (count == claim.1 && key.1 < claim.0 .1) {
+            *claim = (key, count);
+        }
+    }
+    let majority: HashMap<(&str, &str), &str> = top
+        .into_iter()
+        .filter(|&(key, name, _)| owner[&(key.0, name)].0 == key)
+        .map(|(key, name, _)| (key, name))
         .collect();
 
     let mut result = SpeakerAccuracy::default();
@@ -111,6 +127,18 @@ mod tests {
         ];
         let acc = speaker_accuracy(&lines);
         assert_eq!(acc.overall, AccuracyCounts { scored: 1, correct: 0, unlabelled: 1 });
+    }
+
+    #[test]
+    fn one_person_split_across_two_labels_is_not_all_right() {
+        let lines = vec![
+            line("m1", Some("Speaker 1"), Some("Alex"), 3.0),
+            line("m1", Some("Speaker 1"), Some("Alex"), 3.0),
+            line("m1", Some("Speaker 1"), Some("Alex"), 3.0),
+            line("m1", Some("Speaker 2"), Some("Alex"), 3.0),
+        ];
+        let acc = speaker_accuracy(&lines);
+        assert_eq!(acc.overall, AccuracyCounts { scored: 4, correct: 3, unlabelled: 0 });
     }
 
     #[test]
