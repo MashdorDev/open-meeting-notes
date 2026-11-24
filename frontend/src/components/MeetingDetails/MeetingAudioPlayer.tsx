@@ -10,11 +10,12 @@ interface MeetingAudioPlayerProps {
   onAvailable: (available: boolean) => void;
   /** The playback position in seconds, on every time update and seek. */
   onPlayhead: (seconds: number) => void;
-  onPlay: () => void;
+  /** On every play and seek, so the transcript follows playback again. */
+  onPlayOrSeek: () => void;
 }
 
 /** Plays the meeting's saved recording; renders nothing when none was saved. */
-export function MeetingAudioPlayer({ meetingId, audioRef, onAvailable, onPlayhead, onPlay }: MeetingAudioPlayerProps) {
+export function MeetingAudioPlayer({ meetingId, audioRef, onAvailable, onPlayhead, onPlayOrSeek }: MeetingAudioPlayerProps) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -52,8 +53,11 @@ export function MeetingAudioPlayer({ meetingId, audioRef, onAvailable, onPlayhea
       src={src}
       onError={() => setFailed(true)}
       onTimeUpdate={e => onPlayhead(e.currentTarget.currentTime)}
-      onSeeked={e => onPlayhead(e.currentTarget.currentTime)}
-      onPlay={onPlay}
+      onSeeked={e => {
+        onPlayhead(e.currentTarget.currentTime);
+        onPlayOrSeek();
+      }}
+      onPlay={onPlayOrSeek}
       className="mt-3 w-full h-9"
     />
   );

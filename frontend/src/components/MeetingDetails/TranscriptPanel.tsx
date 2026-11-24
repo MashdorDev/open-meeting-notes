@@ -108,6 +108,9 @@ export function TranscriptPanel({
     audio.currentTime = seconds;
     setPlayhead(seconds);
     resumeFollowing();
+    // With the line's time button still focused, Space would seek back to
+    // it; on the player, Space pauses.
+    audio.focus({ preventScroll: true });
     audio.play().catch(error => console.error('Failed to play the recording:', error));
   }, [resumeFollowing]);
 
@@ -133,6 +136,14 @@ export function TranscriptPanel({
     () => (playhead === null ? undefined : lineAt(convertedSegments, playhead)),
     [convertedSegments, playhead],
   );
+
+  // Playing past the loaded pages loads the next one, so the line can be lit.
+  const lastLoadedStart = convertedSegments.length ? convertedSegments[convertedSegments.length - 1].timestamp : null;
+  useEffect(() => {
+    if (playhead !== null && lastLoadedStart !== null && playhead > lastLoadedStart && hasMore && !isLoadingMore) {
+      onLoadMore?.();
+    }
+  }, [playhead, lastLoadedStart, hasMore, isLoadingMore, onLoadMore]);
 
   // Guesses for unnamed voices on the loaded pages, so Dor can check them
   // before confirming; confirm touches only these.
@@ -178,7 +189,7 @@ export function TranscriptPanel({
             audioRef={audioRef}
             onAvailable={setHasAudio}
             onPlayhead={setPlayhead}
-            onPlay={resumeFollowing}
+            onPlayOrSeek={resumeFollowing}
           />
         )}
         {onSaveOtherSpeakerNames && convertedSegments.some(s => s.speaker === 'system') && (

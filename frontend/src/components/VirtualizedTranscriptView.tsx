@@ -257,11 +257,23 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         const stopFollowing = () => {
             followRef.current = false;
         };
+        // A press on the list itself, not a line, is a grab of its scrollbar.
+        const onPointerDown = (e: PointerEvent) => {
+            if (e.target === element) stopFollowing();
+        };
+        const scrollKeys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (scrollKeys.has(e.key)) stopFollowing();
+        };
         element.addEventListener('wheel', stopFollowing, { passive: true });
         element.addEventListener('touchmove', stopFollowing, { passive: true });
+        element.addEventListener('pointerdown', onPointerDown);
+        element.addEventListener('keydown', onKeyDown);
         return () => {
             element.removeEventListener('wheel', stopFollowing);
             element.removeEventListener('touchmove', stopFollowing);
+            element.removeEventListener('pointerdown', onPointerDown);
+            element.removeEventListener('keydown', onKeyDown);
         };
     }, []);
     useEffect(() => {
