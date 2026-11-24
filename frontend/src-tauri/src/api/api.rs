@@ -1085,17 +1085,20 @@ pub async fn name_meeting_speaker(
     name: Option<String>,
 ) -> Result<Vec<String>, String> {
     let pool = state.db_manager.pool();
-    // The name most of this label's named lines carry, if any.
-    let current: Option<String> = sqlx::query_scalar(
+    // The name most of this label's lines carry, unnamed lines counted too:
+    // a label never named as a whole has no current name, so a line fixed
+    // one at a time is never taken for it.
+    let current: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT speaker_name FROM transcripts
-         WHERE meeting_id = ? AND speaker_label = ? AND speaker_name IS NOT NULL
-         GROUP BY speaker_name ORDER BY COUNT(*) DESC, speaker_name LIMIT 1",
+         WHERE meeting_id = ? AND speaker_label = ?
+         GROUP BY speaker_name ORDER BY COUNT(*) DESC, speaker_name IS NULL DESC LIMIT 1",
     )
     .bind(&meeting_id)
     .bind(&speaker_label)
     .fetch_optional(pool)
     .await
-    .map_err(|e| format!("Database error: {}", e))?;
+    .map_err(|e| format!("Database error: {}", e))?
+    .flatten();
     sqlx::query_scalar(
         "UPDATE transcripts SET speaker_name = ?
          WHERE meeting_id = ? AND speaker_label = ? AND (speaker_name IS NULL OR speaker_name = ?)
