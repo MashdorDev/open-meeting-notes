@@ -405,7 +405,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
           setTranscripts(formattedTranscripts);
           console.log('[Reload Sync] ✅ Transcript history synced successfully');
-          setSpeakerGuesses(await invoke<Record<string, string>>('get_live_speaker_guesses'));
+          // A speaker-guesses event that lands while this is in flight is
+          // newer than the snapshot, so it wins.
+          const snapshot = await invoke<Record<string, string>>('get_live_speaker_guesses');
+          setSpeakerGuesses(prev => ({ ...snapshot, ...prev }));
 
           // Fetch meeting name from backend
           const meetingName = await recordingService.getRecordingMeetingName();

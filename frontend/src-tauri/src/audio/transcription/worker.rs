@@ -501,7 +501,7 @@ pub fn start_transcription_task<R: Runtime>(
             "Transcription worker task completed queued={} completed={}",
             final_queued, final_completed
         );
-        diarization.voiceprints()
+        diarization.finish()
     })
 }
 

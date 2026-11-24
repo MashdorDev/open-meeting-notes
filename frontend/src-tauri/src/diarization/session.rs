@@ -275,6 +275,18 @@ impl LiveDiarization {
             .unwrap_or_default()
     }
 
+    /// Each voice heard, then lets the recording's session go: the speaker
+    /// model and the voices stay out of memory until the next recording,
+    /// unless that one has already started.
+    pub fn finish(&self) -> Vec<Voiceprint> {
+        let voices = self.voiceprints();
+        let mut current = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
+        if current.as_ref().is_some_and(|c| std::sync::Arc::ptr_eq(&c.session, &self.session)) {
+            *current = None;
+        }
+        voices
+    }
+
     /// The guessed name of each voice that has one, by label.
     pub fn guesses(&self) -> HashMap<String, String> {
         self.voiceprints()
