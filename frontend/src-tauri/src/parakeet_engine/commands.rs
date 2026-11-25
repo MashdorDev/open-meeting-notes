@@ -150,6 +150,14 @@ pub async fn parakeet_is_model_loaded() -> Result<bool, String> {
     }
 }
 
+/// Live transcription uses only downloaded int8 models. The full-precision
+/// model is for the pass after each recording (audio/stop_pass.rs), which
+/// loads it on its own.
+fn is_live_model(model: &ModelInfo) -> bool {
+    matches!(model.status, crate::parakeet_engine::ModelStatus::Available)
+        && model.quantization == crate::parakeet_engine::QuantizationType::Int8
+}
+
 #[command]
 pub async fn parakeet_has_available_models() -> Result<bool, String> {
     let engine = {
@@ -163,10 +171,10 @@ pub async fn parakeet_has_available_models() -> Result<bool, String> {
             .await
             .map_err(|e| format!("Failed to discover Parakeet models: {}", e))?;
 
-        // Check if at least one model is available
+        // Check if at least one live model is available
         let available_models: Vec<_> = models
             .iter()
-            .filter(|model| matches!(model.status, crate::parakeet_engine::ModelStatus::Available))
+            .filter(|model| is_live_model(model))
             .collect();
 
         Ok(!available_models.is_empty())
@@ -198,7 +206,7 @@ pub async fn parakeet_validate_model_ready() -> Result<String, String> {
 
         let available_models: Vec<_> = models
             .iter()
-            .filter(|model| matches!(model.status, crate::parakeet_engine::ModelStatus::Available))
+            .filter(|model| is_live_model(model))
             .collect();
 
         if available_models.is_empty() {
@@ -208,11 +216,7 @@ pub async fn parakeet_validate_model_ready() -> Result<String, String> {
             );
         }
 
-        // Try to load the first available model (prefer int8 for speed)
-        let first_model = available_models.iter()
-            .find(|m| m.quantization == crate::parakeet_engine::QuantizationType::Int8)
-            .or_else(|| available_models.first())
-            .unwrap();
+        let first_model = available_models[0];
 
         engine
             .load_model(&first_model.name)
@@ -323,7 +327,7 @@ pub async fn parakeet_pick_model_with_config<R: tauri::Runtime>(
 
         let available_models: Vec<_> = models
             .iter()
-            .filter(|model| matches!(model.status, crate::parakeet_engine::ModelStatus::Available))
+            .filter(|model| is_live_model(model))
             .collect();
 
         if available_models.is_empty() {
@@ -341,28 +345,14 @@ pub async fn parakeet_pick_model_with_config<R: tauri::Runtime>(
                 configured_model
             } else {
                 log::warn!(
-                    "Configured Parakeet model '{}' not found, falling back to first available int8 model",
+                    "Configured Parakeet model '{}' not available for live use, falling back to first available int8 model",
                     configured_model
                 );
-                // Prefer int8 quantization for best speed/quality tradeoff
-                available_models
-                    .iter()
-                    .find(|m| m.quantization == crate::parakeet_engine::QuantizationType::Int8)
-                    .or_else(|| available_models.first())
-                    .unwrap()
-                    .name
-                    .clone()
+                available_models[0].name.clone()
             }
         } else {
-            // No configured model, prefer int8 for best speed/quality balance
             log::info!("No configured model, loading first available int8 Parakeet model");
-            available_models
-                .iter()
-                .find(|m| m.quantization == crate::parakeet_engine::QuantizationType::Int8)
-                .or_else(|| available_models.first())
-                .unwrap()
-                .name
-                .clone()
+            available_models[0].name.clone()
         };
 
         Ok(ParakeetModelChoice::ToLoad(model_name))
