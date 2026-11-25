@@ -158,6 +158,30 @@ fn is_live_model(model: &ModelInfo) -> bool {
         && model.quantization == crate::parakeet_engine::QuantizationType::Int8
 }
 
+/// The loaded model, when it is a live model. Retranscription or import can
+/// leave the full-precision model loaded; a recording then loads an int8 one.
+async fn loaded_live_model(engine: &ParakeetEngine) -> Result<Option<String>, String> {
+    if !engine.is_model_loaded().await {
+        return Ok(None);
+    }
+    let Some(current_model) = engine.get_current_model().await else {
+        return Ok(None);
+    };
+    let models = engine
+        .discover_models()
+        .await
+        .map_err(|e| format!("Failed to discover Parakeet models: {}", e))?;
+    if models.iter().any(|m| m.name == current_model && is_live_model(m)) {
+        Ok(Some(current_model))
+    } else {
+        log::info!(
+            "Loaded Parakeet model '{}' is not a live model, loading an int8 model instead",
+            current_model
+        );
+        Ok(None)
+    }
+}
+
 #[command]
 pub async fn parakeet_has_available_models() -> Result<bool, String> {
     let engine = {
@@ -191,11 +215,9 @@ pub async fn parakeet_validate_model_ready() -> Result<String, String> {
     };
 
     if let Some(engine) = engine {
-        // Check if a model is currently loaded
-        if engine.is_model_loaded().await {
-            if let Some(current_model) = engine.get_current_model().await {
-                return Ok(current_model);
-            }
+        // Check if a live model is currently loaded
+        if let Some(current_model) = loaded_live_model(&engine).await? {
+            return Ok(current_model);
         }
 
         // No model loaded, check if any models are available to load
@@ -273,12 +295,10 @@ pub async fn parakeet_pick_model_with_config<R: tauri::Runtime>(
     };
 
     if let Some(engine) = engine {
-        // Check if a model is currently loaded
-        if engine.is_model_loaded().await {
-            if let Some(current_model) = engine.get_current_model().await {
-                log::info!("Parakeet model already loaded: {}", current_model);
-                return Ok(ParakeetModelChoice::Loaded(current_model));
-            }
+        // Check if a live model is currently loaded
+        if let Some(current_model) = loaded_live_model(&engine).await? {
+            log::info!("Parakeet model already loaded: {}", current_model);
+            return Ok(ParakeetModelChoice::Loaded(current_model));
         }
 
         // No model loaded - try to load user's configured model from transcript config
