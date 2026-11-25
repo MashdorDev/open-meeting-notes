@@ -80,19 +80,25 @@ impl CaptionLog {
     pub fn observe(&mut self, app: &str, time: f64, blocks: &[(String, String)]) {
         // Blocks scroll off the top and new ones come in at the bottom, so
         // this read lines up with the end of the last one. Matching by place
-        // keeps two blocks that start the same way ("Yeah") apart.
+        // keeps two blocks that start the same way ("Yeah") apart. The
+        // shift with the most matching pairs wins (then the fewest that do
+        // not, then the smallest); a pair that does not match is new only if
+        // it is like no block already shown, so a rewrite never re-logs.
+        let pair = |old: &(String, String), new: &(String, String)| old.0 == new.0 && related(&old.1, &new.1);
         let shift = (0..=self.shown.len())
-            .find(|&s| {
-                self.shown[s..]
-                    .iter()
-                    .zip(blocks)
-                    .all(|((s_old, old), (s_new, new))| s_old == s_new && same_block(old, new))
+            .max_by_key(|&s| {
+                let (good, bad) = self.shown[s..].iter().zip(blocks).fold((0, 0), |(g, b), (old, new)| {
+                    if pair(old, new) { (g + 1, b) } else { (g, b + 1) }
+                });
+                (good, std::cmp::Reverse(bad), std::cmp::Reverse(s))
             })
-            .unwrap_or(self.shown.len());
-        for (i, (speaker, text)) in blocks.iter().enumerate() {
+            .unwrap_or(0);
+        for (i, block) in blocks.iter().enumerate() {
+            let (speaker, text) = block;
             let new_part = match self.shown.get(shift + i) {
-                Some((_, old)) => new_text(old, text),
-                None => text.trim(),
+                Some(old) if pair(old, block) => new_text(&old.1, text),
+                Some(_) if self.shown.iter().any(|old| old.0 == *speaker && same_block(&old.1, text)) => "",
+                _ => text.trim(),
             };
             if !new_part.is_empty() {
                 self.pieces.push(CaptionPiece {
@@ -153,6 +159,13 @@ fn common_units(a: &[(usize, String)], b: &[(usize, String)]) -> Vec<usize> {
         }
     }
     row
+}
+
+/// Whether a block in the same place and from the same speaker is the one
+/// read before. A one-word draft ("I", "So") is often rewritten whole
+/// ("Hi", "Sure"), so in its place it counts as the same block.
+fn related(old: &str, new: &str) -> bool {
+    units(old).len().min(units(new).len()) <= 1 || same_block(old, new)
 }
 
 /// Whether a block read now is the same one read before: it starts the way
@@ -382,6 +395,12 @@ mod tests {
         // No spaces between words.
         log.observe("meet", 4.0, &blocks(&[("Ken", "今日は")]));
         log.observe("meet", 5.0, &blocks(&[("Ken", "今日はいい天気")]));
+        // A one-word draft rewritten whole is still the same block.
+        log.observe("meet", 6.0, &blocks(&[("You", "I")]));
+        log.observe("meet", 7.0, &blocks(&[("You", "Hi there"), ("Ben", "So")]));
+        log.observe("meet", 8.0, &blocks(&[("You", "Hi there"), ("Ben", "Sure")]));
+        // A block rewritten past recognition does not re-log its neighbours.
+        log.observe("meet", 9.0, &blocks(&[("You", "Okay then so we"), ("Ben", "Sure")]));
         let pieces: Vec<(String, f64, String)> =
             log.into_pieces().into_iter().map(|p| (p.speaker, p.time, p.text)).collect();
         assert_eq!(
@@ -394,6 +413,11 @@ mod tests {
                 ("Ben".into(), 3.5, "today".into()),
                 ("Ken".into(), 4.0, "今日は".into()),
                 ("Ken".into(), 5.0, "いい天気".into()),
+                ("You".into(), 6.0, "I".into()),
+                ("You".into(), 7.0, "Hi there".into()),
+                ("Ben".into(), 7.0, "So".into()),
+                ("Ben".into(), 8.0, "Sure".into()),
+                ("You".into(), 9.0, "Okay then so we".into()),
             ]
         );
     }
