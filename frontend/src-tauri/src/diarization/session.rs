@@ -81,9 +81,11 @@ impl DiarizationSession {
         self.own_profile = profile;
     }
 
-    /// The saved own-voice profile updated with this meeting, when it changed.
-    pub fn updated_own_profile(&self) -> Option<OwnVoiceProfile> {
-        update_own_profile(&self.mic_voices.voiceprints(), self.own_profile.as_ref())
+    /// `saved` updated with this meeting, when it changes. The profile is
+    /// read again at stop rather than taken from the start, in case another
+    /// recording saved it in between.
+    pub fn updated_own_profile(&self, saved: Option<&OwnVoiceProfile>) -> Option<OwnVoiceProfile> {
+        update_own_profile(&self.mic_voices.voiceprints(), saved)
     }
 
     /// Learns the user's voice from a 16kHz mic line.
@@ -391,17 +393,27 @@ impl LiveDiarization {
     /// unless that one has already started.
     pub fn finish(&self) -> FinishedSpeakers {
         let voices = self.voiceprints();
-        let (own_voice, own_profile) = self
+        let own_voice = self
             .session
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .map(|session| (session.own_voice_labels(), session.updated_own_profile()))
+            .map(|session| session.own_voice_labels())
             .unwrap_or_default();
-        if let (Some(path), Some(profile)) = (&self.own_profile_path, own_profile) {
-            match super::voiceprints::write_own_voice_profile(path, &profile) {
-                Ok(()) => log::info!("Saved the user's voice profile ({} lines)", profile.lines),
-                Err(e) => log::warn!("Failed to save the user's voice profile: {}", e),
+        if let Some(path) = &self.own_profile_path {
+            let _write = super::voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let saved = super::voiceprints::read_own_voice_profile(path);
+            let updated = self
+                .session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .and_then(|session| session.updated_own_profile(saved.as_ref()));
+            if let Some(profile) = updated {
+                match super::voiceprints::write_own_voice_profile(path, &profile) {
+                    Ok(()) => log::info!("Saved the user's voice profile ({} lines)", profile.lines),
+                    Err(e) => log::warn!("Failed to save the user's voice profile: {}", e),
+                }
             }
         }
         let mut current = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
