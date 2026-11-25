@@ -129,6 +129,7 @@ fn finalize_recording_start() {
     IS_RECORDING.store(true, Ordering::SeqCst);
     MIC_FALLBACK_FAILED_ATTEMPTS.store(0, Ordering::SeqCst); // fresh mic-recovery budget per session
     reset_speech_detected_flag(); // reset speech-detected emit latch for the new session
+    crate::meeting_captions::start();
 }
 
 // Global recording manager and transcription task to keep them alive during recording
@@ -1256,6 +1257,13 @@ async fn stop_recording_for_session<R: Runtime>(
             }
         }
 
+        let captions = crate::meeting_captions::stop();
+        if let (Some(folder), false) = (&meeting_folder, captions.is_empty()) {
+            match crate::meeting_captions::write_captions(folder, &captions) {
+                Ok(()) => info!("Saved {} caption pieces with the meeting", captions.len()),
+                Err(e) => warn!("Failed to save meeting captions: {}", e),
+            }
+        }
         if let (Some(folder), false) = (&meeting_folder, own_voice.is_empty()) {
             match crate::diarization::voiceprints::write_own_voice(folder, &own_voice) {
                 Ok(()) => info!("Moved {} call-side voices that were the user to the mic side", own_voice.len()),
