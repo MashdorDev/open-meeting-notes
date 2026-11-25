@@ -28,13 +28,28 @@ const FULL_PRECISION_FILES: &[&str] = &[
 ];
 /// The int8 model preferred when full precision is not installed.
 const INT8_MODEL: &str = "parakeet-tdt-0.6b-v3-int8";
+/// A word further than this from every line is speech the live pass never
+/// made a line for; it is dropped rather than put on an unrelated line.
+const MAX_WORD_DISTANCE_SECONDS: f64 = 5.0;
 
-/// Starts the stop pass for a saved meeting without waiting for it. Skipped
-/// when a retranscription is running; holds the retranscription guard so a
-/// retranscription cannot start while it runs.
+/// Starts the stop pass for a saved meeting without waiting for it. Runs only
+/// when the transcript provider is Parakeet. Skipped when a retranscription
+/// is running; holds the retranscription guard, and a retranscription the
+/// user starts cancels it.
 pub fn spawn<R: Runtime>(app: AppHandle<R>, pool: SqlitePool, meeting_id: String, folder_path: String) {
     tauri::async_runtime::spawn(async move {
-        let Ok(_guard) = RetranscriptionGuard::acquire() else {
+        match uses_parakeet(&pool).await {
+            Ok(true) => {}
+            Ok(false) => {
+                info!("Stop pass for {meeting_id}: skipped, the transcript provider is not Parakeet");
+                return;
+            }
+            Err(e) => {
+                warn!("Stop pass for {meeting_id}: skipped, could not read the transcript provider: {e}");
+                return;
+            }
+        }
+        let Ok(_guard) = RetranscriptionGuard::acquire_for_stop_pass() else {
             info!("Stop pass for {meeting_id}: skipped, a retranscription is running");
             return;
         };
@@ -57,18 +72,35 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, pool: SqlitePool, meeting_id: String
     });
 }
 
+/// Whether the saved transcript provider is Parakeet, read the same way
+/// retranscription reads it.
+async fn uses_parakeet(pool: &SqlitePool) -> Result<bool> {
+    let provider: Option<String> =
+        sqlx::query_scalar("SELECT provider FROM transcript_settings WHERE id = '1'")
+            .fetch_optional(pool)
+            .await?;
+    Ok(provider.as_deref() == Some("parakeet"))
+}
+
 async fn run(pool: &SqlitePool, meeting_id: &str, folder: &Path) -> Result<usize> {
     let (model_dir, quantized) = pick_model().await?;
     let audio_path = find_audio_file(folder)?;
 
+    stop_if_needed().await?;
+    let samples = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
+        Ok(decode_audio_file(&audio_path)?.to_whisper_format())
+    })
+    .await
+    .map_err(|e| anyhow!("decode task panicked: {}", e))??;
+
+    stop_if_needed().await?;
     let segments = tokio::task::spawn_blocking(move || -> Result<Vec<SpeechSegment>> {
-        let samples = decode_audio_file(&audio_path)?.to_whisper_format();
         let speech = get_speech_chunks_with_progress(&samples, VAD_REDEMPTION_TIME_MS, |_, _| !is_cancelled())
             .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
         Ok(split_long_segments(&speech))
     })
     .await
-    .map_err(|e| anyhow!("decode task panicked: {}", e))??;
+    .map_err(|e| anyhow!("VAD task panicked: {}", e))??;
     stop_if_needed().await?;
 
     info!(
@@ -160,7 +192,8 @@ async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) 
     let mut tx = pool.begin().await?;
     let lines: Vec<(String, f64, f64)> = sqlx::query_as(
         "SELECT id, audio_start_time, audio_end_time FROM transcripts
-         WHERE meeting_id = ? AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL",
+         WHERE meeting_id = ? AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL
+         ORDER BY audio_start_time, id",
     )
     .bind(meeting_id)
     .fetch_all(&mut *tx)
@@ -188,21 +221,43 @@ async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) 
     Ok(updated)
 }
 
-/// Groups words by line, in the order of `spans`. A word goes to the line
-/// whose span holds its start (the line whose middle is nearest, when spans
-/// overlap), else to the nearest line. Words keep their order.
+/// Groups words by line, in the order of `spans`. Lines whose spans overlap
+/// another line never get words: the recording is mixed, so a word in the
+/// overlap cannot be given to one voice. A word that starts inside an overlap
+/// is dropped. Any other word goes to the eligible line whose span holds its
+/// start, else to the nearest eligible line within MAX_WORD_DISTANCE_SECONDS,
+/// else it is dropped. Words keep their order.
 fn assign_words(spans: &[(f64, f64)], words: Vec<TranscriptWord>) -> Vec<Vec<TranscriptWord>> {
+    let overlaps = |a: (f64, f64), b: (f64, f64)| (a.0 < b.1 && b.0 < a.1) || a == b;
+    let mut overlapped: Vec<(f64, f64)> = Vec::new();
+    let mut eligible = vec![true; spans.len()];
+    for i in 0..spans.len() {
+        for j in i + 1..spans.len() {
+            if overlaps(spans[i], spans[j]) {
+                eligible[i] = false;
+                eligible[j] = false;
+                overlapped.push((spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1)));
+            }
+        }
+    }
+
     let mut per_line: Vec<Vec<TranscriptWord>> = vec![Vec::new(); spans.len()];
     for word in words {
         let t = word.start;
-        let key = |&(start, end): &(f64, f64)| ((start - t).max(t - end).max(0.0), (t - (start + end) / 2.0).abs());
+        if overlapped.iter().any(|&(start, end)| start <= t && t <= end) {
+            continue;
+        }
+        let distance = |&(start, end): &(f64, f64)| (start - t).max(t - end).max(0.0);
         let nearest = spans
             .iter()
             .enumerate()
-            .min_by(|a, b| key(a.1).partial_cmp(&key(b.1)).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i);
-        if let Some(i) = nearest {
-            per_line[i].push(word);
+            .filter(|(i, _)| eligible[*i])
+            .map(|(i, span)| (i, distance(span)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((i, d)) = nearest {
+            if d <= MAX_WORD_DISTANCE_SECONDS {
+                per_line[i].push(word);
+            }
         }
     }
     per_line
