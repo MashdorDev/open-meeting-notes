@@ -249,6 +249,10 @@ export function TranscriptPanel({
             setNamesSaved(n => n + 1);
           }}
           onGuessDismissed={label => setSpeakerGuesses(({ [label]: _, ...rest }) => rest)}
+          onMarkedAsMe={async () => {
+            await onRefetchTranscripts?.();
+            setNamesSaved(n => n + 1);
+          }}
         />
       )}
 

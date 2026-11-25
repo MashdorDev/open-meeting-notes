@@ -1123,6 +1123,64 @@ pub async fn name_meeting_speaker(
     Ok(changed)
 }
 
+/// "This is me" on a call-side voice: the user's voice came back through
+/// someone else's mic. Its voiceprint becomes the user's own-voice profile,
+/// which later meetings compare against, and its lines move to the user's
+/// side. Returns the ids moved.
+#[tauri::command]
+pub async fn mark_speaker_as_me(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    speaker_label: String,
+) -> Result<Vec<String>, String> {
+    use tauri::Manager;
+    use crate::diarization::voiceprints;
+    let pool = state.db_manager.pool();
+    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(&meeting_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Database error: {}", e))?
+        .flatten();
+    let folder = folder.ok_or("This meeting has no folder with its voices")?;
+    let voice = voiceprints::read_voiceprints(std::path::Path::new(&folder))
+        .map_err(|e| format!("Could not read the meeting's voices: {}", e))?
+        .into_iter()
+        .find(|v| v.label == speaker_label)
+        .ok_or_else(|| format!("No saved voice for {}", speaker_label))?;
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join(voiceprints::OWN_VOICE_PROFILE_FILE);
+    {
+        let _write = voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let profile = voiceprints::OwnVoiceProfile::with_marked_voice(voiceprints::read_own_voice_profile(&path), &voice);
+        voiceprints::write_own_voice_profile(&path, &profile).map_err(|e| format!("Could not save your voice: {}", e))?;
+    }
+    let mut tx = pool.begin().await.map_err(|e| format!("Database error: {}", e))?;
+    let moved: Vec<String> = sqlx::query_scalar(
+        "UPDATE transcripts SET speaker = 'mic', speaker_label = NULL, speaker_name = NULL, speaker_name_pinned = 0
+         WHERE meeting_id = ? AND speaker_label = ?
+         RETURNING id",
+    )
+    .bind(&meeting_id)
+    .bind(&speaker_label)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| format!("Database error: {}", e))?;
+    sqlx::query("DELETE FROM voice_samples WHERE meeting_id = ? AND speaker_label = ?")
+        .bind(&meeting_id)
+        .bind(&speaker_label)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("Database error: {}", e))?;
+    tx.commit().await.map_err(|e| format!("Database error: {}", e))?;
+    log_info!("Saved {} as the user's voice ({} lines moved)", speaker_label, moved.len());
+    Ok(moved)
+}
+
 /// Keeps a speaker's voice as a sample of the person it is named after, from
 /// the voiceprints saved with the meeting. The name comes from the lines
 /// themselves: lines named one at a time are left out, and the sample is kept

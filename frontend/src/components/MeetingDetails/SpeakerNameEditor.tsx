@@ -20,6 +20,8 @@ interface SpeakerNameEditorProps {
   onSaved: (transcriptIds: string[], name: string | null) => Promise<void> | void;
   /** The guess for this voice was marked wrong. */
   onGuessDismissed: (speakerLabel: string) => void;
+  /** The voice was the user's own, and its lines moved to the user's side. */
+  onMarkedAsMe: () => Promise<void> | void;
 }
 
 /**
@@ -27,7 +29,7 @@ interface SpeakerNameEditorProps {
  * meeting, or for this line alone when the voice was mixed up. The names are
  * kept next to the automatic labels, so the speaker accuracy can be measured.
  */
-export function SpeakerNameEditor({ meetingId, segment, guess, suggestions, onClose, onSaved, onGuessDismissed }: SpeakerNameEditorProps) {
+export function SpeakerNameEditor({ meetingId, segment, guess, suggestions, onClose, onSaved, onGuessDismissed, onMarkedAsMe }: SpeakerNameEditorProps) {
   const [name, setName] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -71,6 +73,23 @@ export function SpeakerNameEditor({ meetingId, segment, guess, suggestions, onCl
     }
   };
 
+  // The user's voice heard through someone else's mic on the call. Saving
+  // it lets later meetings find it, even with a colleague at the user's desk.
+  const markAsMe = async () => {
+    if (!segment?.speakerLabel) return;
+    setSaving(true);
+    try {
+      await invoke('mark_speaker_as_me', { meetingId, speakerLabel: segment.speakerLabel });
+      await onMarkedAsMe();
+      onClose();
+    } catch (error) {
+      console.error('Failed to mark the voice as yours:', error);
+      toast.error(`Could not save your voice: ${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const trimmed = name.trim();
   const label = segment?.speakerLabel;
 
@@ -101,6 +120,17 @@ export function SpeakerNameEditor({ meetingId, segment, guess, suggestions, onCl
             className="rounded-md border border-gray-300 px-3 py-2 text-base font-normal focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </label>
+
+        {label && (
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => void markAsMe()}
+            className="self-start text-sm text-blue-700 hover:underline disabled:opacity-50"
+          >
+            {`This is me: move every ${label} line to my side and remember my voice`}
+          </button>
+        )}
 
         {suggestions.length > 0 && (
           <div className="flex flex-wrap gap-2">
