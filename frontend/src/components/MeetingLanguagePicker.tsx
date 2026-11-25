@@ -7,24 +7,29 @@ import { Button } from './ui/button';
 import { Label } from './ui/label';
 
 interface MeetingLanguagePickerProps {
-  provider: string;
+  /** The provider meetings are transcribed with now (the saved one). */
+  savedProvider: string;
+  /** The provider whose models are listed below, which may not be saved yet. */
+  shownProvider: string;
   onUseWhisper: () => void;
 }
 
 /**
  * The language meetings are held in. Parakeet only knows 25 European
- * languages, so for any other language this points the user to Whisper,
- * and to a language-tuned model where one exists.
+ * languages and cannot translate, so for anything else this points the user
+ * to Whisper, and to a language-tuned model where one exists.
  */
-export function MeetingLanguagePicker({ provider, onUseWhisper }: MeetingLanguagePickerProps) {
+export function MeetingLanguagePicker({ savedProvider, shownProvider, onUseWhisper }: MeetingLanguagePickerProps) {
   const { selectedLanguage, setSelectedLanguage } = useConfig();
   // The language is read per chunk, so changing it mid-recording would split a meeting.
   const { isRecording } = useRecordingState();
   const lang = selectedLanguage || 'auto';
   const name = LANGUAGES.find((l) => l.code === lang)?.name ?? lang;
-  const isAuto = lang === 'auto' || lang === 'auto-translate';
-  const parakeetCannot = provider === 'parakeet' && !isAuto && !PARAKEET_LANGUAGES.includes(lang);
+  const translate = lang === 'auto-translate';
+  // Keyed on the saved provider: the warning stays until a Whisper model is chosen.
+  const parakeetCannot = savedProvider === 'parakeet' && lang !== 'auto' && !PARAKEET_LANGUAGES.includes(lang);
   const tuned = LANGUAGE_MODELS[lang];
+  const whisperShown = shownProvider === 'localWhisper';
 
   return (
     <div>
@@ -46,18 +51,26 @@ export function MeetingLanguagePicker({ provider, onUseWhisper }: MeetingLanguag
 
         {parakeetCannot && (
           <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-            <p>Parakeet does not transcribe {name}, so its text would come out wrong. Use Local Whisper for {name} meetings.</p>
-            <Button size="sm" className="mt-2" onClick={onUseWhisper}>Use Local Whisper</Button>
+            <p>
+              {translate
+                ? 'Parakeet cannot translate. It writes the meeting in the language spoken. Use Local Whisper to translate to English.'
+                : `Parakeet does not transcribe ${name}, so its text would come out wrong. Use Local Whisper for ${name} meetings.`}
+            </p>
+            {whisperShown ? (
+              <p className="mt-2 font-medium">Choose a Whisper model below. Meetings use Parakeet until one is selected.</p>
+            ) : (
+              <Button size="sm" className="mt-2" onClick={onUseWhisper}>Use Local Whisper</Button>
+            )}
           </div>
         )}
 
-        {tuned && (provider === 'localWhisper' || parakeetCannot) && (
+        {tuned && (savedProvider === 'localWhisper' || parakeetCannot) && (
           <p className="mt-2 text-xs text-gray-500">
             For {name}, download {tuned.label} under Language-tuned Models. It is tuned on {name} speech.
           </p>
         )}
 
-        {provider === 'parakeet' && !parakeetCannot && !isAuto && (
+        {savedProvider === 'parakeet' && !parakeetCannot && lang !== 'auto' && (
           <p className="mt-2 text-xs text-gray-500">Parakeet detects the language by itself.</p>
         )}
       </div>

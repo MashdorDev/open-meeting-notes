@@ -104,7 +104,8 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 </div> */}
                 <div className="space-y-4 pb-6">
                     <MeetingLanguagePicker
-                        provider={uiProvider}
+                        savedProvider={transcriptModelConfig.provider}
+                        shownProvider={uiProvider}
                         onUseWhisper={() => setUiProvider('localWhisper')}
                     />
                     <div>
