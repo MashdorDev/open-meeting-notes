@@ -129,6 +129,7 @@ fn finalize_recording_start() {
     IS_RECORDING.store(true, Ordering::SeqCst);
     MIC_FALLBACK_FAILED_ATTEMPTS.store(0, Ordering::SeqCst); // fresh mic-recovery budget per session
     reset_speech_detected_flag(); // reset speech-detected emit latch for the new session
+    crate::meeting_captions::start();
 }
 
 // Global recording manager and transcription task to keep them alive during recording
@@ -928,6 +929,9 @@ async fn stop_recording_for_session<R: Runtime>(
     };
 
     let (stop_result, manager_for_cleanup) = stop_result;
+    // Now, not after the transcript drains: whatever is said in the call
+    // after Stop is not part of this meeting.
+    let captions = crate::meeting_captions::stop().await;
 
     match stop_result {
         Ok(_) => {
@@ -1256,6 +1260,12 @@ async fn stop_recording_for_session<R: Runtime>(
             }
         }
 
+        if let (Some(folder), false) = (&meeting_folder, captions.is_empty()) {
+            match crate::meeting_captions::write_captions(folder, &captions) {
+                Ok(()) => info!("Saved {} caption pieces with the meeting", captions.len()),
+                Err(e) => warn!("Failed to save meeting captions: {}", e),
+            }
+        }
         if let (Some(folder), false) = (&meeting_folder, own_voice.is_empty()) {
             match crate::diarization::voiceprints::write_own_voice(folder, &own_voice) {
                 Ok(()) => info!("Moved {} call-side voices that were the user to the mic side", own_voice.len()),
@@ -1363,6 +1373,7 @@ pub async fn pause_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
     if let Some(manager) = manager_guard.as_ref() {
         manager.pause_recording().map_err(|e| e.to_string())?;
+        crate::meeting_captions::set_paused(true);
 
         // Emit pause event to frontend
         app.emit(
@@ -1397,6 +1408,7 @@ pub async fn resume_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), Strin
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
     if let Some(manager) = manager_guard.as_ref() {
         manager.resume_recording().map_err(|e| e.to_string())?;
+        crate::meeting_captions::set_paused(false);
 
         // Emit resume event to frontend
         app.emit(

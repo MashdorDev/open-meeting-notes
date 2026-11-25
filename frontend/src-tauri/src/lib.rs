@@ -43,6 +43,7 @@ pub mod config;
 pub mod console_utils;
 pub mod database;
 pub mod diarization;
+pub mod meeting_captions;
 pub mod doodle;
 pub mod notifications;
 pub mod ollama;
@@ -997,6 +998,13 @@ pub fn run() {
                         log::info!("Cleaning up sidecar...");
                         if let Err(e) = summary::summary_engine::force_shutdown_sidecar().await {
                             log::error!("Failed to force shutdown sidecar: {}", e);
+                        }
+
+                        // Ends a caption reader still running, which undoes the
+                        // accessibility switch it may have set on a browser.
+                        let captions = crate::meeting_captions::stop();
+                        if tokio::time::timeout(std::time::Duration::from_secs(2), captions).await.is_err() {
+                            log::warn!("Caption reader did not stop within 2 s");
                         }
                     });
                     log::info!("Application cleanup complete");
