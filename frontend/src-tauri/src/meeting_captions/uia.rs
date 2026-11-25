@@ -1,6 +1,6 @@
 //! Reads Meet's caption region from the browser through Windows UI Automation.
 
-use super::{capture, parse_caption_texts, CaptionPiece};
+use super::{capture, parse_caption_texts, CaptionPiece, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::CloseHandle;
@@ -28,7 +28,13 @@ pub fn run(stop: &AtomicBool) -> Vec<CaptionPiece> {
             Ok(automation) => capture(
                 stop,
                 || find_meet_captions(&automation, stop, false).ok().flatten(),
-                |region| caption_texts(&automation, region).ok(),
+                |region| match caption_texts(&automation, region) {
+                    Ok(texts) => Read::Texts(texts),
+                    Err(_) if region.CurrentName().is_err() => Read::Gone,
+                    // A line went away mid-read: reading on would miss the
+                    // lines after it, which the next read would log again.
+                    Err(_) => Read::Partial,
+                },
             ),
             Err(e) => {
                 log::warn!("Meeting captions off: UI Automation unavailable: {}", e);
@@ -172,23 +178,36 @@ unsafe fn caption_texts(automation: &IUIAutomation, region: &IUIAutomationElemen
     region.CurrentName()?;
     let walker = automation.ControlViewWalker()?;
     let mut texts = Vec::new();
-    walk(&walker, region, 0, &mut texts);
+    walk(&walker, region, 0, &mut texts)?;
     Ok(texts)
 }
 
-/// An element that goes away mid-read (Meet replaces caption lines as it
-/// revises) is skipped, not taken as the region being gone.
-unsafe fn walk(walker: &IUIAutomationTreeWalker, parent: &IUIAutomationElement, depth: usize, texts: &mut Vec<(usize, String)>) {
-    let mut child = walker.GetFirstChildElement(parent).ok();
-    while let Some(element) = child {
-        if element.CurrentControlType().is_ok_and(|t| t == UIA_TextControlTypeId) {
-            if let Ok(name) = element.CurrentName() {
-                texts.push((depth, name.to_string()));
-            }
-        }
-        walk(walker, &element, depth + 1, texts);
-        child = walker.GetNextSiblingElement(&element).ok();
+/// The walker's next element: None at the end, an error when the element
+/// went away (Meet replaces caption lines as it revises).
+fn next(step: windows::core::Result<IUIAutomationElement>) -> windows::core::Result<Option<IUIAutomationElement>> {
+    match step {
+        Ok(element) => Ok(Some(element)),
+        // A null element, which the walker returns at the end.
+        Err(e) if e.code() == windows::core::Error::empty().code() => Ok(None),
+        Err(e) => Err(e),
     }
+}
+
+unsafe fn walk(
+    walker: &IUIAutomationTreeWalker,
+    parent: &IUIAutomationElement,
+    depth: usize,
+    texts: &mut Vec<(usize, String)>,
+) -> windows::core::Result<()> {
+    let mut child = next(walker.GetFirstChildElement(parent))?;
+    while let Some(element) = child {
+        if element.CurrentControlType()? == UIA_TextControlTypeId {
+            texts.push((depth, element.CurrentName()?.to_string()));
+        }
+        walk(walker, &element, depth + 1, texts)?;
+        child = next(walker.GetNextSiblingElement(&element))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

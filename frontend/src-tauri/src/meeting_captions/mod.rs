@@ -265,11 +265,6 @@ pub async fn stop() -> Vec<CaptionPiece> {
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const READ_EVERY: Duration = Duration::from_millis(700);
 
-/// A first read this soon after the start shows what was said before it;
-/// Chromium may need a search or two before its page is readable.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-const BASELINE_WITHIN: Duration = Duration::from_secs(15);
-
 /// How long to wait before looking for the caption region again. The
 /// search walks browser windows, so after a minute without captions it is
 /// done less often.
@@ -282,27 +277,34 @@ fn search_wait(misses: u32) -> Duration {
     }
 }
 
-/// The reader loop both platforms share: finds the caption region with
-/// `find`, reads its texts with `read` (None once it is gone) and logs the
-/// new text against recording time, which is wall time minus pauses, like
-/// the audio's timestamps.
+/// One read of the caption region.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-fn capture<R>(
-    stop: &AtomicBool,
-    mut find: impl FnMut() -> Option<R>,
-    mut read: impl FnMut(&R) -> Option<Vec<(usize, String)>>,
-) -> Vec<CaptionPiece> {
+enum Read {
+    Texts(Vec<(usize, String)>),
+    /// Part of the region changed mid-read; try again at the next read.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Partial,
+    /// The tab closed or captions were turned off.
+    Gone,
+}
+
+/// The reader loop both platforms share: finds the caption region with
+/// `find`, reads it with `read` and logs the new text against recording
+/// time, which is wall time minus pauses, like the audio's timestamps.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn capture<R>(stop: &AtomicBool, mut find: impl FnMut() -> Option<R>, mut read: impl FnMut(&R) -> Read) -> Vec<CaptionPiece> {
     let mut clock = Duration::ZERO;
     let mut ticked = Instant::now();
     let mut log = CaptionLog::default();
     let mut region: Option<R> = None;
     let mut last_search: Option<Instant> = None;
     let mut misses = 0;
-    // What the first read in the recording's first seconds shows was said
-    // before it started, and what the first read after a pause shows was
-    // said during the pause: neither is logged.
-    let mut first_read = true;
-    let mut resumed = false;
+    // The next read only takes what is on screen without logging it. Set at
+    // the start and at a pause: if the region is showing then (or at the
+    // first search after), its text was said before the recording or during
+    // the pause. A region found by a later search is logged from its first
+    // read, since its text was said while recording.
+    let mut baseline = true;
     while !stop.load(Ordering::SeqCst) {
         let paused = PAUSED.load(Ordering::SeqCst);
         if !paused {
@@ -310,7 +312,9 @@ fn capture<R>(
         }
         ticked = Instant::now();
         if paused {
-            resumed = true;
+            baseline = true;
+            // Search again as soon as the recording resumes.
+            last_search = None;
             std::thread::sleep(READ_EVERY);
             continue;
         }
@@ -322,21 +326,24 @@ fn capture<R>(
                 log::info!("Reading speaker names from Meet's captions");
             } else {
                 misses += 1;
+                baseline = false;
             }
         }
         if let Some(found) = &region {
             match read(found) {
-                Some(texts) => {
+                Read::Texts(texts) => {
                     let blocks = parse_caption_texts(&texts);
-                    let early = std::mem::take(&mut first_read) && clock < BASELINE_WITHIN;
-                    if std::mem::take(&mut resumed) || early {
+                    if std::mem::take(&mut baseline) {
                         log.baseline(&blocks);
                     } else {
                         log.observe("meet", clock.as_secs_f64(), &blocks);
                     }
                 }
-                // The tab closed or captions were turned off.
-                None => region = None,
+                Read::Partial => {}
+                Read::Gone => {
+                    region = None;
+                    baseline = false;
+                }
             }
         }
         std::thread::sleep(READ_EVERY);

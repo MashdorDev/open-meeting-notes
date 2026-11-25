@@ -1,7 +1,7 @@
 //! Reads Meet's caption region from the browser through the macOS
 //! Accessibility API (AXUIElement).
 
-use super::{capture, parse_caption_texts, search_wait, CaptionPiece};
+use super::{capture, parse_caption_texts, search_wait, CaptionPiece, Read};
 use cidre::{arc, ax, cf, ns, objc};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,7 +48,10 @@ pub fn run(stop: &AtomicBool) -> Vec<CaptionPiece> {
     // A browser that hangs must not hold up the reader.
     let _ = ax::UiElement::sys_wide().set_messaging_timeout_secs(1.0);
     let mut exposed = HashMap::new();
-    let pieces = capture(stop, || find_meet_captions(&mut exposed, stop, false), |region| caption_texts(region, stop));
+    let pieces = capture(stop, || find_meet_captions(&mut exposed, stop, false), |region| match caption_texts(region, stop) {
+        Some(texts) => Read::Texts(texts),
+        None => Read::Gone,
+    });
     unexpose(&exposed);
     pieces
 }
