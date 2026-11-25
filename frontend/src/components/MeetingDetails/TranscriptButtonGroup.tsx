@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
@@ -36,11 +36,15 @@ export function TranscriptButtonGroup({
   // Whether the stop pass rewrote lines whose live text can be restored.
   const [hasLiveText, setHasLiveText] = useState(false);
   const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
+  // The meeting shown now, so a reply for a meeting left behind is ignored.
+  const meetingIdRef = useRef(meetingId);
+  meetingIdRef.current = meetingId;
 
   const checkLiveText = useCallback(async () => {
     if (!meetingId) return;
     try {
-      setHasLiveText(await invoke<boolean>('api_meeting_has_live_text', { meetingId }));
+      const hasLive = await invoke<boolean>('api_meeting_has_live_text', { meetingId });
+      if (meetingIdRef.current === meetingId) setHasLiveText(hasLive);
     } catch (error) {
       console.error('Failed to check for live text:', error);
     }
@@ -63,7 +67,11 @@ export function TranscriptButtonGroup({
     if (!meetingId) return;
     try {
       const lines = await invoke<number>('api_restore_live_text', { meetingId });
-      toast.success(lines === 1 ? 'Restored the live text of 1 line' : `Restored the live text of ${lines} lines`);
+      if (lines === 0) {
+        toast.info('Nothing to restore');
+      } else {
+        toast.success(lines === 1 ? 'Restored the live text of 1 line' : `Restored the live text of ${lines} lines`);
+      }
     } catch (error) {
       toast.error(String(error));
     }
@@ -75,7 +83,9 @@ export function TranscriptButtonGroup({
     if (onRefetchTranscripts) {
       await onRefetchTranscripts();
     }
-  }, [onRefetchTranscripts]);
+    // Retranscribing replaces every line, so no live text is left.
+    await checkLiveText();
+  }, [onRefetchTranscripts, checkLiveText]);
 
   return (
     <div className="flex items-center justify-center w-full gap-2">
