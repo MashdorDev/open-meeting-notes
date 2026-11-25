@@ -3,6 +3,7 @@ import { Globe } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
+import { PARAKEET_LANGUAGES } from '@/lib/whisper';
 
 export interface Language {
   code: string;
@@ -168,6 +169,8 @@ export function LanguageSelection({
     }
   };
 
+  const parakeetCannot = selectedLanguage !== 'auto' && !PARAKEET_LANGUAGES.includes(selectedLanguage);
+
   // Find the selected language name for display
   const selectedLanguageName = LANGUAGES.find(
     lang => lang.code === selectedLanguage
@@ -198,11 +201,18 @@ export function LanguageSelection({
         </select>
 
         {/* Parakeet language limitation warning */}
-        {isParakeet && (
+        {isParakeet && parakeetCannot && (
           <div className="p-2 bg-amber-50 border border-amber-200 rounded text-amber-800">
-            <p className="font-medium">ℹ️ Parakeet Language Support</p>
-            <p className="mt-1 text-xs">Parakeet currently only supports automatic language detection. Manual language selection is not available. Use Whisper if you need to specify a particular language.</p>
+            <p className="text-xs">
+              {selectedLanguage === 'auto-translate'
+                ? 'Parakeet cannot translate. It writes the meeting in the language spoken.'
+                : `Parakeet does not transcribe ${selectedLanguageName}, so its text would come out wrong.`}
+              {' '}Choose Local Whisper in Settings &gt; Transcription.
+            </p>
           </div>
+        )}
+        {isParakeet && !parakeetCannot && (
+          <p className="text-xs text-gray-500">Parakeet detects the language by itself.</p>
         )}
 
         {/* Info text */}
@@ -222,7 +232,7 @@ export function LanguageSelection({
               <p className="mt-1">All audio will be automatically translated to English. Best for multilingual meetings where you need English output.</p>
             </div>
           )}
-          {selectedLanguage !== 'auto' && selectedLanguage !== 'auto-translate' && (
+          {!isParakeet && selectedLanguage !== 'auto' && selectedLanguage !== 'auto-translate' && (
             <p className="text-gray-600">
               Transcription will be optimized for <strong>{selectedLanguageName}</strong>
             </p>
