@@ -135,3 +135,33 @@ unsafe fn walk(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Prints what the search sees; run during a Meet call with captions on:
+    /// cargo test --lib meeting_captions::uia::live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn search_steps() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
+            let documents = automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_DocumentControlTypeId.0)).unwrap();
+            let windows = automation.GetRootElement().unwrap().FindAll(TreeScope_Children, &automation.CreateTrueCondition().unwrap()).unwrap();
+            for i in 0..windows.Length().unwrap() {
+                let w = windows.GetElement(i).unwrap();
+                let class = w.CurrentClassName().unwrap().to_string();
+                if !BROWSER_CLASSES.contains(&class.as_str()) { continue; }
+                let docs = w.FindAll(TreeScope_Descendants, &documents);
+                let n = docs.as_ref().map(|d| d.Length().unwrap_or(-1)).unwrap_or(-2);
+                println!("window [{}] {} documents: {}", class, w.CurrentName().unwrap(), n);
+                if let Ok(docs) = docs {
+                    for j in 0..n { println!("   doc: {:?}", docs.GetElement(j).unwrap().CurrentName().unwrap().to_string()); }
+                }
+            }
+            println!("found: {:?}", find_meet_captions(&automation).map(|f| f.is_some()));
+        }
+    }
+}

@@ -77,7 +77,18 @@ impl CaptionLog {
                     let common = common_prefix_chars(&old, text);
                     // Back to the start of the word the two first differ in.
                     let cut = text[..common].rfind(' ').map_or(0, |i| i + 1);
-                    if common == text.len() { String::new() } else { text[cut..].to_string() }
+                    if common == text.len() {
+                        String::new()
+                    } else {
+                        // Meet ends its draft with a period and drops it as
+                        // words come in ("now." then "now testing"), so the
+                        // last word seen comes back; keep it once.
+                        let mut new_part = text[cut..].split_whitespace().peekable();
+                        if new_part.peek().map(|w| bare_word(w)) == old.split_whitespace().last().map(bare_word) {
+                            new_part.next();
+                        }
+                        new_part.collect::<Vec<_>>().join(" ")
+                    }
                 }
                 None => {
                     self.open.push((speaker.clone(), text.clone()));
@@ -104,17 +115,16 @@ impl CaptionLog {
     }
 }
 
+fn bare_word(word: &str) -> String {
+    word.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+}
+
 /// Whether a block read now is the same one read before: it starts the way
 /// the earlier one did (the app only rewrites the last few words).
 fn same_block(old: &str, new: &str) -> bool {
     let n = old.split_whitespace().count().min(new.split_whitespace().count()).min(3);
     // Punctuation and case come and go as the app revises ("there" becomes "There,").
-    let start = |s: &str| {
-        s.split_whitespace()
-            .take(n)
-            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase())
-            .collect::<Vec<_>>()
-    };
+    let start = |s: &str| s.split_whitespace().take(n).map(bare_word).collect::<Vec<_>>();
     n > 0 && start(old) == start(new)
 }
 
@@ -186,6 +196,9 @@ mod tests {
         log.observe("meet", 3.0, &block("You", "Hello there, how are"));
         // The app rewrites the last word.
         log.observe("meet", 4.0, &block("You", "Hello there, how is it"));
+        // Meet's draft period on the last word.
+        log.observe("meet", 4.5, &block("You", "Hello there, how is it."));
+        log.observe("meet", 4.8, &block("You", "Hello there, how is it going"));
         log.observe("meet", 5.0, &block("Ben", "Fine thanks"));
         let pieces: Vec<(String, f64, String)> =
             log.into_pieces().into_iter().map(|p| (p.speaker, p.time, p.text)).collect();
@@ -193,8 +206,9 @@ mod tests {
             pieces,
             vec![
                 ("You".into(), 1.0, "Hello there".into()),
-                ("You".into(), 3.0, "there, how are".into()),
+                ("You".into(), 3.0, "how are".into()),
                 ("You".into(), 4.0, "is it".into()),
+                ("You".into(), 4.8, "going".into()),
                 ("Ben".into(), 5.0, "Fine thanks".into()),
             ]
         );
