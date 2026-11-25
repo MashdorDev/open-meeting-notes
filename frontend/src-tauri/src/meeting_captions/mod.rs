@@ -80,19 +80,24 @@ impl CaptionLog {
     pub fn observe(&mut self, app: &str, time: f64, blocks: &[(String, String)]) {
         // Blocks scroll off the top and new ones come in at the bottom, so
         // this read lines up with the end of the last one. Matching by place
-        // keeps two blocks that start the same way ("Yeah") apart. The
-        // shift with the most matching pairs wins (then the fewest that do
-        // not, then the smallest); a pair that does not match is new only if
-        // it is like no block already shown, so a rewrite never re-logs.
-        let pair = |old: &(String, String), new: &(String, String)| old.0 == new.0 && related(&old.1, &new.1);
+        // keeps two blocks that start the same way ("Yeah") apart. The shift
+        // is chosen by strict matches only: the most, then the fewest
+        // mismatches, then the largest shift, since in a two-person call a
+        // block also lines up with the same speaker's block two places on.
+        let strict = |old: &(String, String), new: &(String, String)| old.0 == new.0 && same_block(&old.1, &new.1);
         let shift = (0..=self.shown.len())
             .max_by_key(|&s| {
                 let (good, bad) = self.shown[s..].iter().zip(blocks).fold((0, 0), |(g, b), (old, new)| {
-                    if pair(old, new) { (g + 1, b) } else { (g, b + 1) }
+                    if strict(old, new) { (g + 1, b) } else { (g, b + 1) }
                 });
-                (good, std::cmp::Reverse(bad), std::cmp::Reverse(s))
+                (good, std::cmp::Reverse(bad))
             })
             .unwrap_or(0);
+        // In a place the strict matches fixed, a one-word draft rewritten
+        // whole ("I" to "Hi") is still that block. A block that matches
+        // nothing is new only if it is like no block already shown, so a
+        // rewrite never re-logs.
+        let pair = |old: &(String, String), new: &(String, String)| old.0 == new.0 && related(&old.1, &new.1);
         for (i, block) in blocks.iter().enumerate() {
             let (speaker, text) = block;
             let new_part = match self.shown.get(shift + i) {
@@ -434,5 +439,14 @@ mod tests {
                 ("You".into(), 9.0, "Okay then so we".into()),
             ]
         );
+
+        // Two people taking turns: each block also lines up with the same
+        // speaker's block two places on, which must not win.
+        let mut log = CaptionLog::default();
+        log.baseline(&blocks(&[("A", "Yeah"), ("B", "Okay"), ("A", "Sure"), ("B", "Right")]));
+        log.observe("meet", 10.0, &blocks(&[("A", "Sure"), ("B", "Right"), ("A", "Yeah definitely")]));
+        let turns: Vec<(String, f64, String)> =
+            log.into_pieces().into_iter().map(|p| (p.speaker, p.time, p.text)).collect();
+        assert_eq!(turns, vec![("A".into(), 10.0, "Yeah definitely".into())]);
     }
 }
