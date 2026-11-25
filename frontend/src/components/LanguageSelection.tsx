@@ -226,7 +226,7 @@ export function LanguageSelection({
               <p className="mt-1">For best accuracy, select your specific language (e.g., English, Spanish, etc.)</p>
             </div>
           )}
-          {selectedLanguage === 'auto-translate' && (
+          {!isParakeet && selectedLanguage === 'auto-translate' && (
             <div className="p-2 bg-blue-50 border border-blue-200 rounded text-blue-800">
               <p className="font-medium">🌐 Translation Mode Active</p>
               <p className="mt-1">All audio will be automatically translated to English. Best for multilingual meetings where you need English output.</p>
