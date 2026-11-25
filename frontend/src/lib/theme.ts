@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export type ThemeChoice = 'light' | 'dark' | 'system';
@@ -41,3 +42,21 @@ export function startTheme(): () => void {
  * Keep the logic in step with applyTheme above.
  */
 export const THEME_BOOT_SCRIPT = `try{var t=localStorage.getItem('${STORAGE_KEY}');if(t==='dark'||(t!=='light'&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark')}catch(e){}`;
+
+function subscribeToDarkClass(onChange: () => void): () => void {
+  const observer = new MutationObserver(onChange);
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+  return () => observer.disconnect();
+}
+
+/**
+ * The theme actually on screen, for components that take a theme prop and
+ * set their own colors (BlockNote paints light variables on its own root).
+ */
+export function useResolvedTheme(): 'light' | 'dark' {
+  return useSyncExternalStore(
+    subscribeToDarkClass,
+    () => (document.documentElement.classList.contains('dark') ? 'dark' : 'light'),
+    () => 'light',
+  );
+}

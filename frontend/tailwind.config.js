@@ -40,7 +40,12 @@ for (const scale of [...GRAY_SCALES, ...ACCENT_SCALES]) {
 }
 
 const themedPalette = plugin(({ addBase }) => {
-  addBase({ ':root': { ...lightVars, colorScheme: 'light' }, '.dark': { ...darkVars, colorScheme: 'dark' } })
+  addBase({
+    ':root': { ...lightVars, colorScheme: 'light' },
+    '.dark': { ...darkVars, colorScheme: 'dark' },
+    // For surfaces drawn the same in both themes (the dark drop overlay).
+    '.palette-fixed': lightVars,
+  })
 })
 
 module.exports = {
