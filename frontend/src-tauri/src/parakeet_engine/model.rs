@@ -486,3 +486,36 @@ impl ParakeetModel {
         Ok(timestamped_result)
     }
 }
+
+#[cfg(test)]
+mod accuracy {
+    use super::ParakeetModel;
+
+    /// Transcribes a recording to compare model files and context lengths.
+    /// OMN_AB_MODEL: model folder; OMN_AB_QUANT: 1 for the int8 files;
+    /// OMN_AB_PCM: 16 kHz mono f32le; OMN_AB_SEGMENTS: JSON [[start, end], ...]
+    /// in seconds, or unset for one pass over the whole recording;
+    /// OMN_AB_OUT: where the text goes.
+    #[test]
+    #[ignore]
+    fn transcribe_for_comparison() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{} not set", k));
+        let mut model = ParakeetModel::new(var("OMN_AB_MODEL"), var("OMN_AB_QUANT") == "1").unwrap();
+        let bytes = std::fs::read(var("OMN_AB_PCM")).unwrap();
+        let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let spans: Vec<(f64, f64)> = match std::env::var("OMN_AB_SEGMENTS") {
+            Ok(path) => serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap(),
+            Err(_) => vec![(0.0, samples.len() as f64 / 16_000.0)],
+        };
+        let started = std::time::Instant::now();
+        let text: Vec<String> = spans
+            .iter()
+            .map(|&(start, end)| {
+                let (a, b) = ((start * 16_000.0) as usize, ((end * 16_000.0) as usize).min(samples.len()));
+                model.transcribe_samples(samples[a..b].to_vec()).unwrap().text.trim().to_string()
+            })
+            .collect();
+        println!("took {:.1}s", started.elapsed().as_secs_f64());
+        std::fs::write(var("OMN_AB_OUT"), text.join(" ")).unwrap();
+    }
+}
