@@ -6,11 +6,11 @@
 
 use super::decoder::decode_audio_file;
 use super::retranscription::{
-    find_audio_file, is_cancelled, reset_cancellation, split_long_segments, RetranscriptionGuard,
+    find_audio_file, split_long_segments, RetranscriptionGuard,
     VAD_REDEMPTION_TIME_MS,
 };
 use super::transcription::words::{shift_words, words_from_pieces, words_to_json, TranscriptWord};
-use super::vad::{get_speech_chunks_with_progress, SpeechSegment};
+use super::vad::{get_speech_chunks, SpeechSegment};
 use crate::parakeet_engine::ParakeetModel;
 use anyhow::{anyhow, Result};
 use log::{info, warn};
@@ -34,8 +34,8 @@ const MAX_WORD_DISTANCE_SECONDS: f64 = 5.0;
 
 /// Starts the stop pass for a saved meeting without waiting for it. Runs only
 /// when the transcript provider is Parakeet. Skipped when a retranscription
-/// is running; holds the retranscription guard, and a retranscription the
-/// user starts cancels it.
+/// is running; holds the retranscription guard, so a retranscription the
+/// user starts meanwhile is refused.
 pub fn spawn<R: Runtime>(app: AppHandle<R>, pool: SqlitePool, meeting_id: String, folder_path: String) {
     tauri::async_runtime::spawn(async move {
         match uses_parakeet(&pool).await {
@@ -53,7 +53,6 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, pool: SqlitePool, meeting_id: String
             info!("Stop pass for {meeting_id}: skipped, a retranscription is running");
             return;
         };
-        reset_cancellation();
         let started = std::time::Instant::now();
         match run(&pool, &meeting_id, Path::new(&folder_path)).await {
             Ok(0) => info!("Stop pass for {meeting_id}: no line changed"),
@@ -100,7 +99,7 @@ async fn run(pool: &SqlitePool, meeting_id: &str, folder: &Path) -> Result<usize
 
     stop_if_needed().await?;
     let segments = tokio::task::spawn_blocking(move || -> Result<Vec<SpeechSegment>> {
-        let speech = get_speech_chunks_with_progress(&samples, VAD_REDEMPTION_TIME_MS, |_, _| !is_cancelled())
+        let speech = get_speech_chunks(&samples, VAD_REDEMPTION_TIME_MS)
             .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
         Ok(split_long_segments(&speech))
     })
@@ -148,12 +147,9 @@ async fn run(pool: &SqlitePool, meeting_id: &str, folder: &Path) -> Result<usize
     store(pool, meeting_id, words).await
 }
 
-/// Stops the pass when a retranscription cancel was asked for, or when a new
-/// recording started and needs the CPU for its live transcript.
+/// Stops the pass when a new recording started and needs the CPU for its
+/// live transcript. The user's retranscription cancel flag is not shared.
 async fn stop_if_needed() -> Result<()> {
-    if is_cancelled() {
-        return Err(anyhow!("cancelled"));
-    }
     if super::recording_commands::is_recording().await {
         return Err(anyhow!("a new recording started"));
     }

@@ -22,12 +22,9 @@ static RETRANSCRIPTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Global flag to signal cancellation
 static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
 
-/// Set while the stop pass holds the guard, so a retranscription the user
-/// asks for can cancel it instead of being refused.
+/// Set while the stop pass holds the guard, to tell the user why a
+/// retranscription is refused.
 static STOP_PASS_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// How long a retranscription waits for a cancelled stop pass to let go.
-const STOP_PASS_GIVE_WAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// RAII guard for RETRANSCRIPTION_IN_PROGRESS flag
 /// Ensures flag is cleared even if retranscription panics or returns early.
@@ -48,7 +45,7 @@ impl RetranscriptionGuard {
         Ok(RetranscriptionGuard { stop_pass: false })
     }
 
-    /// The guard for the stop pass, which gives way to a retranscription.
+    /// The guard for the stop pass.
     pub(crate) fn acquire_for_stop_pass() -> Result<Self, String> {
         let mut guard = Self::acquire()?;
         guard.stop_pass = true;
@@ -63,19 +60,6 @@ impl Drop for RetranscriptionGuard {
             STOP_PASS_RUNNING.store(false, Ordering::SeqCst);
         }
         RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
-    }
-}
-
-/// Cancels a running stop pass and waits for it to release the guard.
-async fn stop_pass_give_way() {
-    if !STOP_PASS_RUNNING.load(Ordering::SeqCst) {
-        return;
-    }
-    info!("Cancelling the stop pass for a retranscription");
-    RETRANSCRIPTION_CANCELLED.store(true, Ordering::SeqCst);
-    let started = std::time::Instant::now();
-    while RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) && started.elapsed() < STOP_PASS_GIVE_WAY_TIMEOUT {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -121,15 +105,6 @@ pub fn cancel_retranscription() {
     RETRANSCRIPTION_CANCELLED.store(true, Ordering::SeqCst);
 }
 
-/// Clears a cancel left from an earlier run; call right after acquiring the guard.
-pub(crate) fn reset_cancellation() {
-    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
-}
-
-pub(crate) fn is_cancelled() -> bool {
-    RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
-}
-
 /// Longest stretch handed to the engine at once: 25 seconds at 16 kHz.
 const MAX_SEGMENT_SAMPLES: usize = 25 * 16000;
 
@@ -167,18 +142,11 @@ pub async fn start_retranscription<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
-    stop_pass_give_way().await;
     // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = RetranscriptionGuard::acquire().map_err(|e| {
-        if STOP_PASS_RUNNING.load(Ordering::SeqCst) {
-            anyhow!("Improving the transcript, try again in a minute")
-        } else {
-            anyhow!(e)
-        }
-    })?;
+    let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
 
     // Reset cancellation flag
-    reset_cancellation();
+    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
@@ -952,9 +920,11 @@ pub async fn start_retranscription_command<R: Runtime>(
     provider: Option<String>,
 ) -> Result<RetranscriptionStarted, String> {
 
-    // Check if retranscription is already in progress (guard will be acquired in start_retranscription).
-    // A running stop pass is cancelled there instead.
-    if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) && !STOP_PASS_RUNNING.load(Ordering::SeqCst) {
+    // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
+    if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
+        if STOP_PASS_RUNNING.load(Ordering::SeqCst) {
+            return Err("Improving the transcript, try again in a minute".to_string());
+        }
         return Err("Retranscription already in progress".to_string());
     }
 
