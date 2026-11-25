@@ -339,10 +339,13 @@ impl LiveDiarization {
                 None => Vec::new(),
             };
             log::info!("Loaded {} voice profiles", profiles.len());
-            let own_profile = own_profile_path.as_deref().and_then(super::voiceprints::read_own_voice_profile);
-            log::info!("Own voice profile {}", if own_profile.is_some() { "loaded" } else { "not saved yet" });
             match tokio::task::spawn_blocking(move || DiarizationSession::new(&path, profiles)).await {
                 Ok(Ok(mut session)) => {
+                    // Read under the profile lock as the session goes live, so
+                    // a "Forget my voice" during the model load is not undone.
+                    let _profile = super::voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    let own_profile = own_profile_path.as_deref().and_then(super::voiceprints::read_own_voice_profile);
+                    log::info!("Own voice profile {}", if own_profile.is_some() { "loaded" } else { "not saved yet" });
                     session.set_own_profile(own_profile);
                     *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
                     log::info!("Speaker diarization ready");
