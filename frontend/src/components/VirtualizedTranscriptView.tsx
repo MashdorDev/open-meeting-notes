@@ -235,9 +235,11 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     const loadMoreTriggerRef = useRef<HTMLDivElement>(null);
 
     // "Speaker N" only tells voices apart; with a single voice the found or
-    // typed name for the other side reads better.
+    // typed name for the other side reads better. Mic lines can carry a
+    // label while recording (the user heard on the call side) and are not
+    // another voice.
     const multipleVoices = useMemo(
-        () => new Set(segments.map(s => s.speakerLabel).filter(Boolean)).size > 1,
+        () => new Set(segments.filter(s => s.speaker === 'system').map(s => s.speakerLabel).filter(Boolean)).size > 1,
         [segments],
     );
 

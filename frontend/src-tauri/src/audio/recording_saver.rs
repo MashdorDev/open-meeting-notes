@@ -33,6 +33,24 @@ pub struct TranscriptSegment {
     pub words: Vec<crate::audio::transcription::words::TranscriptWord>,
 }
 
+/// The final say on one line's side. A call-side voice that was the user
+/// moves to the mic side without its label. A line marked as the user while
+/// recording keeps its label, so when that voice was not the user after all
+/// it goes back to the call side. Returns whether the line changed.
+pub fn settle_own_voice(speaker: &mut Option<String>, label: &mut Option<String>, own_voice: &[String]) -> bool {
+    let Some(voice) = label.as_ref() else { return false };
+    if own_voice.contains(voice) {
+        *speaker = Some("mic".to_string());
+        *label = None;
+        true
+    } else if speaker.as_deref() == Some("mic") {
+        *speaker = Some("system".to_string());
+        true
+    } else {
+        false
+    }
+}
+
 /// Meeting metadata structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingMetadata {
@@ -142,6 +160,22 @@ impl RecordingSaver {
         if let Some(folder) = &self.meeting_folder {
             if self.write_transcripts_json(folder).is_err() {
                 warn!("Failed to write transcripts after folding speakers");
+            }
+        }
+    }
+
+    /// Settles which call-side voices were the user (see
+    /// `settle_own_voice`) and rewrites transcripts.json when lines moved.
+    pub fn apply_own_voice(&self, labels: &[String]) {
+        let mut changed = false;
+        if let Ok(mut segments) = self.transcript_segments.lock() {
+            for segment in segments.iter_mut() {
+                changed |= settle_own_voice(&mut segment.speaker, &mut segment.speaker_label, labels);
+            }
+        }
+        if let (true, Some(folder)) = (changed, &self.meeting_folder) {
+            if self.write_transcripts_json(folder).is_err() {
+                warn!("Failed to write transcripts after moving the user's voice");
             }
         }
     }
@@ -508,5 +542,35 @@ impl RecordingSaver {
 impl Default for RecordingSaver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod own_voice_tests {
+    use super::settle_own_voice;
+
+    fn settle(speaker: &str, label: Option<&str>, own: &[&str]) -> (Option<String>, Option<String>, bool) {
+        let mut speaker = Some(speaker.to_string());
+        let mut label = label.map(str::to_string);
+        let own: Vec<String> = own.iter().map(|l| l.to_string()).collect();
+        let changed = settle_own_voice(&mut speaker, &mut label, &own);
+        (speaker, label, changed)
+    }
+
+    #[test]
+    fn the_users_voice_moves_to_the_mic_side() {
+        assert_eq!(settle("system", Some("Speaker 1"), &["Speaker 1"]), (Some("mic".into()), None, true));
+        assert_eq!(settle("mic", Some("Speaker 1"), &["Speaker 1"]), (Some("mic".into()), None, true));
+    }
+
+    #[test]
+    fn a_live_guess_that_did_not_hold_goes_back() {
+        assert_eq!(settle("mic", Some("Speaker 3"), &["Speaker 1"]), (Some("system".into()), Some("Speaker 3".into()), true));
+    }
+
+    #[test]
+    fn other_lines_stay() {
+        assert_eq!(settle("system", Some("Speaker 2"), &["Speaker 1"]), (Some("system".into()), Some("Speaker 2".into()), false));
+        assert_eq!(settle("mic", None, &["Speaker 1"]), (Some("mic".into()), None, false));
     }
 }

@@ -133,7 +133,7 @@ fn finalize_recording_start() {
 
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
-static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<Vec<crate::diarization::Voiceprint>>>> = Mutex::new(None);
+static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<crate::diarization::FinishedSpeakers>>> = Mutex::new(None);
 
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
 static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
@@ -970,6 +970,7 @@ async fn stop_recording_for_session<R: Runtime>(
     };
 
     let mut voiceprints = Vec::new();
+    let mut own_voice = Vec::new();
     if let Some(task_handle) = transcription_task {
         info!("⏳ Waiting for ALL transcription chunks to be processed (no timeout - preserving every chunk)");
 
@@ -1003,7 +1004,8 @@ async fn stop_recording_for_session<R: Runtime>(
         ).await {
             Ok(Ok(speakers)) => {
                 info!("✅ ALL transcription chunks processed successfully - no data lost");
-                voiceprints = speakers;
+                voiceprints = speakers.voices;
+                own_voice = speakers.own_voice;
             }
             Ok(Err(e)) => {
                 warn!("⚠️ Transcription task completed with error: {:?}", e);
@@ -1233,6 +1235,9 @@ async fn stop_recording_for_session<R: Runtime>(
         let (kept, folds) = crate::diarization::voiceprints::fold_single_line_voices(std::mem::take(&mut voiceprints));
         voiceprints = kept;
         manager.apply_speaker_folds(&folds);
+        // After the folds: a one-line voice may have folded into the user's.
+        voiceprints.retain(|voice| !own_voice.contains(&voice.label));
+        manager.apply_own_voice(&own_voice);
 
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
@@ -1251,16 +1256,23 @@ async fn stop_recording_for_session<R: Runtime>(
             }
         }
 
+        if let (Some(folder), false) = (&meeting_folder, own_voice.is_empty()) {
+            match crate::diarization::voiceprints::write_own_voice(folder, &own_voice) {
+                Ok(()) => info!("Moved {} call-side voices that were the user to the mic side", own_voice.len()),
+                Err(e) => warn!("Failed to save the user's call-side voices: {}", e),
+            }
+        }
         if let (Some(folder), false) = (&meeting_folder, voiceprints.is_empty()) {
             match crate::diarization::voiceprints::write_voiceprints(folder, &voiceprints) {
                 Ok(()) => info!("Saved {} speaker voiceprints with the meeting", voiceprints.len()),
                 Err(e) => warn!("Failed to save speaker voiceprints: {}", e),
             }
-            if !folds.is_empty() {
-                match crate::diarization::voiceprints::write_folds(folder, &folds) {
-                    Ok(()) => info!("Folded {} one-line voices into the others", folds.len()),
-                    Err(e) => warn!("Failed to save speaker folds: {}", e),
-                }
+        }
+        // Even when no voice was kept: the folds may point at the user's.
+        if let (Some(folder), false) = (&meeting_folder, folds.is_empty()) {
+            match crate::diarization::voiceprints::write_folds(folder, &folds) {
+                Ok(()) => info!("Folded {} one-line voices into the others", folds.len()),
+                Err(e) => warn!("Failed to save speaker folds: {}", e),
             }
         }
 

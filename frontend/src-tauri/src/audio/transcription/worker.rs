@@ -214,7 +214,7 @@ fn split_at_samples(chunk: AudioChunk, cuts: &[usize]) -> Vec<AudioChunk> {
 pub fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
     transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
-) -> tokio::task::JoinHandle<Vec<crate::diarization::Voiceprint>> {
+) -> tokio::task::JoinHandle<crate::diarization::FinishedSpeakers> {
     tokio::spawn(async move {
         info!("Starting transcription worker task");
 
@@ -241,7 +241,7 @@ pub fn start_transcription_task<R: Runtime>(
                         error!("Failed to stop recording after transcription init failure: {}", e);
                     }
                 });
-                return Vec::new();
+                return crate::diarization::FinishedSpeakers::default();
             }
         };
 
@@ -325,6 +325,12 @@ pub fn start_transcription_task<R: Runtime>(
                         RecordingDeviceType::System => Some(chunk.data.clone()),
                         RecordingDeviceType::Microphone => None,
                     };
+                    // Mic speech teaches diarization the user's own voice, to
+                    // catch it when another mic on the call sends it back.
+                    let mic_audio = match chunk_device_type {
+                        RecordingDeviceType::Microphone if chunk.sample_rate == DIARIZATION_SAMPLE_RATE => Some(chunk.data.clone()),
+                        _ => None,
+                    };
                     let processing_started = Instant::now();
 
                     if !engine_clone.is_model_loaded().await {
@@ -364,6 +370,13 @@ pub fn start_transcription_task<R: Runtime>(
                                         Some(samples) => diarization.label(samples).await,
                                         None => None,
                                     };
+                                    if let Some(samples) = mic_audio {
+                                        diarization.learn_own_voice(samples).await;
+                                    }
+                                    // The line keeps its voice label, so the check
+                                    // at stop can move it back if that voice turns
+                                    // out not to be the user.
+                                    let own_voice = speaker_label.as_deref().is_some_and(|l| diarization.is_own_voice(l));
                                     if speaker_label.is_some() {
                                         let guesses = diarization.guesses();
                                         if guesses != sent_guesses {
@@ -376,6 +389,7 @@ pub fn start_transcription_task<R: Runtime>(
                                         timestamp: format_current_timestamp(),
                                         source: match chunk_device_type {
                                             RecordingDeviceType::Microphone => "mic",
+                                            RecordingDeviceType::System if own_voice => "mic",
                                             RecordingDeviceType::System => "system",
                                         }
                                         .to_string(),

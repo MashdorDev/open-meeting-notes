@@ -408,6 +408,10 @@ impl RecordingManager {
         self.recording_saver.apply_speaker_folds(folds);
     }
 
+    pub fn apply_own_voice(&self, labels: &[String]) {
+        self.recording_saver.apply_own_voice(labels);
+    }
+
     /// Save recording after transcription is complete
     pub async fn save_recording_only<R: tauri::Runtime>(&mut self, app: &tauri::AppHandle<R>) -> Result<()> {
         debug!("Saving recording with transcript chunks");

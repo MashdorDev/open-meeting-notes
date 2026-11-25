@@ -27,6 +27,18 @@ const CHANGE_HOP_SAMPLES: usize = 12_000;
 /// Lower than the clustering threshold: a 1.5 s window of the same voice
 /// scatters more than a whole segment does.
 const CHANGE_SIMILARITY_THRESHOLD: f32 = 0.4;
+/// Mic lines shorter than this (1.5 s) do not teach the user's own voice.
+const MIN_SAMPLES_FOR_OWN_VOICE: usize = 24_000;
+/// How close a voice on the call side must sound to the user's mic to be
+/// the user coming back through someone else's mic in the same room. On a
+/// 3-person call the user's voice there scored 0.97 against the mic, the
+/// other two 0.52 and 0.26. Compared per voice, not per line: single lines
+/// scatter too much (at any threshold, many of another person's lines
+/// passed).
+const OWN_VOICE_SIMILARITY: f32 = 0.75;
+/// Mic lines, and lines of the voice, needed before comparing the two.
+const MIN_LINES_FOR_OWN_VOICE: usize = 3;
+
 /// `change_windows` needs four windows to find a change.
 const MIN_SAMPLES_FOR_CHANGES: usize = CHANGE_WINDOW_SAMPLES + 3 * CHANGE_HOP_SAMPLES;
 
@@ -38,6 +50,17 @@ pub struct DiarizationSession {
     /// Lines given each label, including those after Stop while the queue
     /// drains, which the recording saver no longer receives.
     lines: HashMap<String, usize>,
+    /// Voices on the user's mic. Someone in the room can be heard there
+    /// too, so the user is the voice with the most mic lines.
+    mic_voices: SpeakerClusterer,
+}
+
+/// The voices of one recording at its end.
+#[derive(Debug, Default)]
+pub struct FinishedSpeakers {
+    pub voices: Vec<Voiceprint>,
+    /// Labels of voices on the call side that are the user's own voice.
+    pub own_voice: Vec<String>,
 }
 
 impl DiarizationSession {
@@ -47,7 +70,43 @@ impl DiarizationSession {
             clusterer: SpeakerClusterer::new(),
             profiles,
             lines: HashMap::new(),
+            mic_voices: SpeakerClusterer::new(),
         })
+    }
+
+    /// Learns the user's voice from a 16kHz mic line.
+    pub fn learn_own_voice(&mut self, mic_16k: &[f32]) {
+        if mic_16k.len() < MIN_SAMPLES_FOR_OWN_VOICE {
+            return;
+        }
+        match self.extractor.compute(mic_16k) {
+            Ok(embedding) => {
+                self.mic_voices.assign(&embedding);
+            }
+            Err(e) => log::warn!("Could not learn the user's voice from a mic line: {}", e),
+        }
+    }
+
+    /// Voices on the call side that sound like the user's mic: the user
+    /// heard through another mic on the call.
+    pub fn own_voice_labels(&self) -> Vec<String> {
+        let Some(own) = self
+            .mic_voices
+            .voiceprints()
+            .into_iter()
+            .max_by_key(|voice| voice.segments)
+            .filter(|voice| voice.segments >= MIN_LINES_FOR_OWN_VOICE)
+            .map(|voice| voice.embedding)
+        else {
+            return Vec::new();
+        };
+        self.clusterer
+            .voiceprints()
+            .into_iter()
+            .filter(|voice| self.lines.get(&voice.label).copied().unwrap_or(0) >= MIN_LINES_FOR_OWN_VOICE)
+            .filter(|voice| cosine_similarity(&voice.embedding, &own) >= OWN_VOICE_SIMILARITY)
+            .map(|voice| voice.label)
+            .collect()
     }
 
     /// Assign a speaker label to a 16kHz mono speech segment. A segment too
@@ -278,6 +337,27 @@ impl LiveDiarization {
         .flatten()
     }
 
+    /// Learns the user's voice from a 16kHz mic line; nothing while the
+    /// model is not ready.
+    pub async fn learn_own_voice(&self, mic_16k: Vec<f32>) {
+        let slot = self.session.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(session) = slot.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                session.learn_own_voice(&mic_16k);
+            }
+        })
+        .await;
+    }
+
+    /// Whether a call-side label is the user's own voice.
+    pub fn is_own_voice(&self, label: &str) -> bool {
+        self.session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|session| session.own_voice_labels().iter().any(|l| l == label))
+    }
+
     /// Each speaker heard so far; empty when the model never loaded.
     pub fn voiceprints(&self) -> Vec<Voiceprint> {
         self.session
@@ -291,13 +371,20 @@ impl LiveDiarization {
     /// Each voice heard, then lets the recording's session go: the speaker
     /// model and the voices stay out of memory until the next recording,
     /// unless that one has already started.
-    pub fn finish(&self) -> Vec<Voiceprint> {
+    pub fn finish(&self) -> FinishedSpeakers {
         let voices = self.voiceprints();
+        let own_voice = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|session| session.own_voice_labels())
+            .unwrap_or_default();
         let mut current = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
         if current.as_ref().is_some_and(|c| std::sync::Arc::ptr_eq(&c.session, &self.session)) {
             *current = None;
         }
-        voices
+        FinishedSpeakers { voices, own_voice }
     }
 
     /// The guessed name of each voice that has one, by label.
@@ -335,6 +422,9 @@ mod tests {
     /// [[start_s, end_s], ...] in the order the app labeled them;
     /// OMN_REPLAY_OUT: where the labels go; OMN_EMBED_MODEL: the CAM++ file;
     /// OMN_MAX_SPEAKERS and OMN_THRESHOLD override the clustering settings.
+    /// OMN_REPLAY_SOURCES: optional JSON ["mic"|"system", ...] per segment;
+    /// mic segments teach the user's voice, and system segments in it come
+    /// out as "Me". The voices found to be the user at the end are printed.
     #[test]
     #[ignore]
     fn replay_meeting() {
@@ -346,14 +436,27 @@ mod tests {
         let threshold = std::env::var("OMN_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(CLUSTER_SIMILARITY_THRESHOLD);
         let mut session = DiarizationSession::new(Path::new(&var("OMN_EMBED_MODEL")), Vec::new()).unwrap();
         session.clusterer = SpeakerClusterer::with_settings(max, threshold);
+        let sources: Option<Vec<String>> = std::env::var("OMN_REPLAY_SOURCES")
+            .ok()
+            .map(|path| serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap());
         let labels: Vec<Option<String>> = segments
             .iter()
-            .map(|&(start, end)| {
+            .enumerate()
+            .map(|(i, &(start, end))| {
                 let a = ((start * 16_000.0) as usize).min(pcm.len());
                 let b = ((end * 16_000.0) as usize).min(pcm.len());
-                session.label_segment(&pcm[a..b])
+                if sources.as_ref().is_some_and(|s| s[i] == "mic") {
+                    session.learn_own_voice(&pcm[a..b]);
+                    return None;
+                }
+                let label = session.label_segment(&pcm[a..b]);
+                match label {
+                    Some(l) if sources.is_some() && session.own_voice_labels().contains(&l) => Some("Me".to_string()),
+                    other => other,
+                }
             })
             .collect();
+        println!("own voice at the end: {:?}", session.own_voice_labels());
         std::fs::write(var("OMN_REPLAY_OUT"), serde_json::to_string(&labels).unwrap()).unwrap();
         if let Ok(path) = std::env::var("OMN_REPLAY_EMBEDDINGS") {
             let embeddings: Vec<Option<Vec<f32>>> = segments
