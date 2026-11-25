@@ -44,8 +44,8 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
         "open_window" => focus_main_window(app),
         "settings" => {
             focus_main_window(app);
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.eval("window.location.assign('/settings')");
+            if let Err(e) = app.emit_to("main", "open-settings", ()) {
+                log::error!("Tray: failed to emit open-settings: {}", e);
             }
         }
         "check_updates" => check_updates_handler(app),
