@@ -65,6 +65,53 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, pool: SqlitePool, meeting_id: String
     });
 }
 
+/// Whether the stop pass rewrote any line of the meeting, so its live
+/// version can be restored.
+#[tauri::command]
+pub async fn api_meeting_has_live_text(
+    meeting_id: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM transcripts WHERE meeting_id = ? AND live_text IS NOT NULL)",
+    )
+    .bind(&meeting_id)
+    .fetch_one(state.db_manager.pool())
+    .await
+    .map_err(|e| format!("Failed to read the transcript: {}", e))
+}
+
+/// Puts the live pass's text and word times back on every line the stop
+/// pass rewrote, in one statement, and returns how many lines changed.
+/// Refused while the stop pass or a retranscription runs. Emits
+/// `meeting-transcript-refined` so an open meeting page refreshes its lines.
+#[tauri::command]
+pub async fn api_restore_live_text<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<u64, String> {
+    let _guard = RetranscriptionGuard::acquire_for_restore()?;
+    let lines_updated = sqlx::query(
+        "UPDATE transcripts SET transcript = live_text, words = live_words,
+             live_text = NULL, live_words = NULL
+         WHERE meeting_id = ? AND live_text IS NOT NULL",
+    )
+    .bind(&meeting_id)
+    .execute(state.db_manager.pool())
+    .await
+    .map_err(|e| format!("Failed to restore the live text: {}", e))?
+    .rows_affected();
+    info!("Restored the live text of {lines_updated} lines for {meeting_id}");
+    if lines_updated > 0 {
+        let _ = app.emit(
+            "meeting-transcript-refined",
+            serde_json::json!({ "meeting_id": meeting_id, "lines_updated": lines_updated }),
+        );
+    }
+    Ok(lines_updated)
+}
+
 /// Whether the saved transcript provider is Parakeet, read the same way
 /// retranscription reads it.
 async fn uses_parakeet(pool: &SqlitePool) -> Result<bool> {
