@@ -53,52 +53,41 @@ pub fn parse_caption_texts(texts: &[(usize, String)]) -> Vec<(String, String)> {
 
 /// Turns repeated reads of the caption region into pieces of new text. A
 /// block keeps growing while its speaker talks, and the app may rewrite its
-/// last words, so only what follows the part already seen becomes a piece.
+/// words, so only what follows the part already seen becomes a piece.
 #[derive(Default)]
 pub struct CaptionLog {
-    /// The last text seen of each recent block, by speaker.
-    open: Vec<(String, String)>,
+    /// The blocks of the last read, in screen order.
+    shown: Vec<(String, String)>,
     pieces: Vec<CaptionPiece>,
 }
 
-/// How many recent blocks are remembered; Meet shows about two at a time.
-const OPEN_BLOCKS: usize = 8;
+/// How many words at the end of a block the app rewrites as it goes.
+const REVISED_UNITS: usize = 3;
 
 impl CaptionLog {
+    /// Takes what is on screen without logging it: text that was there
+    /// before the recording started was not said during it.
+    pub fn baseline(&mut self, blocks: &[(String, String)]) {
+        self.shown = blocks.to_vec();
+    }
+
     pub fn observe(&mut self, app: &str, time: f64, blocks: &[(String, String)]) {
-        for (speaker, text) in blocks {
-            let seen = self
-                .open
-                .iter()
-                .rposition(|(s, old)| s == speaker && same_block(old, text));
-            let new_part = match seen {
-                Some(i) => {
-                    let old = std::mem::replace(&mut self.open[i].1, text.clone());
-                    let common = common_prefix_chars(&old, text);
-                    // Back to the start of the word the two first differ in.
-                    let cut = text[..common].rfind(' ').map_or(0, |i| i + 1);
-                    if common == text.len() {
-                        String::new()
-                    } else {
-                        // Meet ends its draft with a period and drops it as
-                        // words come in ("now." then "now testing"), so the
-                        // last word seen comes back; keep it once.
-                        let mut new_part = text[cut..].split_whitespace().peekable();
-                        if new_part.peek().map(|w| bare_word(w)) == old.split_whitespace().last().map(bare_word) {
-                            new_part.next();
-                        }
-                        new_part.collect::<Vec<_>>().join(" ")
-                    }
-                }
-                None => {
-                    self.open.push((speaker.clone(), text.clone()));
-                    if self.open.len() > OPEN_BLOCKS {
-                        self.open.remove(0);
-                    }
-                    text.clone()
-                }
+        // Blocks scroll off the top and new ones come in at the bottom, so
+        // this read lines up with the end of the last one. Matching by place
+        // keeps two blocks that start the same way ("Yeah") apart.
+        let shift = (0..=self.shown.len())
+            .find(|&s| {
+                self.shown[s..]
+                    .iter()
+                    .zip(blocks)
+                    .all(|((s_old, old), (s_new, new))| s_old == s_new && same_block(old, new))
+            })
+            .unwrap_or(self.shown.len());
+        for (i, (speaker, text)) in blocks.iter().enumerate() {
+            let new_part = match self.shown.get(shift + i) {
+                Some((_, old)) => new_text(old, text),
+                None => text.trim(),
             };
-            let new_part = new_part.trim();
             if !new_part.is_empty() {
                 self.pieces.push(CaptionPiece {
                     speaker: speaker.clone(),
@@ -108,6 +97,7 @@ impl CaptionLog {
                 });
             }
         }
+        self.shown = blocks.to_vec();
     }
 
     pub fn into_pieces(self) -> Vec<CaptionPiece> {
@@ -115,25 +105,80 @@ impl CaptionLog {
     }
 }
 
-fn bare_word(word: &str) -> String {
-    word.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+/// The text split into the units it is compared by, each with where it
+/// starts: words, or single characters in scripts written without spaces.
+/// Units are compared without punctuation or case, which the app changes as
+/// it revises ("there" becomes "There,", "now." loses its period).
+fn units(text: &str) -> Vec<(usize, String)> {
+    let mut units: Vec<(usize, String)> = Vec::new();
+    let mut word: Option<(usize, String)> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() || unspaced(c) {
+            units.extend(word.take());
+            if unspaced(c) {
+                units.push((i, c.to_string()));
+            }
+        } else {
+            let (_, w) = word.get_or_insert((i, String::new()));
+            w.extend(c.to_lowercase().filter(|c| c.is_alphanumeric()));
+        }
+    }
+    units.extend(word);
+    units.retain(|(_, u)| !u.is_empty());
+    units
+}
+
+/// Chinese, Japanese, Thai, Lao, Khmer and Myanmar put no spaces between words.
+fn unspaced(c: char) -> bool {
+    matches!(c as u32,
+        0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF
+        | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+}
+
+/// Length of the longest sequence of units both have, in order, by prefix
+/// of `b`: `ends[j]` covers `b[..j]`.
+fn common_units(a: &[(usize, String)], b: &[(usize, String)]) -> Vec<usize> {
+    let mut row = vec![0; b.len() + 1];
+    for (_, x) in a {
+        let mut prev = vec![0; b.len() + 1];
+        std::mem::swap(&mut row, &mut prev);
+        for (j, (_, y)) in b.iter().enumerate() {
+            row[j + 1] = if x == y { prev[j] + 1 } else { prev[j + 1].max(row[j]) };
+        }
+    }
+    row
 }
 
 /// Whether a block read now is the same one read before: it starts the way
-/// the earlier one did (the app only rewrites the last few words).
+/// the earlier one did, or, once the app has trimmed or rewritten its start,
+/// at least half of the shorter one is in the other.
 fn same_block(old: &str, new: &str) -> bool {
-    let n = old.split_whitespace().count().min(new.split_whitespace().count()).min(3);
-    // Punctuation and case come and go as the app revises ("there" becomes "There,").
-    let start = |s: &str| s.split_whitespace().take(n).map(bare_word).collect::<Vec<_>>();
-    n > 0 && start(old) == start(new)
+    let (old, new) = (units(old), units(new));
+    let n = old.len().min(new.len());
+    if n == 0 {
+        return false;
+    }
+    let k = n.min(REVISED_UNITS);
+    old[..k].iter().map(|(_, u)| u).eq(new[..k].iter().map(|(_, u)| u))
+        || common_units(&old, &new)[new.len()] * 2 >= n.max(2)
 }
 
-/// Bytes the two strings share at the start, on a character boundary.
-fn common_prefix_chars(a: &str, b: &str) -> usize {
-    a.char_indices()
-        .zip(b.chars())
-        .find(|((_, x), y)| x != y)
-        .map_or(a.len().min(b.len()), |((i, _), _)| i)
+/// What `new` adds to `old`. The app rewrites the last few words while it
+/// listens, so after the common start the rewritten words come back; an
+/// edit further back (or a start the app trimmed) gives only the tail that
+/// follows everything already seen.
+fn new_text<'a>(old: &str, new: &'a str) -> &'a str {
+    let (old, new_units) = (units(old), units(new));
+    let same = old.iter().zip(&new_units).take_while(|((_, a), (_, b))| a == b).count();
+    let from = if old.len() - same <= REVISED_UNITS {
+        same
+    } else {
+        let ends = common_units(&old, &new_units);
+        let longest = ends[new_units.len()];
+        // The earliest point by which everything shared has been seen.
+        ends.iter().position(|&n| n == longest).unwrap_or(new_units.len())
+    };
+    new_units.get(from).map_or("", |(start, _)| new[*start..].trim())
 }
 
 pub fn write_captions(folder: &Path, pieces: &[CaptionPiece]) -> std::io::Result<()> {
@@ -224,6 +269,34 @@ mod tests {
                 ("You".into(), 4.0, "is it".into()),
                 ("You".into(), 4.8, "going".into()),
                 ("Ben".into(), 5.0, "Fine thanks".into()),
+            ]
+        );
+
+        let mut log = CaptionLog::default();
+        let blocks = |items: &[(&str, &str)]| items.iter().map(|(s, t)| (s.to_string(), t.to_string())).collect::<Vec<_>>();
+        // On screen before the recording: not said during it.
+        log.baseline(&blocks(&[("You", "Before we start")]));
+        log.observe("meet", 1.0, &blocks(&[("You", "Before we start"), ("Ben", "Yeah")]));
+        // A second short block that starts the same way is its own block.
+        log.observe("meet", 2.0, &blocks(&[("You", "Before we start"), ("Ben", "Yeah"), ("You", "I"), ("Ben", "Yeah")]));
+        // An edit early in a block gives only the new tail.
+        log.observe("meet", 3.0, &blocks(&[("Ben", "Yeah"), ("You", "I"), ("Ben", "Yeah so the plan is fine")]));
+        log.observe("meet", 3.5, &blocks(&[("Ben", "Yeah"), ("You", "I"), ("Ben", "Yeah, so that plan is fine today")]));
+        // No spaces between words.
+        log.observe("meet", 4.0, &blocks(&[("Ken", "今日は")]));
+        log.observe("meet", 5.0, &blocks(&[("Ken", "今日はいい天気")]));
+        let pieces: Vec<(String, f64, String)> =
+            log.into_pieces().into_iter().map(|p| (p.speaker, p.time, p.text)).collect();
+        assert_eq!(
+            pieces,
+            vec![
+                ("Ben".into(), 1.0, "Yeah".into()),
+                ("You".into(), 2.0, "I".into()),
+                ("Ben".into(), 2.0, "Yeah".into()),
+                ("Ben".into(), 3.0, "so the plan is fine".into()),
+                ("Ben".into(), 3.5, "today".into()),
+                ("Ken".into(), 4.0, "今日は".into()),
+                ("Ken".into(), 5.0, "いい天気".into()),
             ]
         );
     }
