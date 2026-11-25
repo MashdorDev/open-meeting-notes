@@ -863,6 +863,8 @@ pub fn run() {
             api::get_meeting_audio_path,
             api::name_meeting_speaker,
             api::mark_speaker_as_me,
+            api::own_voice_status,
+            api::forget_own_voice,
             api::set_transcript_speaker_name,
             api::get_meeting_speaker_guesses,
             api::dismiss_speaker_guess,
