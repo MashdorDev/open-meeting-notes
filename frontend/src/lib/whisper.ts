@@ -145,8 +145,18 @@ export const MODEL_CONFIGS: Record<string, Partial<ModelInfo>> = {
   }
 };
 
-/** Models tuned for one language, shown in their own group. */
-export const LANGUAGE_MODEL_NAMES = ['he-large-v3-turbo', 'yi-large-v3-turbo'];
+/** Models tuned for one language, by language code. Shown in their own group. */
+export const LANGUAGE_MODELS: Record<string, { model: string; label: string }> = {
+  he: { model: 'he-large-v3-turbo', label: 'Hebrew (ivrit.ai)' },
+  yi: { model: 'yi-large-v3-turbo', label: 'Yiddish (ivrit.ai)' },
+};
+export const LANGUAGE_MODEL_NAMES = Object.values(LANGUAGE_MODELS).map((m) => m.model);
+
+/** Languages Parakeet TDT 0.6B v3 transcribes (NVIDIA's model card). */
+export const PARAKEET_LANGUAGES = [
+  'bg', 'hr', 'cs', 'da', 'nl', 'en', 'et', 'fi', 'fr', 'de', 'el', 'hu', 'it',
+  'lv', 'lt', 'mt', 'pl', 'pt', 'ro', 'sk', 'sl', 'es', 'sv', 'ru', 'uk',
+];
 
 // Helper functions
 export function getModelIcon(accuracy: ModelAccuracy): string {
