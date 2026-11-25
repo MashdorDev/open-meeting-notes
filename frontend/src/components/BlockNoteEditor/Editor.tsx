@@ -6,6 +6,7 @@ import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/shadcn";
 import "@blocknote/shadcn/style.css";
 import "@blocknote/core/fonts/inter.css";
+import { useResolvedTheme } from "@/lib/theme";
 
 interface EditorProps {
   initialContent?: Block[];
@@ -47,5 +48,6 @@ export default function Editor({ initialContent, onChange, editable = true }: Ed
     };
   }, [editor, onChange]);
 
-  return <BlockNoteView editor={editor} editable={editable} theme="light" />;
+  const theme = useResolvedTheme();
+  return <BlockNoteView editor={editor} editable={editable} theme={theme} />;
 }
