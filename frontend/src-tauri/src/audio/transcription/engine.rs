@@ -417,6 +417,8 @@ pub async fn get_or_init_whisper<R: Runtime>(
             let available_models: Vec<_> = models
                 .iter()
                 .filter(|m| matches!(m.status, crate::whisper_engine::ModelStatus::Available))
+                // A language-tuned model is used only when it is the chosen one.
+                .filter(|m| crate::config::whisper_model_language(&m.name).is_none())
                 .collect();
 
             if let Some(fallback_model) = available_models.first() {

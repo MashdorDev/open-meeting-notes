@@ -33,4 +33,40 @@ pub const WHISPER_MODEL_CATALOG: &[(&str, &str, u32, &str, &str, &str)] = &[
     ("medium-q5_0", "ggml-medium-q5_0.bin", 514, "High", "Medium", "Quantized medium model, professional quality"),
     ("large-v3-turbo-q5_0", "ggml-large-v3-turbo-q5_0.bin", 547, "High", "Medium", "Quantized large model, best balance"),
     ("large-v3-q5_0", "ggml-large-v3-q5_0.bin", 1031, "High", "Slow", "Quantized large model, high accuracy"),
+
+    // Language-tuned models (ivrit.ai, Apache-2.0). Each one always transcribes in
+    // its own language; see whisper_model_language.
+    ("he-large-v3-turbo", "ggml-he-large-v3-turbo.bin", 1545, "High", "Medium", "Hebrew. Large V3 Turbo tuned on Hebrew speech by ivrit.ai"),
+    ("yi-large-v3-turbo", "ggml-yi-large-v3-turbo.bin", 1545, "High", "Medium", "Yiddish. Large V3 Turbo tuned on Yiddish speech by ivrit.ai"),
 ];
+
+/// The language a language-tuned Whisper model must run in, or None for the
+/// multilingual models. ivrit.ai's models lose most of their language detection
+/// in tuning, so their language is set explicitly instead of auto-detected.
+pub fn whisper_model_language(model_name: &str) -> Option<&'static str> {
+    match model_name {
+        "he-large-v3-turbo" => Some("he"),
+        "yi-large-v3-turbo" => Some("yi"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_tuned_models_force_their_language() {
+        assert_eq!(whisper_model_language("he-large-v3-turbo"), Some("he"));
+        assert_eq!(whisper_model_language("yi-large-v3-turbo"), Some("yi"));
+        assert_eq!(whisper_model_language("large-v3-turbo"), None);
+    }
+
+    #[test]
+    fn every_language_tuned_model_is_in_the_catalog() {
+        for name in ["he-large-v3-turbo", "yi-large-v3-turbo"] {
+            let entry = WHISPER_MODEL_CATALOG.iter().find(|m| m.0 == name);
+            assert_eq!(entry.map(|m| m.1), Some(format!("ggml-{}.bin", name).as_str()));
+        }
+    }
+}

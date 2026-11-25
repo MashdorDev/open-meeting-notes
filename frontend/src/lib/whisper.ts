@@ -128,8 +128,25 @@ export const MODEL_CONFIGS: Record<string, Partial<ModelInfo>> = {
     size_mb: 1031,
     accuracy: 'High',
     speed: 'Slow'
+  },
+
+  // Language-tuned models (ivrit.ai). Each always transcribes in its own language.
+  'he-large-v3-turbo': {
+    description: 'Hebrew. Large V3 Turbo tuned on Hebrew speech by ivrit.ai.',
+    size_mb: 1545,
+    accuracy: 'High',
+    speed: 'Medium'
+  },
+  'yi-large-v3-turbo': {
+    description: 'Yiddish. Large V3 Turbo tuned on Yiddish speech by ivrit.ai.',
+    size_mb: 1545,
+    accuracy: 'High',
+    speed: 'Medium'
   }
 };
+
+/** Models tuned for one language, shown in their own group. */
+export const LANGUAGE_MODEL_NAMES = ['he-large-v3-turbo', 'yi-large-v3-turbo'];
 
 // Helper functions
 export function getModelIcon(accuracy: ModelAccuracy): string {
@@ -227,6 +244,10 @@ export function getModelTagline(modelName: string, speed: ProcessingSpeed, accur
     featureText = 'Balanced quality';
   } else if (baseName === 'tiny') {
     featureText = 'Fastest option';
+  } else if (baseName === 'he-large-v3-turbo') {
+    featureText = 'Tuned for Hebrew';
+  } else if (baseName === 'yi-large-v3-turbo') {
+    featureText = 'Tuned for Yiddish';
   }
 
   // Add quantization note if applicable

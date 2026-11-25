@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { LANGUAGE_MODEL_NAMES } from '@/lib/whisper';
 
 export interface RawModelInfo {
   name: string;
@@ -96,9 +97,15 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
       if (configuredMatch) {
         // Use the configured model if available
         setSelectedModelKey(`${configuredMatch.provider}:${configuredMatch.name}`);
-      } else if (allModels.length > 0) {
-        // Fall back to first available model
-        setSelectedModelKey(`${allModels[0].provider}:${allModels[0].name}`);
+      } else {
+        // Fall back to the first available model, but never to a language-tuned
+        // one: it would transcribe in its own language without being chosen.
+        const fallback = allModels.find(
+          (m) => !(m.provider === 'whisper' && LANGUAGE_MODEL_NAMES.includes(m.name))
+        );
+        if (fallback) {
+          setSelectedModelKey(`${fallback.provider}:${fallback.name}`);
+        }
       }
     }
 

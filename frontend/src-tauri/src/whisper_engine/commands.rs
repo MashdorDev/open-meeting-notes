@@ -263,8 +263,14 @@ pub async fn whisper_validate_model_ready() -> Result<String, String> {
             );
         }
 
-        // Try to load the first available model
-        let first_model = &available_models[0];
+        // Never fall back to a language-tuned model: it would transcribe every
+        // meeting in its own language without the user having chosen it.
+        let first_model = available_models
+            .iter()
+            .find(|m| crate::config::whisper_model_language(&m.name).is_none())
+            .ok_or_else(|| {
+                "Only language-tuned Whisper models are downloaded. Choose one in Settings > Transcription.".to_string()
+            })?;
         engine
             .load_model(&first_model.name)
             .await
@@ -350,6 +356,12 @@ pub async fn whisper_validate_model_ready_with_config<R: tauri::Runtime>(
             );
         }
 
+        // A language-tuned model is used only when it is the configured one.
+        let fallback = available_models
+            .iter()
+            .find(|m| crate::config::whisper_model_language(&m.name).is_none())
+            .map(|m| m.name.clone());
+
         // Try to load user's configured model if specified
         let model_name = if let Some(configured_model) = model_to_load {
             // Check if configured model is available
@@ -357,20 +369,22 @@ pub async fn whisper_validate_model_ready_with_config<R: tauri::Runtime>(
                 log::info!("Loading user's configured model: {}", configured_model);
                 configured_model
             } else {
+                let fallback = fallback.ok_or_else(|| {
+                    format!("Configured model '{}' not found. Choose a model in Settings > Transcription.", configured_model)
+                })?;
                 log::warn!(
-                    "Configured model '{}' not found, falling back to first available: {}",
+                    "Configured model '{}' not found, falling back to: {}",
                     configured_model,
-                    available_models[0].name
+                    fallback
                 );
-                available_models[0].name.clone()
+                fallback
             }
         } else {
-            // No configured model, use first available
-            log::info!(
-                "No configured model, loading first available: {}",
-                available_models[0].name
-            );
-            available_models[0].name.clone()
+            let fallback = fallback.ok_or_else(|| {
+                "No transcription model chosen. Choose one in Settings > Transcription.".to_string()
+            })?;
+            log::info!("No configured model, loading: {}", fallback);
+            fallback
         };
 
         engine
