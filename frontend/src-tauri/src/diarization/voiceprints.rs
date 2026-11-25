@@ -176,6 +176,102 @@ pub fn read_own_voice(folder: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The user's own voice, kept across meetings in the app data folder, so a
+/// colleague who talks more than the user on the user's mic is not taken
+/// for them.
+pub const OWN_VOICE_PROFILE_FILE: &str = "own-voice-profile.json";
+/// How close a mic voice must be to the saved profile to be the user. Dor's
+/// mic in one meeting scored 0.92 against his profile from another; the
+/// others on that call 0.35 and 0.05.
+const OWN_PROFILE_MATCH: f32 = PROFILE_MATCH_THRESHOLD;
+/// Without a profile, the mic's main voice is the user only when it has at
+/// least this many times the lines of the next voice on the mic.
+const OWN_VOICE_LEAD: usize = 2;
+/// Mic lines a voice needs before it is compared, and before a first
+/// profile is saved from it.
+const MIN_MIC_LINES: usize = 3;
+const MIN_LINES_FOR_FIRST_PROFILE: usize = 10;
+/// The profile stops weighting older meetings past this many lines, so it
+/// follows a new mic or room.
+const MAX_PROFILE_LINES: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnVoiceProfile {
+    pub embedding: Vec<f32>,
+    pub lines: usize,
+}
+
+/// The mic voice that is the user in this meeting: the one closest to the
+/// saved profile, or the profile itself when none is close; without a
+/// profile, the mic's main voice when it clearly leads.
+fn own_mic_voice<'a>(mic: &'a [Voiceprint], profile: Option<&OwnVoiceProfile>) -> Option<&'a Voiceprint> {
+    let heard: Vec<&Voiceprint> = mic.iter().filter(|v| v.segments >= MIN_MIC_LINES).collect();
+    match profile {
+        Some(profile) => heard
+            .into_iter()
+            .map(|v| (v, cosine_similarity(&v.embedding, &profile.embedding)))
+            .filter(|(_, score)| *score >= OWN_PROFILE_MATCH)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(v, _)| v),
+        None => {
+            let mut by_lines = heard;
+            by_lines.sort_by(|a, b| b.segments.cmp(&a.segments));
+            let main = *by_lines.first()?;
+            let next = by_lines.get(1).map_or(0, |v| v.segments);
+            (main.segments >= OWN_VOICE_LEAD * next).then_some(main)
+        }
+    }
+}
+
+/// What the user sounds like in this meeting, to compare call-side voices
+/// against; None until it is known.
+pub fn own_voice_anchor(mic: &[Voiceprint], profile: Option<&OwnVoiceProfile>) -> Option<Vec<f32>> {
+    match own_mic_voice(mic, profile) {
+        Some(voice) => Some(voice.embedding.clone()),
+        None => profile.map(|p| p.embedding.clone()),
+    }
+}
+
+/// The profile after this meeting: blended with the user's mic voice when
+/// it matched, or a first one when the mic's main voice clearly led on
+/// enough lines. None leaves the saved profile as it is.
+pub fn update_own_profile(mic: &[Voiceprint], profile: Option<&OwnVoiceProfile>) -> Option<OwnVoiceProfile> {
+    let voice = own_mic_voice(mic, profile)?;
+    match profile {
+        Some(profile) => {
+            let old = profile.lines.min(MAX_PROFILE_LINES) as f32;
+            let new = voice.segments as f32;
+            let mut embedding: Vec<f32> = profile
+                .embedding
+                .iter()
+                .zip(&voice.embedding)
+                .map(|(p, v)| p * old + v * new)
+                .collect();
+            let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm == 0.0 {
+                return None;
+            }
+            embedding.iter_mut().for_each(|x| *x /= norm);
+            Some(OwnVoiceProfile { embedding, lines: (profile.lines + voice.segments).min(MAX_PROFILE_LINES) })
+        }
+        None => (voice.segments >= MIN_LINES_FOR_FIRST_PROFILE)
+            .then(|| OwnVoiceProfile { embedding: voice.embedding.clone(), lines: voice.segments }),
+    }
+}
+
+pub fn read_own_voice_profile(path: &Path) -> Option<OwnVoiceProfile> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| log::warn!("Ignoring unreadable own voice profile: {}", e))
+        .ok()
+}
+
+pub fn write_own_voice_profile(path: &Path, profile: &OwnVoiceProfile) -> std::io::Result<()> {
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_vec(profile)?)?;
+    std::fs::rename(&temp, path)
+}
+
 /// Writes the voiceprints of one meeting. Through a temp file, so a crash
 /// mid-write leaves the old file or none, never half of one.
 pub fn write_voiceprints(folder: &Path, voiceprints: &[Voiceprint]) -> std::io::Result<()> {
@@ -304,5 +400,41 @@ mod tests {
         assert!(read_own_voice(dir.path()).is_empty());
         write_own_voice(dir.path(), &["Speaker 1".to_string()]).unwrap();
         assert_eq!(read_own_voice(dir.path()), vec!["Speaker 1".to_string()]);
+    }
+
+    fn mic_voice(label: &str, segments: usize, embedding: [f32; 2]) -> Voiceprint {
+        Voiceprint { label: label.into(), segments, embedding: embedding.to_vec(), name: None, dismissed: false, lines: segments }
+    }
+
+    #[test]
+    fn without_a_profile_the_main_mic_voice_must_clearly_lead() {
+        let user = mic_voice("Speaker 1", 12, [1.0, 0.0]);
+        let colleague = mic_voice("Speaker 2", 8, [0.0, 1.0]);
+        assert_eq!(own_voice_anchor(&[user.clone(), colleague.clone()], None), None);
+        let quiet = mic_voice("Speaker 2", 4, [0.0, 1.0]);
+        assert_eq!(own_voice_anchor(&[user.clone(), quiet.clone()], None), Some(vec![1.0, 0.0]));
+        let first = update_own_profile(&[user, quiet], None).unwrap();
+        assert_eq!((first.embedding, first.lines), (vec![1.0, 0.0], 12));
+    }
+
+    #[test]
+    fn a_profile_keeps_a_talkative_colleague_from_becoming_the_user() {
+        let profile = OwnVoiceProfile { embedding: vec![1.0, 0.0], lines: 50 };
+        let colleague = mic_voice("Speaker 1", 40, [0.0, 1.0]);
+        let user = mic_voice("Speaker 2", 5, [0.8, 0.6]);
+        assert_eq!(own_voice_anchor(&[colleague.clone(), user.clone()], Some(&profile)), Some(vec![0.8, 0.6]));
+        // Only the colleague on the mic: the saved profile is the anchor and stays as it was.
+        assert_eq!(own_voice_anchor(&[colleague.clone()], Some(&profile)), Some(vec![1.0, 0.0]));
+        assert_eq!(update_own_profile(&[colleague], Some(&profile)), None);
+    }
+
+    #[test]
+    fn a_matching_meeting_blends_into_the_profile() {
+        let profile = OwnVoiceProfile { embedding: vec![1.0, 0.0], lines: 10 };
+        let user = mic_voice("Speaker 1", 10, [0.8, 0.6]);
+        let updated = update_own_profile(&[user], Some(&profile)).unwrap();
+        assert_eq!(updated.lines, 20);
+        let norm = (1.8f32 * 1.8 + 0.6 * 0.6).sqrt();
+        assert!((updated.embedding[0] - 1.8 / norm).abs() < 1e-6);
     }
 }

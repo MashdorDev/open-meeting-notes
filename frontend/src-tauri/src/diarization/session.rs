@@ -5,7 +5,7 @@
 
 use super::clustering::{change_windows, cosine_similarity, SpeakerClusterer, CLUSTER_SIMILARITY_THRESHOLD};
 use super::embedding::{EmbeddingError, EmbeddingExtractor};
-use super::voiceprints::{guess_names, VoiceProfile, Voiceprint};
+use super::voiceprints::{guess_names, own_voice_anchor, update_own_profile, OwnVoiceProfile, VoiceProfile, Voiceprint};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -36,7 +36,7 @@ const MIN_SAMPLES_FOR_OWN_VOICE: usize = 24_000;
 /// scatter too much (at any threshold, many of another person's lines
 /// passed).
 const OWN_VOICE_SIMILARITY: f32 = 0.75;
-/// Mic lines, and lines of the voice, needed before comparing the two.
+/// Lines of a call-side voice needed before comparing it with the user.
 const MIN_LINES_FOR_OWN_VOICE: usize = 3;
 
 /// `change_windows` needs four windows to find a change.
@@ -51,8 +51,10 @@ pub struct DiarizationSession {
     /// drains, which the recording saver no longer receives.
     lines: HashMap<String, usize>,
     /// Voices on the user's mic. Someone in the room can be heard there
-    /// too, so the user is the voice with the most mic lines.
+    /// too; `own_voice_anchor` picks which is the user.
     mic_voices: SpeakerClusterer,
+    /// The user's voice saved from earlier meetings.
+    own_profile: Option<OwnVoiceProfile>,
 }
 
 /// The voices of one recording at its end.
@@ -71,7 +73,17 @@ impl DiarizationSession {
             profiles,
             lines: HashMap::new(),
             mic_voices: SpeakerClusterer::new(),
+            own_profile: None,
         })
+    }
+
+    pub fn set_own_profile(&mut self, profile: Option<OwnVoiceProfile>) {
+        self.own_profile = profile;
+    }
+
+    /// The saved own-voice profile updated with this meeting, when it changed.
+    pub fn updated_own_profile(&self) -> Option<OwnVoiceProfile> {
+        update_own_profile(&self.mic_voices.voiceprints(), self.own_profile.as_ref())
     }
 
     /// Learns the user's voice from a 16kHz mic line.
@@ -90,14 +102,7 @@ impl DiarizationSession {
     /// Voices on the call side that sound like the user's mic: the user
     /// heard through another mic on the call.
     pub fn own_voice_labels(&self) -> Vec<String> {
-        let Some(own) = self
-            .mic_voices
-            .voiceprints()
-            .into_iter()
-            .max_by_key(|voice| voice.segments)
-            .filter(|voice| voice.segments >= MIN_LINES_FOR_OWN_VOICE)
-            .map(|voice| voice.embedding)
-        else {
+        let Some(own) = own_voice_anchor(&self.mic_voices.voiceprints(), self.own_profile.as_ref()) else {
             return Vec::new();
         };
         self.clusterer
@@ -278,12 +283,22 @@ pub fn current_guesses() -> HashMap<String, String> {
 #[derive(Clone, Default)]
 pub struct LiveDiarization {
     session: std::sync::Arc<std::sync::Mutex<Option<DiarizationSession>>>,
+    /// Where the user's own-voice profile is kept; None without an app data folder.
+    own_profile_path: Option<std::path::PathBuf>,
 }
 
 impl LiveDiarization {
     /// Starts loading the model. `OMN_DIARIZATION=off` turns it off.
     pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Self {
-        let live = Self::default();
+        use tauri::Manager;
+        let live = Self {
+            own_profile_path: app
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|dir| dir.join(super::voiceprints::OWN_VOICE_PROFILE_FILE)),
+            ..Self::default()
+        };
         *CURRENT.lock().unwrap_or_else(|p| p.into_inner()) = Some(live.clone());
         if std::env::var("OMN_DIARIZATION").as_deref() == Ok("off") {
             log::info!("Speaker diarization off: OMN_DIARIZATION=off");
@@ -291,6 +306,7 @@ impl LiveDiarization {
         }
         let app = app.clone();
         let slot = live.session.clone();
+        let own_profile_path = live.own_profile_path.clone();
         tauri::async_runtime::spawn(async move {
             let path = match super::models::ensure_embedding_model(&app).await {
                 Ok(path) => path,
@@ -299,7 +315,6 @@ impl LiveDiarization {
                     return;
                 }
             };
-            use tauri::Manager;
             let profiles = match app.try_state::<crate::state::AppState>() {
                 Some(state) => super::voiceprints::load_voice_profiles(state.db_manager.pool())
                     .await
@@ -310,8 +325,11 @@ impl LiveDiarization {
                 None => Vec::new(),
             };
             log::info!("Loaded {} voice profiles", profiles.len());
+            let own_profile = own_profile_path.as_deref().and_then(super::voiceprints::read_own_voice_profile);
+            log::info!("Own voice profile {}", if own_profile.is_some() { "loaded" } else { "not saved yet" });
             match tokio::task::spawn_blocking(move || DiarizationSession::new(&path, profiles)).await {
-                Ok(Ok(session)) => {
+                Ok(Ok(mut session)) => {
+                    session.set_own_profile(own_profile);
                     *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
                     log::info!("Speaker diarization ready");
                 }
@@ -373,13 +391,19 @@ impl LiveDiarization {
     /// unless that one has already started.
     pub fn finish(&self) -> FinishedSpeakers {
         let voices = self.voiceprints();
-        let own_voice = self
+        let (own_voice, own_profile) = self
             .session
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .map(|session| session.own_voice_labels())
+            .map(|session| (session.own_voice_labels(), session.updated_own_profile()))
             .unwrap_or_default();
+        if let (Some(path), Some(profile)) = (&self.own_profile_path, own_profile) {
+            match super::voiceprints::write_own_voice_profile(path, &profile) {
+                Ok(()) => log::info!("Saved the user's voice profile ({} lines)", profile.lines),
+                Err(e) => log::warn!("Failed to save the user's voice profile: {}", e),
+            }
+        }
         let mut current = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
         if current.as_ref().is_some_and(|c| std::sync::Arc::ptr_eq(&c.session, &self.session)) {
             *current = None;
