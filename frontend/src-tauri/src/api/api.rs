@@ -1025,12 +1025,18 @@ pub async fn api_save_transcript<R: Runtime>(
             log_error!("Failed to parse transcript segments: {}", e);
             format!("Invalid transcript data format: {}. Please check the data structure.", e)
         })?;
-    // The live lines still carry the voices folded away at stop.
+    // The live lines still carry the voices folded away at stop, and the
+    // user's own voice heard on the call side before it was recognized.
     if let Some(folder) = &folder_path {
         let folds = crate::diarization::voiceprints::read_folds(std::path::Path::new(folder));
+        let own_voice = crate::diarization::voiceprints::read_own_voice(std::path::Path::new(folder));
         for segment in &mut transcripts_to_save {
             if let Some(target) = segment.speaker_label.as_ref().and_then(|l| folds.get(l)) {
                 segment.speaker_label = target.clone();
+            }
+            if segment.speaker_label.as_ref().is_some_and(|l| own_voice.contains(l)) {
+                segment.speaker = Some("mic".to_string());
+                segment.speaker_label = None;
             }
         }
     }

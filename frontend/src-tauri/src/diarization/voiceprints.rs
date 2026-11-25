@@ -17,6 +17,8 @@ pub const VOICEPRINTS_FILE: &str = "speakers.json";
 /// Where each voice folded away at stop went, so the database save gives
 /// its lines the same label as transcripts.json.
 pub const FOLDS_FILE: &str = "speaker-folds.json";
+/// Call-side voices that were the user's own voice, as a JSON list of labels.
+pub const OWN_VOICE_FILE: &str = "own-voice.json";
 
 /// One speaker's cluster centroid (L2-normalized) and how many segments
 /// built it.
@@ -162,6 +164,18 @@ pub fn read_folds(folder: &Path) -> HashMap<String, Option<String>> {
         .unwrap_or_default()
 }
 
+pub fn write_own_voice(folder: &Path, labels: &[String]) -> std::io::Result<()> {
+    std::fs::write(folder.join(OWN_VOICE_FILE), serde_json::to_vec(labels)?)
+}
+
+/// The call-side labels that were the user; empty when there were none.
+pub fn read_own_voice(folder: &Path) -> Vec<String> {
+    std::fs::read(folder.join(OWN_VOICE_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 /// Writes the voiceprints of one meeting. Through a temp file, so a crash
 /// mid-write leaves the old file or none, never half of one.
 pub fn write_voiceprints(folder: &Path, voiceprints: &[Voiceprint]) -> std::io::Result<()> {
@@ -282,5 +296,13 @@ mod tests {
         let expected = [3.0 / 10f32.sqrt(), 1.0 / 10f32.sqrt()];
         assert!(profiles[0].embedding.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-6));
         assert_eq!(profiles[1], profile("Sam", vec![0.0, 1.0]));
+    }
+
+    #[test]
+    fn own_voice_labels_round_trip_and_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_own_voice(dir.path()).is_empty());
+        write_own_voice(dir.path(), &["Speaker 1".to_string()]).unwrap();
+        assert_eq!(read_own_voice(dir.path()), vec!["Speaker 1".to_string()]);
     }
 }

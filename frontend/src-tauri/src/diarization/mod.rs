@@ -15,4 +15,4 @@ pub mod session;
 pub mod voiceprints;
 
 pub use voiceprints::Voiceprint;
-pub use session::{DiarizationSession, LiveDiarization};
+pub use session::{DiarizationSession, FinishedSpeakers, LiveDiarization};

@@ -146,6 +146,27 @@ impl RecordingSaver {
         }
     }
 
+    /// Moves the lines of call-side voices that were the user to the mic
+    /// side and rewrites transcripts.json.
+    pub fn apply_own_voice(&self, labels: &[String]) {
+        if labels.is_empty() {
+            return;
+        }
+        if let Ok(mut segments) = self.transcript_segments.lock() {
+            for segment in segments.iter_mut() {
+                if segment.speaker_label.as_ref().is_some_and(|l| labels.contains(l)) {
+                    segment.speaker = Some("mic".to_string());
+                    segment.speaker_label = None;
+                }
+            }
+        }
+        if let Some(folder) = &self.meeting_folder {
+            if self.write_transcripts_json(folder).is_err() {
+                warn!("Failed to write transcripts after moving the user's voice");
+            }
+        }
+    }
+
     /// Legacy method for backward compatibility - converts text to basic segment
     pub fn add_transcript_chunk(&self, text: String) {
         let segment = TranscriptSegment {
