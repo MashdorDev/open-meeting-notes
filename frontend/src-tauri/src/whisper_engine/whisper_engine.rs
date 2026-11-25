@@ -1706,4 +1706,41 @@ mod tests {
         let models = engine.discover_models().await.unwrap();
         assert!(matches!(tiny_model(&models).status, ModelStatus::Missing));
     }
+
+    /// Downloads ivrit.ai's Hebrew model through the app's own download path and
+    /// transcribes a clip with the language set to auto, to show the model's own
+    /// language wins. Needs about 1.6 GB on first run.
+    ///   OMN_LIVE_MODELS_DIR=<dir> OMN_LIVE_HE_AUDIO=<16 kHz mono f32le file> \
+    ///   cargo test --lib whisper_engine::whisper_engine::tests::live_hebrew -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_hebrew_model_transcribes_in_hebrew_with_auto_language() {
+        let models_dir = PathBuf::from(std::env::var("OMN_LIVE_MODELS_DIR").expect("OMN_LIVE_MODELS_DIR"));
+        let audio_path = std::env::var("OMN_LIVE_HE_AUDIO").expect("OMN_LIVE_HE_AUDIO");
+        let engine = WhisperEngine::new_with_models_dir(Some(models_dir)).unwrap();
+
+        let name = "he-large-v3-turbo";
+        let models = engine.discover_models().await.unwrap();
+        let status = &models.iter().find(|m| m.name == name).unwrap().status;
+        if !matches!(status, ModelStatus::Available) {
+            println!("downloading {name}");
+            engine.download_model(name, None).await.unwrap();
+            engine.discover_models().await.unwrap();
+        }
+        engine.load_model(name).await.unwrap();
+
+        let bytes = std::fs::read(audio_path).unwrap();
+        let samples: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        // 30 s from 17:00, where the test meeting has steady speech.
+        let start = 17 * 60 * 16_000;
+        let clip = samples[start..start + 30 * 16_000].to_vec();
+
+        let text = engine.transcribe_audio(clip, Some("auto".to_string())).await.unwrap();
+        println!("{text}");
+        let hebrew = text.chars().filter(|c| ('\u{05D0}'..='\u{05EA}').contains(c)).count();
+        assert!(hebrew > 20, "expected Hebrew text, got: {text}");
+    }
 }
