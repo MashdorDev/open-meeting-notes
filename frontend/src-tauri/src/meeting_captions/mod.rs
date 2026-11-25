@@ -260,6 +260,11 @@ pub async fn stop() -> Vec<CaptionPiece> {
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const READ_EVERY: Duration = Duration::from_millis(700);
 
+/// A first read this soon after the start shows what was said before it;
+/// Chromium may need a search or two before its page is readable.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+const BASELINE_WITHIN: Duration = Duration::from_secs(15);
+
 /// How long to wait before looking for the caption region again. The
 /// search walks browser windows, so after a minute without captions it is
 /// done less often.
@@ -288,9 +293,11 @@ fn capture<R>(
     let mut region: Option<R> = None;
     let mut last_search: Option<Instant> = None;
     let mut misses = 0;
-    // Set when the region was already showing at the first search: what it
-    // shows then was said before the recording.
-    let mut baseline = false;
+    // What the first read in the recording's first seconds shows was said
+    // before it started, and what the first read after a pause shows was
+    // said during the pause: neither is logged.
+    let mut first_read = true;
+    let mut resumed = false;
     while !stop.load(Ordering::SeqCst) {
         let paused = PAUSED.load(Ordering::SeqCst);
         if !paused {
@@ -298,11 +305,11 @@ fn capture<R>(
         }
         ticked = Instant::now();
         if paused {
+            resumed = true;
             std::thread::sleep(READ_EVERY);
             continue;
         }
         if region.is_none() && last_search.is_none_or(|t| t.elapsed() >= search_wait(misses)) {
-            baseline = last_search.is_none();
             last_search = Some(Instant::now());
             region = find();
             if region.is_some() {
@@ -314,8 +321,15 @@ fn capture<R>(
         }
         if let Some(found) = &region {
             match read(found) {
-                Some(texts) if std::mem::take(&mut baseline) => log.baseline(&parse_caption_texts(&texts)),
-                Some(texts) => log.observe("meet", clock.as_secs_f64(), &parse_caption_texts(&texts)),
+                Some(texts) => {
+                    let blocks = parse_caption_texts(&texts);
+                    let early = std::mem::take(&mut first_read) && clock < BASELINE_WITHIN;
+                    if std::mem::take(&mut resumed) || early {
+                        log.baseline(&blocks);
+                    } else {
+                        log.observe("meet", clock.as_secs_f64(), &blocks);
+                    }
+                }
                 // The tab closed or captions were turned off.
                 None => region = None,
             }
