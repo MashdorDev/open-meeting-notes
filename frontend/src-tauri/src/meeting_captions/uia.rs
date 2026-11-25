@@ -1,6 +1,6 @@
 //! Reads Meet's caption region from the browser through Windows UI Automation.
 
-use super::{parse_caption_texts, CaptionLog, CaptionPiece};
+use super::{is_paused, parse_caption_texts, CaptionLog, CaptionPiece};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -55,11 +55,22 @@ pub fn stop() -> Vec<CaptionPiece> {
 }
 
 unsafe fn capture(automation: &IUIAutomation, stop: &AtomicBool) -> Vec<CaptionPiece> {
-    let started = Instant::now();
+    // Recording time: wall time minus pauses, like the audio's timestamps.
+    let mut clock = Duration::ZERO;
+    let mut ticked = Instant::now();
     let mut log = CaptionLog::default();
     let mut captions: Option<IUIAutomationElement> = None;
     let mut last_search: Option<Instant> = None;
     while !stop.load(Ordering::SeqCst) {
+        let paused = is_paused();
+        if !paused {
+            clock += ticked.elapsed();
+        }
+        ticked = Instant::now();
+        if paused {
+            std::thread::sleep(READ_EVERY);
+            continue;
+        }
         if captions.is_none() && last_search.is_none_or(|t| t.elapsed() >= SEARCH_EVERY) {
             last_search = Some(Instant::now());
             captions = find_meet_captions(automation).ok().flatten();
@@ -69,7 +80,7 @@ unsafe fn capture(automation: &IUIAutomation, stop: &AtomicBool) -> Vec<CaptionP
         }
         if let Some(region) = &captions {
             match caption_texts(automation, region) {
-                Ok(texts) => log.observe("meet", started.elapsed().as_secs_f64(), &parse_caption_texts(&texts)),
+                Ok(texts) => log.observe("meet", clock.as_secs_f64(), &parse_caption_texts(&texts)),
                 // The tab closed or captions were turned off.
                 Err(_) => captions = None,
             }

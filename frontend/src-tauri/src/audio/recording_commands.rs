@@ -929,6 +929,9 @@ async fn stop_recording_for_session<R: Runtime>(
     };
 
     let (stop_result, manager_for_cleanup) = stop_result;
+    // Now, not after the transcript drains: whatever is said in the call
+    // after Stop is not part of this meeting.
+    let captions = crate::meeting_captions::stop();
 
     match stop_result {
         Ok(_) => {
@@ -1257,7 +1260,6 @@ async fn stop_recording_for_session<R: Runtime>(
             }
         }
 
-        let captions = crate::meeting_captions::stop();
         if let (Some(folder), false) = (&meeting_folder, captions.is_empty()) {
             match crate::meeting_captions::write_captions(folder, &captions) {
                 Ok(()) => info!("Saved {} caption pieces with the meeting", captions.len()),
@@ -1371,6 +1373,7 @@ pub async fn pause_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
     if let Some(manager) = manager_guard.as_ref() {
         manager.pause_recording().map_err(|e| e.to_string())?;
+        crate::meeting_captions::set_paused(true);
 
         // Emit pause event to frontend
         app.emit(
@@ -1405,6 +1408,7 @@ pub async fn resume_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), Strin
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
     if let Some(manager) = manager_guard.as_ref() {
         manager.resume_recording().map_err(|e| e.to_string())?;
+        crate::meeting_captions::set_paused(false);
 
         // Emit resume event to frontend
         app.emit(

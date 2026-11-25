@@ -144,8 +144,22 @@ pub fn read_captions(folder: &Path) -> Option<Vec<CaptionPiece>> {
     serde_json::from_slice(&std::fs::read(folder.join(CAPTIONS_FILE)).ok()?).ok()
 }
 
+/// Set while the recording is paused: captions are not read then, and the
+/// caption clock stops, the way the audio's does.
+static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_paused(paused: bool) {
+    PAUSED.store(paused, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_paused() -> bool {
+    PAUSED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Starts reading captions for a new recording.
 pub fn start() {
+    set_paused(false);
     #[cfg(windows)]
     uia::start();
 }
