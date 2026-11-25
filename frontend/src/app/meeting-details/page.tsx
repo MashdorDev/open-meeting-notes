@@ -146,7 +146,7 @@ function MeetingDetailsContent() {
     }
   }, [metadata, transcripts, meetingId, isLoadingTranscripts, setCurrentMeeting]);
 
-  // The stop pass rewrote this meeting's lines from the saved recording.
+  // The stop pass rewrote this meeting's lines, or their live text was restored.
   useEffect(() => {
     if (!meetingId) return;
     const unlisten = listen<{ meeting_id: string; lines_updated: number }>('meeting-transcript-refined', (event) => {

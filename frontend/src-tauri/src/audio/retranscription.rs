@@ -52,6 +52,18 @@ impl RetranscriptionGuard {
         STOP_PASS_RUNNING.store(true, Ordering::SeqCst);
         Ok(guard)
     }
+
+    /// The guard for restoring a meeting's live text, refused with a
+    /// message for the user while the stop pass or a retranscription runs.
+    pub(crate) fn acquire_for_restore() -> Result<Self, String> {
+        Self::acquire().map_err(|_| {
+            if STOP_PASS_RUNNING.load(Ordering::SeqCst) {
+                "Improving the transcript, try again in a minute".to_string()
+            } else {
+                "A retranscription is running, try again when it finishes".to_string()
+            }
+        })
+    }
 }
 
 impl Drop for RetranscriptionGuard {

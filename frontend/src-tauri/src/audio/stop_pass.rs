@@ -1,8 +1,8 @@
 //! The stop pass: once a recording is saved, transcribe the whole recording
 //! again in the background with Parakeet and put the new words on the lines
 //! the live pass made. Lines keep their times, speaker, label and name; the
-//! live text is kept in `live_text` so it can be restored. Any failure leaves
-//! the live text as it was.
+//! live text and word times are kept in `live_text` and `live_words` so they
+//! can be restored. Any failure leaves the live text as it was.
 
 use super::decoder::decode_audio_file;
 use super::retranscription::{
@@ -63,6 +63,53 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, pool: SqlitePool, meeting_id: String
             Err(e) => warn!("Stop pass for {meeting_id}: kept the live text: {e}"),
         }
     });
+}
+
+/// Whether the stop pass rewrote any line of the meeting, so its live
+/// version can be restored.
+#[tauri::command]
+pub async fn api_meeting_has_live_text(
+    meeting_id: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM transcripts WHERE meeting_id = ? AND live_text IS NOT NULL)",
+    )
+    .bind(&meeting_id)
+    .fetch_one(state.db_manager.pool())
+    .await
+    .map_err(|e| format!("Failed to read the transcript: {}", e))
+}
+
+/// Puts the live pass's text and word times back on every line the stop
+/// pass rewrote, in one statement, and returns how many lines changed.
+/// Refused while the stop pass or a retranscription runs. Emits
+/// `meeting-transcript-refined` so an open meeting page refreshes its lines.
+#[tauri::command]
+pub async fn api_restore_live_text<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<u64, String> {
+    let _guard = RetranscriptionGuard::acquire_for_restore()?;
+    let lines_updated = sqlx::query(
+        "UPDATE transcripts SET transcript = live_text, words = live_words,
+             live_text = NULL, live_words = NULL
+         WHERE meeting_id = ? AND live_text IS NOT NULL",
+    )
+    .bind(&meeting_id)
+    .execute(state.db_manager.pool())
+    .await
+    .map_err(|e| format!("Failed to restore the live text: {}", e))?
+    .rows_affected();
+    info!("Restored the live text of {lines_updated} lines for {meeting_id}");
+    if lines_updated > 0 {
+        let _ = app.emit(
+            "meeting-transcript-refined",
+            serde_json::json!({ "meeting_id": meeting_id, "lines_updated": lines_updated }),
+        );
+    }
+    Ok(lines_updated)
 }
 
 /// Whether the saved transcript provider is Parakeet, read the same way
@@ -200,8 +247,8 @@ async fn load_model(dir: PathBuf, quantized: bool) -> Result<ParakeetModel> {
 }
 
 /// Writes the new words onto the meeting's lines in one transaction. Lines
-/// that get no words keep their live text; `live_text` keeps the first live
-/// text, so running again never loses it.
+/// that get no words keep their live text; `live_text` and `live_words` keep
+/// the first live version, so running again never loses it.
 async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) -> Result<usize> {
     let mut tx = pool.begin().await?;
     let lines: Vec<(String, f64, f64)> = sqlx::query_as(
@@ -220,8 +267,12 @@ async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) 
             continue;
         }
         let text = line_words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        // live_words is keyed on live_text, not on itself: live words can be
+        // NULL, and a later run must not store its own words as the live ones.
         sqlx::query(
-            "UPDATE transcripts SET live_text = COALESCE(live_text, transcript), transcript = ?, words = ?
+            "UPDATE transcripts SET live_text = COALESCE(live_text, transcript),
+                 live_words = CASE WHEN live_text IS NULL THEN words ELSE live_words END,
+                 transcript = ?, words = ?
              WHERE id = ?",
         )
         .bind(text)
