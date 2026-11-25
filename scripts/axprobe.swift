@@ -11,21 +11,35 @@ guard args.count >= 2 else {
     print("usage: axprobe <app name|bundle id> [dump|watch] [seconds]"); exit(2)
 }
 let query = args[1].lowercased()
-let mode = args.count >= 3 ? args[2] : "dump"
+let mode = args.count >= 3 ? args[2].lowercased() : "dump"
+guard mode == "dump" || mode == "watch" else {
+    print("usage: axprobe <app name|bundle id> [dump|watch] [seconds]"); exit(2)
+}
 let seconds = args.count >= 4 ? Double(args[3]) ?? 60 : 60
 let maxNodes = 40000
 
 guard AXIsProcessTrusted() else { print("no Accessibility permission"); exit(1) }
 
-let apps = NSWorkspace.shared.runningApplications.filter {
-    ($0.localizedName?.lowercased() == query) || ($0.bundleIdentifier?.lowercased() == query)
-        || ($0.localizedName?.lowercased().contains(query) ?? false)
-}.filter { $0.activationPolicy == .regular }
-guard let app = apps.first else { print("not running: \(query)"); exit(1) }
+let running = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+let exact = running.filter {
+    $0.localizedName?.lowercased() == query || $0.bundleIdentifier?.lowercased() == query
+}
+let partial = running.filter {
+    ($0.localizedName?.lowercased().contains(query) ?? false)
+        || ($0.bundleIdentifier?.lowercased().contains(query) ?? false)
+}
+let candidates = exact.isEmpty ? partial : exact
+guard let app = candidates.first else { print("not running: \(query)"); exit(1) }
+if candidates.count > 1 {
+    print("several apps match, using the first: " + candidates.map { $0.bundleIdentifier ?? "?" }.joined(separator: ", "))
+}
 print("app: \(app.localizedName ?? "?") \(app.bundleIdentifier ?? "?") pid \(app.processIdentifier)")
 
 let root = AXUIElementCreateApplication(app.processIdentifier)
-AXUIElementSetMessagingTimeout(root, 1.0)
+// A timeout set on one element does not reach the elements read from it;
+// the system-wide element sets it for every element, so a hung app costs
+// at most 1 s per read instead of 6.
+AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
 let manual = AXUIElementSetAttributeValue(root, "AXManualAccessibility" as CFString, kCFBooleanTrue)
 print("AXManualAccessibility set: \(manual == .success ? "ok" : "error \(manual.rawValue)")")
 
