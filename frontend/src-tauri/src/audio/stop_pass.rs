@@ -83,7 +83,12 @@ async fn uses_parakeet(pool: &SqlitePool) -> Result<bool> {
 }
 
 async fn run(pool: &SqlitePool, meeting_id: &str, folder: &Path) -> Result<usize> {
-    let (model_dir, quantized) = pick_model().await?;
+    // Resolved before decoding so a missing model fails early.
+    let full_precision = full_precision_dir().await?;
+    let int8 = match full_precision {
+        Some(_) => None,
+        None => Some(int8_dir().await?),
+    };
     let audio_path = find_audio_file(folder)?;
 
     stop_if_needed().await?;
@@ -103,17 +108,17 @@ async fn run(pool: &SqlitePool, meeting_id: &str, folder: &Path) -> Result<usize
     .map_err(|e| anyhow!("VAD task panicked: {}", e))??;
     stop_if_needed().await?;
 
-    info!(
-        "Stop pass for {meeting_id}: {} speech chunks, model {} ({})",
-        segments.len(),
-        model_dir.display(),
-        if quantized { "int8" } else { "fp32" }
-    );
-    let mut model = tokio::task::spawn_blocking(move || {
-        ParakeetModel::new(&model_dir, quantized).map_err(|e| anyhow!("failed to load Parakeet model: {}", e))
-    })
-    .await
-    .map_err(|e| anyhow!("model load task panicked: {}", e))??;
+    info!("Stop pass for {meeting_id}: {} speech chunks", segments.len());
+    let mut model = match full_precision {
+        Some(dir) => match load_model(dir, false).await {
+            Ok(model) => model,
+            Err(e) => {
+                warn!("Stop pass for {meeting_id}: full-precision model failed, using int8: {e}");
+                load_model(int8_dir().await?, true).await?
+            }
+        },
+        None => load_model(int8.expect("int8 resolved when no full precision"), true).await?,
+    };
 
     let mut words: Vec<TranscriptWord> = Vec::new();
     for segment in segments {
@@ -155,23 +160,22 @@ async fn stop_if_needed() -> Result<()> {
     Ok(())
 }
 
-/// The model folder and whether it is int8: full-precision v3 when its files
-/// are there, else an installed int8 model, v3 first.
-async fn pick_model() -> Result<(PathBuf, bool)> {
-    let engine = {
-        let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().cloned()
-    }
-    .ok_or_else(|| anyhow!("Parakeet engine not initialized"))?;
+fn parakeet_engine() -> Result<std::sync::Arc<crate::parakeet_engine::ParakeetEngine>> {
+    let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().cloned().ok_or_else(|| anyhow!("Parakeet engine not initialized"))
+}
 
-    let full = engine.get_models_directory().await.join(FULL_PRECISION_MODEL);
-    if FULL_PRECISION_FILES.iter().all(|f| full.join(f).is_file()) {
-        return Ok((full, false));
-    }
+/// The full-precision v3 folder, when its files are there.
+async fn full_precision_dir() -> Result<Option<PathBuf>> {
+    let full = parakeet_engine()?.get_models_directory().await.join(FULL_PRECISION_MODEL);
+    Ok(FULL_PRECISION_FILES.iter().all(|f| full.join(f).is_file()).then_some(full))
+}
 
-    let models = engine.discover_models().await?;
+/// An installed int8 model folder, v3 first.
+async fn int8_dir() -> Result<PathBuf> {
+    let models = parakeet_engine()?.discover_models().await?;
     let available = |m: &&crate::parakeet_engine::ModelInfo| {
         matches!(m.status, crate::parakeet_engine::ModelStatus::Available)
             && m.quantization == crate::parakeet_engine::QuantizationType::Int8
@@ -181,8 +185,21 @@ async fn pick_model() -> Result<(PathBuf, bool)> {
         .filter(available)
         .find(|m| m.name == INT8_MODEL)
         .or_else(|| models.iter().find(available))
-        .map(|m| (m.path.clone(), true))
+        .map(|m| m.path.clone())
         .ok_or_else(|| anyhow!("no Parakeet model installed"))
+}
+
+async fn load_model(dir: PathBuf, quantized: bool) -> Result<ParakeetModel> {
+    info!(
+        "Stop pass: loading {} ({})",
+        dir.display(),
+        if quantized { "int8" } else { "fp32" }
+    );
+    tokio::task::spawn_blocking(move || {
+        ParakeetModel::new(&dir, quantized).map_err(|e| anyhow!("failed to load Parakeet model: {}", e))
+    })
+    .await
+    .map_err(|e| anyhow!("model load task panicked: {}", e))?
 }
 
 /// Writes the new words onto the meeting's lines in one transaction. Lines
