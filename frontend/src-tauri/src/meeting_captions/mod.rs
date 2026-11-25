@@ -9,6 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 mod uia;
@@ -191,30 +195,118 @@ pub fn read_captions(folder: &Path) -> Option<Vec<CaptionPiece>> {
 
 /// Set while the recording is paused: captions are not read then, and the
 /// caption clock stops, the way the audio's does.
-static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PAUSED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_paused(paused: bool) {
-    PAUSED.store(paused, std::sync::atomic::Ordering::SeqCst);
+    PAUSED.store(paused, Ordering::SeqCst);
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
-fn is_paused() -> bool {
-    PAUSED.load(std::sync::atomic::Ordering::SeqCst)
-}
+/// The reader thread of the current recording and the flag that stops it.
+type Reader = (Arc<AtomicBool>, JoinHandle<Vec<CaptionPiece>>);
+static RUNNING: Mutex<Option<Reader>> = Mutex::new(None);
 
 /// Starts reading captions for a new recording.
 pub fn start() {
     set_paused(false);
     #[cfg(windows)]
-    uia::start();
+    {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let flag = stop_flag.clone();
+        let handle = std::thread::spawn(move || uia::run(&flag));
+        let previous = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).replace((stop_flag, handle));
+        // A reader left over from a recording that never stopped: let it
+        // finish on its own rather than wait for it here.
+        if let Some((flag, _)) = previous {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Stops reading and hands back what was captured (nothing off Windows).
-pub fn stop() -> Vec<CaptionPiece> {
-    #[cfg(windows)]
-    return uia::stop();
-    #[cfg(not(windows))]
-    Vec::new()
+/// The reader may be in the middle of a slow read, so it is waited for
+/// off the async runtime's threads.
+pub async fn stop() -> Vec<CaptionPiece> {
+    let running = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let Some((flag, handle)) = running else { return Vec::new() };
+    flag.store(true, Ordering::SeqCst);
+    match tokio::task::spawn_blocking(move || handle.join()).await {
+        Ok(Ok(pieces)) => pieces,
+        _ => {
+            log::warn!("Meeting caption reader panicked");
+            Vec::new()
+        }
+    }
+}
+
+/// Captions show up within a second of the words; a read takes a few ms.
+#[cfg_attr(not(windows), allow(dead_code))]
+const READ_EVERY: Duration = Duration::from_millis(700);
+
+/// How long to wait before looking for the caption region again. The
+/// search walks browser windows, so after a minute without captions it is
+/// done less often.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn search_wait(misses: u32) -> Duration {
+    match misses {
+        0..=12 => Duration::from_secs(5),
+        13..=24 => Duration::from_secs(15),
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// The reader loop both platforms share: finds the caption region with
+/// `find`, reads its texts with `read` (None once it is gone) and logs the
+/// new text against recording time, which is wall time minus pauses, like
+/// the audio's timestamps.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn capture<R>(
+    stop: &AtomicBool,
+    mut find: impl FnMut() -> Option<R>,
+    mut read: impl FnMut(&R) -> Option<Vec<(usize, String)>>,
+) -> Vec<CaptionPiece> {
+    let mut clock = Duration::ZERO;
+    let mut ticked = Instant::now();
+    let mut log = CaptionLog::default();
+    let mut region: Option<R> = None;
+    let mut last_search: Option<Instant> = None;
+    let mut misses = 0;
+    // Set when the region was already showing at the first search: what it
+    // shows then was said before the recording.
+    let mut baseline = false;
+    while !stop.load(Ordering::SeqCst) {
+        let paused = PAUSED.load(Ordering::SeqCst);
+        if !paused {
+            clock += ticked.elapsed();
+        }
+        ticked = Instant::now();
+        if paused {
+            std::thread::sleep(READ_EVERY);
+            continue;
+        }
+        if region.is_none() && last_search.is_none_or(|t| t.elapsed() >= search_wait(misses)) {
+            baseline = last_search.is_none();
+            last_search = Some(Instant::now());
+            region = find();
+            if region.is_some() {
+                misses = 0;
+                log::info!("Reading speaker names from Meet's captions");
+            } else {
+                misses += 1;
+            }
+        }
+        if let Some(found) = &region {
+            match read(found) {
+                Some(texts) if std::mem::take(&mut baseline) => log.baseline(&parse_caption_texts(&texts)),
+                Some(texts) => log.observe("meet", clock.as_secs_f64(), &parse_caption_texts(&texts)),
+                // The tab closed or captions were turned off.
+                None => region = None,
+            }
+        }
+        std::thread::sleep(READ_EVERY);
+    }
+    let pieces = log.into_pieces();
+    log::info!("Captured {} caption pieces", pieces.len());
+    pieces
 }
 
 #[cfg(test)]

@@ -931,7 +931,7 @@ async fn stop_recording_for_session<R: Runtime>(
     let (stop_result, manager_for_cleanup) = stop_result;
     // Now, not after the transcript drains: whatever is said in the call
     // after Stop is not part of this meeting.
-    let captions = crate::meeting_captions::stop();
+    let captions = crate::meeting_captions::stop().await;
 
     match stop_result {
         Ok(_) => {

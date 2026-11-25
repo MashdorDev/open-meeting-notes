@@ -1,123 +1,159 @@
 //! Reads Meet's caption region from the browser through Windows UI Automation.
 
-use super::{is_paused, parse_caption_texts, CaptionLog, CaptionPiece};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-use windows::Win32::System::Variant::VARIANT;
+use super::{capture, parse_caption_texts, CaptionPiece};
+use std::sync::atomic::AtomicBool;
+use windows::core::PWSTR;
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::*;
 
-/// Captions show up within a second of the words; a read takes a few ms.
-const READ_EVERY: Duration = Duration::from_millis(700);
-/// Looking for a Meet tab walks every browser window, so it is not done on every read.
-const SEARCH_EVERY: Duration = Duration::from_secs(5);
 /// Top-level windows of Firefox and of Chromium browsers (Chrome, Edge).
 const BROWSER_CLASSES: [&str; 2] = ["MozillaWindowClass", "Chrome_WidgetWin_1"];
+/// Chromium's window class is shared by Electron apps (VS Code, Slack,
+/// Discord), whose trees are large, so only these programs are searched.
+const BROWSER_PROGRAMS: [&str; 7] = ["chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "arc.exe", "vivaldi.exe", "opera.exe"];
+/// The caption region's label in an English Meet. Other languages are
+/// recognised by the shape of what the region holds.
+const CAPTIONS_LABEL: &str = "Captions";
 
-static RUNNING: Mutex<Option<(Arc<AtomicBool>, JoinHandle<Vec<CaptionPiece>>)>> = Mutex::new(None);
-
-pub fn start() {
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let flag = stop_flag.clone();
-    let handle = std::thread::spawn(move || {
-        // SAFETY: COM is set up and torn down on this thread, which owns
-        // every UI Automation object it creates.
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let pieces = match CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
-                Ok(automation) => capture(&automation, &flag),
-                Err(e) => {
-                    log::warn!("Meeting captions off: UI Automation unavailable: {}", e);
-                    Vec::new()
-                }
-            };
-            CoUninitialize();
-            pieces
-        }
-    });
-    let previous = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).replace((stop_flag, handle));
-    if let Some((flag, handle)) = previous {
-        flag.store(true, Ordering::SeqCst);
-        let _ = handle.join();
+/// Reads captions until `stop` is set; runs on its own thread.
+pub fn run(stop: &AtomicBool) -> Vec<CaptionPiece> {
+    // SAFETY: COM is set up and torn down on this thread, which owns
+    // every UI Automation object it creates.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let pieces = match CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+            Ok(automation) => capture(
+                stop,
+                || find_meet_captions(&automation, false).ok().flatten(),
+                |region| caption_texts(&automation, region).ok(),
+            ),
+            Err(e) => {
+                log::warn!("Meeting captions off: UI Automation unavailable: {}", e);
+                Vec::new()
+            }
+        };
+        CoUninitialize();
+        pieces
     }
 }
 
-pub fn stop() -> Vec<CaptionPiece> {
-    let running = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).take();
-    let Some((flag, handle)) = running else { return Vec::new() };
-    flag.store(true, Ordering::SeqCst);
-    handle.join().unwrap_or_else(|_| {
-        log::warn!("Meeting caption reader panicked");
-        Vec::new()
-    })
-}
-
-unsafe fn capture(automation: &IUIAutomation, stop: &AtomicBool) -> Vec<CaptionPiece> {
-    // Recording time: wall time minus pauses, like the audio's timestamps.
-    let mut clock = Duration::ZERO;
-    let mut ticked = Instant::now();
-    let mut log = CaptionLog::default();
-    let mut captions: Option<IUIAutomationElement> = None;
-    let mut last_search: Option<Instant> = None;
-    while !stop.load(Ordering::SeqCst) {
-        let paused = is_paused();
-        if !paused {
-            clock += ticked.elapsed();
-        }
-        ticked = Instant::now();
-        if paused {
-            std::thread::sleep(READ_EVERY);
-            continue;
-        }
-        if captions.is_none() && last_search.is_none_or(|t| t.elapsed() >= SEARCH_EVERY) {
-            last_search = Some(Instant::now());
-            captions = find_meet_captions(automation).ok().flatten();
-            if captions.is_some() {
-                log::info!("Reading speaker names from Meet's captions");
-            }
-        }
-        if let Some(region) = &captions {
-            match caption_texts(automation, region) {
-                Ok(texts) => log.observe("meet", clock.as_secs_f64(), &parse_caption_texts(&texts)),
-                // The tab closed or captions were turned off.
-                Err(_) => captions = None,
-            }
-        }
-        std::thread::sleep(READ_EVERY);
+/// Whether the window belongs to one of the browsers in `BROWSER_PROGRAMS`.
+unsafe fn is_browser(window: &IUIAutomationElement) -> bool {
+    let Ok(pid) = window.CurrentProcessId() else { return false };
+    let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid as u32) else { return false };
+    let mut path = [0u16; 1024];
+    let mut len = path.len() as u32;
+    let read = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len);
+    let _ = CloseHandle(process);
+    if read.is_err() {
+        return false;
     }
-    let pieces = log.into_pieces();
-    log::info!("Captured {} caption pieces", pieces.len());
-    pieces
+    let path = String::from_utf16_lossy(&path[..len as usize]).to_lowercase();
+    BROWSER_PROGRAMS.contains(&path.rsplit('\\').next().unwrap_or(""))
 }
 
-/// The "Captions" group of a Meet tab in a browser window, when captions are on.
-unsafe fn find_meet_captions(automation: &IUIAutomation) -> windows::core::Result<Option<IUIAutomationElement>> {
+/// The top-level window that holds keyboard focus, if any.
+unsafe fn focused_window(automation: &IUIAutomation) -> Option<IUIAutomationElement> {
+    let root = automation.GetRootElement().ok()?;
+    let walker = automation.RawViewWalker().ok()?;
+    let mut element = automation.GetFocusedElement().ok()?;
+    loop {
+        let parent = walker.GetParentElement(&element).ok()?;
+        if automation.CompareElements(&parent, &root).ok()?.as_bool() {
+            return Some(element);
+        }
+        element = parent;
+    }
+}
+
+/// The caption region of a Meet tab, when captions are on. With several
+/// Meet tabs, the one in the focused window and on screen wins; otherwise
+/// the first, and the log says which.
+unsafe fn find_meet_captions(automation: &IUIAutomation, trace: bool) -> windows::core::Result<Option<IUIAutomationElement>> {
     let documents = automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_DocumentControlTypeId.0))?;
-    let region = automation.CreateAndCondition(
-        &automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_GroupControlTypeId.0))?,
-        &automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from("Captions"))?,
-    )?;
     let windows = automation.GetRootElement()?.FindAll(TreeScope_Children, &automation.CreateTrueCondition()?)?;
+    let focused = focused_window(automation);
+    let mut found: Vec<(u8, String, IUIAutomationElement)> = Vec::new();
     for i in 0..windows.Length()? {
         let window = windows.GetElement(i)?;
-        if !BROWSER_CLASSES.contains(&window.CurrentClassName()?.to_string().as_str()) {
+        let class = window.CurrentClassName()?.to_string();
+        if !BROWSER_CLASSES.contains(&class.as_str()) || !is_browser(&window) {
             continue;
         }
+        let in_focus = match &focused {
+            Some(f) => automation.CompareElements(f, &window)?.as_bool(),
+            None => false,
+        };
         let docs = window.FindAll(TreeScope_Descendants, &documents)?;
+        if trace {
+            println!("window [{}] {:?} focused: {} documents: {}", class, window.CurrentName()?.to_string(), in_focus, docs.Length()?);
+        }
         for j in 0..docs.Length()? {
             let doc = docs.GetElement(j)?;
+            let title = doc.CurrentName()?.to_string();
+            if trace {
+                println!("   doc: {:?}", title);
+            }
             // "Meet - abc-defg-hij": the tab title of a Meet call.
-            if !doc.CurrentName()?.to_string().starts_with("Meet ") {
+            if !title.starts_with("Meet ") {
                 continue;
             }
-            if let Ok(found) = doc.FindFirst(TreeScope_Descendants, &region) {
-                return Ok(Some(found));
+            if let Some(region) = caption_region(automation, &doc, trace)? {
+                // A background tab's document is off screen.
+                let on_screen = !doc.CurrentIsOffscreen()?.as_bool();
+                found.push((in_focus as u8 * 2 + on_screen as u8, title, region));
             }
         }
     }
-    Ok(None)
+    let best = found.iter().map(|(score, _, _)| *score).max();
+    let Some(i) = found.iter().position(|(score, _, _)| Some(*score) == best) else { return Ok(None) };
+    if found.len() > 1 {
+        log::info!(
+            "{} Meet tabs show captions; reading {:?} (focused window and on screen first)",
+            found.len(),
+            found[i].1
+        );
+    }
+    Ok(Some(found.swap_remove(i).2))
+}
+
+/// The caption region in a Meet document: the region labelled "Captions",
+/// or else the one landmark region whose texts read as speaker blocks.
+unsafe fn caption_region(
+    automation: &IUIAutomation,
+    doc: &IUIAutomationElement,
+    trace: bool,
+) -> windows::core::Result<Option<IUIAutomationElement>> {
+    let labelled = automation.CreateAndCondition(
+        &automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_GroupControlTypeId.0))?,
+        &automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(CAPTIONS_LABEL))?,
+    )?;
+    // ARIA regions with a label are custom landmarks.
+    let landmark = automation.CreatePropertyCondition(UIA_LandmarkTypePropertyId, &VARIANT::from(UIA_CustomLandmarkTypeId.0))?;
+    let candidates = doc.FindAll(TreeScope_Descendants, &automation.CreateOrCondition(&labelled, &landmark)?)?;
+    let mut shaped = Vec::new();
+    for i in 0..candidates.Length()? {
+        let region = candidates.GetElement(i)?;
+        let name = region.CurrentName()?.to_string();
+        if name == CAPTIONS_LABEL {
+            if trace {
+                println!("      region {:?}: labelled", name);
+            }
+            return Ok(Some(region));
+        }
+        let blocks = parse_caption_texts(&caption_texts(automation, &region).unwrap_or_default()).len();
+        if trace {
+            println!("      region {:?}: {} speaker blocks", name, blocks);
+        }
+        if blocks > 0 {
+            shaped.push(region);
+        }
+    }
+    // Two regions with that shape (the chat panel can look alike): unsure.
+    Ok(if shaped.len() == 1 { shaped.pop() } else { None })
 }
 
 /// The texts under the caption region in tree order, with their depth.
@@ -159,20 +195,11 @@ mod live {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
-            let documents = automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_DocumentControlTypeId.0)).unwrap();
-            let windows = automation.GetRootElement().unwrap().FindAll(TreeScope_Children, &automation.CreateTrueCondition().unwrap()).unwrap();
-            for i in 0..windows.Length().unwrap() {
-                let w = windows.GetElement(i).unwrap();
-                let class = w.CurrentClassName().unwrap().to_string();
-                if !BROWSER_CLASSES.contains(&class.as_str()) { continue; }
-                let docs = w.FindAll(TreeScope_Descendants, &documents);
-                let n = docs.as_ref().map(|d| d.Length().unwrap_or(-1)).unwrap_or(-2);
-                println!("window [{}] {} documents: {}", class, w.CurrentName().unwrap(), n);
-                if let Ok(docs) = docs {
-                    for j in 0..n { println!("   doc: {:?}", docs.GetElement(j).unwrap().CurrentName().unwrap().to_string()); }
-                }
+            let found = find_meet_captions(&automation, true);
+            println!("found: {:?}", found.as_ref().map(|f| f.is_some()));
+            if let Ok(Some(region)) = found {
+                println!("texts: {:?}", caption_texts(&automation, &region));
             }
-            println!("found: {:?}", find_meet_captions(&automation).map(|f| f.is_some()));
         }
     }
 }
