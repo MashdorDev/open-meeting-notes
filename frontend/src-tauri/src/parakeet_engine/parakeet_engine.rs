@@ -110,6 +110,16 @@ const PARAKEET_V3_ARTIFACTS: &[ArtifactSpec] = &[
     ArtifactSpec { filename: "vocab.txt", exact_bytes: 93_939 },
 ];
 
+/// Full-precision v3. The encoder keeps its weights in the external
+/// `encoder-model.onnx.data`, which ONNX Runtime reads from the same folder.
+const PARAKEET_V3_FP32_ARTIFACTS: &[ArtifactSpec] = &[
+    ArtifactSpec { filename: "encoder-model.onnx", exact_bytes: 41_770_866 },
+    ArtifactSpec { filename: "encoder-model.onnx.data", exact_bytes: 2_435_420_160 },
+    ArtifactSpec { filename: "decoder_joint-model.onnx", exact_bytes: 72_520_893 },
+    ArtifactSpec { filename: "nemo128.onnx", exact_bytes: 139_764 },
+    ArtifactSpec { filename: "vocab.txt", exact_bytes: 93_939 },
+];
+
 const PARAKEET_V2_ARTIFACTS: &[ArtifactSpec] = &[
     ArtifactSpec { filename: "encoder-model.int8.onnx", exact_bytes: 652_184_014 },
     ArtifactSpec { filename: "decoder_joint-model.int8.onnx", exact_bytes: 8_998_286 },
@@ -135,6 +145,17 @@ const PARAKEET_MODEL_SPECS: &[ModelSpec] = &[
         description: "Previous version with int8 quantization, good balance of speed and accuracy",
         source_base_url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx/resolve/0bbb45a3365852604aef28b538a8f066f4ccaa85",
         artifacts: PARAKEET_V2_ARTIFACTS,
+    },
+    // Used only by the pass that re-transcribes each recording after it
+    // stops (audio/stop_pass.rs), never for live transcription.
+    ModelSpec {
+        name: "parakeet-tdt-0.6b-v3",
+        size_mb: 2550,
+        quantization: QuantizationType::FP32,
+        speed: "After recording (v3)",
+        description: "Full precision, gives better text after each recording",
+        source_base_url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce",
+        artifacts: PARAKEET_V3_FP32_ARTIFACTS,
     },
 ];
 
@@ -706,7 +727,11 @@ impl ParakeetEngine {
         tokio::select! {
             biased;
             _ = active_download.cancellation.cancelled() => Err(DownloadCancelled.into()),
-            response = request.send() => response
+            // The client has no whole-request timeout (a 2.4 GB file on a slow
+            // line takes hours), so the wait for headers is bounded here and
+            // the body loop stops after 30 s without data.
+            response = timeout(Duration::from_secs(60), request.send()) => response
+                .map_err(|_| anyhow!("Failed to start download for {}: no response in 60 seconds", file_url))?
                 .map_err(|error| anyhow!("Failed to start download for {}: {}", file_url, error)),
         }
     }
@@ -868,7 +893,6 @@ impl ParakeetEngine {
             .user_agent(concat!("OpenMeetingNotes/", env!("CARGO_PKG_VERSION")))
             .tcp_nodelay(true)
             .pool_max_idle_per_host(1)
-            .timeout(Duration::from_secs(3600))
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| anyhow!("Failed to create HTTP client: {}", error))?;

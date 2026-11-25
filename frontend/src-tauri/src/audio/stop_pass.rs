@@ -18,14 +18,8 @@ use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Runtime};
 
-/// Full-precision Parakeet v3, used when its folder is installed.
+/// Full-precision Parakeet v3, used when it is downloaded.
 const FULL_PRECISION_MODEL: &str = "parakeet-tdt-0.6b-v3";
-const FULL_PRECISION_FILES: &[&str] = &[
-    "encoder-model.onnx",
-    "decoder_joint-model.onnx",
-    "nemo128.onnx",
-    "vocab.txt",
-];
 /// The int8 model preferred when full precision is not installed.
 const INT8_MODEL: &str = "parakeet-tdt-0.6b-v3-int8";
 /// A word further than this from every line is speech the live pass never
@@ -163,10 +157,17 @@ fn parakeet_engine() -> Result<std::sync::Arc<crate::parakeet_engine::ParakeetEn
     guard.as_ref().cloned().ok_or_else(|| anyhow!("Parakeet engine not initialized"))
 }
 
-/// The full-precision v3 folder, when its files are there.
+/// The full-precision v3 folder, when discovery finds every file at its
+/// exact size (not while it is still downloading).
 async fn full_precision_dir() -> Result<Option<PathBuf>> {
-    let full = parakeet_engine()?.get_models_directory().await.join(FULL_PRECISION_MODEL);
-    Ok(FULL_PRECISION_FILES.iter().all(|f| full.join(f).is_file()).then_some(full))
+    let models = parakeet_engine()?.discover_models().await?;
+    Ok(models
+        .into_iter()
+        .find(|m| {
+            m.name == FULL_PRECISION_MODEL
+                && matches!(m.status, crate::parakeet_engine::ModelStatus::Available)
+        })
+        .map(|m| m.path))
 }
 
 /// An installed int8 model folder, v3 first.

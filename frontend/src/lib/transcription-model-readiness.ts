@@ -1,5 +1,6 @@
 export interface ModelWithStatus {
   status?: unknown;
+  quantization?: unknown;
 }
 
 interface ProviderCommands {
@@ -25,8 +26,10 @@ export function getProviderCommands(provider: string): ProviderCommands | null {
   return PROVIDER_COMMANDS[provider] ?? null;
 }
 
+// Counts only downloads that will make recording ready. The full-precision
+// Parakeet model is used after each recording, never live.
 export function hasDownloadingModel(models: ModelWithStatus[]): boolean {
-  return models.some(({ status }) => (
+  return models.some(({ status, quantization }) => quantization !== 'FP32' && (
     status === 'Downloading'
     || (status !== null && typeof status === 'object' && 'Downloading' in status)
   ));

@@ -65,10 +65,10 @@ export const MODEL_DISPLAY_CONFIG: Record<string, ModelDisplayInfo> = {
     tagline: 'Real time • Smaller size',
     tier: 'balanced'
   },
-  'parakeet-tdt-0.6b-v3-fp32': {
-    friendlyName: 'Precise',
+  'parakeet-tdt-0.6b-v3': {
+    friendlyName: 'Full precision',
     icon: '🎯',
-    tagline: '20x real-time • Higher accuracy',
+    tagline: 'Better text after each recording • about 2.5 GB',
     tier: 'precise'
   }
 };
@@ -91,9 +91,9 @@ export const PARAKEET_MODEL_CONFIGS: Record<string, Partial<ParakeetModelInfo>> 
     speed: 'Very Fast',
     quantization: 'Int8'
   },
-  'parakeet-tdt-0.6b-v3-fp32': {
-    description: '20x real-time on M4 Max, higher precision',
-    size_mb: 2554, // Actual download: 2.44GB + 41.8MB encoder + 72.5MB decoder + 0.2MB extras
+  'parakeet-tdt-0.6b-v3': {
+    description: 'Full precision, gives better text after each recording',
+    size_mb: 2550, // Actual download: 2.44GB + 41.8MB encoder + 72.5MB decoder + 0.2MB extras
     accuracy: 'High',
     speed: 'Fast',
     quantization: 'FP32'
@@ -134,6 +134,12 @@ export function formatFileSize(sizeMb: number): string {
     return `${(sizeMb / 1000).toFixed(1)}GB`;
   }
   return `${sizeMb}MB`;
+}
+
+// The full-precision model is used only by the pass that re-transcribes each
+// recording after it stops; live transcription uses int8 models.
+export function isAfterRecordingModel(model: ParakeetModelInfo): boolean {
+  return model.quantization === 'FP32';
 }
 
 // Helper function to check if model is quantized
