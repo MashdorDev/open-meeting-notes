@@ -22,9 +22,16 @@ static RETRANSCRIPTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Global flag to signal cancellation
 static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
 
+/// Set while the stop pass holds the guard, to tell the user why a
+/// retranscription is refused.
+static STOP_PASS_RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// RAII guard for RETRANSCRIPTION_IN_PROGRESS flag
-/// Ensures flag is cleared even if retranscription panics or returns early
-struct RetranscriptionGuard;
+/// Ensures flag is cleared even if retranscription panics or returns early.
+/// The stop pass holds it too, so the two never run at once.
+pub(crate) struct RetranscriptionGuard {
+    stop_pass: bool,
+}
 
 impl RetranscriptionGuard {
     /// Create guard and set flag atomically
@@ -35,12 +42,23 @@ impl RetranscriptionGuard {
         {
             return Err("Retranscription already in progress".to_string());
         }
-        Ok(RetranscriptionGuard)
+        Ok(RetranscriptionGuard { stop_pass: false })
+    }
+
+    /// The guard for the stop pass.
+    pub(crate) fn acquire_for_stop_pass() -> Result<Self, String> {
+        let mut guard = Self::acquire()?;
+        guard.stop_pass = true;
+        STOP_PASS_RUNNING.store(true, Ordering::SeqCst);
+        Ok(guard)
     }
 }
 
 impl Drop for RetranscriptionGuard {
     fn drop(&mut self) {
+        if self.stop_pass {
+            STOP_PASS_RUNNING.store(false, Ordering::SeqCst);
+        }
         RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
@@ -50,7 +68,7 @@ impl Drop for RetranscriptionGuard {
 /// (500ms) because the entire file is processed at once by VAD with no
 /// latency requirement, and short redemption fragments speech at every
 /// natural sentence/topic pause (500ms-2s)
-const VAD_REDEMPTION_TIME_MS: u32 = 2000;
+pub(crate) const VAD_REDEMPTION_TIME_MS: u32 = 2000;
 
 /// Progress update emitted during retranscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +105,34 @@ pub fn cancel_retranscription() {
     RETRANSCRIPTION_CANCELLED.store(true, Ordering::SeqCst);
 }
 
+/// Longest stretch handed to the engine at once: 25 seconds at 16 kHz.
+const MAX_SEGMENT_SAMPLES: usize = 25 * 16000;
+
+/// Splits very long segments at silence boundaries for better transcription quality.
+/// Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
+/// for the lowest-energy window near the target split point and cut there.
+pub(crate) fn split_long_segments(
+    speech_segments: &[crate::audio::vad::SpeechSegment],
+) -> Vec<crate::audio::vad::SpeechSegment> {
+    let mut processable_segments = Vec::new();
+    for segment in speech_segments {
+        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
+            debug!(
+                "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
+                segment.end_timestamp_ms - segment.start_timestamp_ms,
+                segment.samples.len()
+            );
+
+            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
+            debug!("Split into {} sub-segments", sub_segments.len());
+            processable_segments.extend(sub_segments);
+        } else {
+            processable_segments.push(segment.clone());
+        }
+    }
+    processable_segments
+}
+
 /// Start retranscription of a meeting's audio
 pub async fn start_retranscription<R: Runtime>(
     app: AppHandle<R>,
@@ -97,7 +143,18 @@ pub async fn start_retranscription<R: Runtime>(
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
+    // The command checked the guard before spawning this task, but the stop
+    // pass can take it in between; tell the dialog so it does not spin.
+    let _guard = match RetranscriptionGuard::acquire() {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = app.emit(
+                "retranscription-error",
+                RetranscriptionError { meeting_id: meeting_id.clone(), error: e.to_string() },
+            );
+            return Err(anyhow!(e));
+        }
+    };
 
     // Reset cancellation flag
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
@@ -358,27 +415,7 @@ async fn run_retranscription<R: Runtime>(
         None
     };
 
-    // Split very long segments at silence boundaries for better transcription quality.
-    // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
-    // for the lowest-energy window near the target split point and cut there.
-    const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
-
-    let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &speech_segments {
-        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            debug!(
-                "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
-                segment.end_timestamp_ms - segment.start_timestamp_ms,
-                segment.samples.len()
-            );
-
-            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            debug!("Split into {} sub-segments", sub_segments.len());
-            processable_segments.extend(sub_segments);
-        } else {
-            processable_segments.push(segment.clone());
-        }
-    }
+    let processable_segments = split_long_segments(&speech_segments);
 
     let processable_count = processable_segments.len();
     info!("Processing {} segments (after splitting)", processable_count);
@@ -896,6 +933,9 @@ pub async fn start_retranscription_command<R: Runtime>(
 
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
     if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
+        if STOP_PASS_RUNNING.load(Ordering::SeqCst) {
+            return Err("Improving the transcript, try again in a minute".to_string());
+        }
         return Err("Retranscription already in progress".to_string());
     }
 

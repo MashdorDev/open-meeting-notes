@@ -1046,6 +1046,7 @@ pub async fn api_save_transcript<R: Runtime>(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let stop_pass_folder = folder_path.clone();
     // Now, call the repository with the correctly typed data.
     match TranscriptsRepository::save_transcript(
         pool,
@@ -1074,6 +1075,9 @@ pub async fn api_save_transcript<R: Runtime>(
                 .await;
                 crate::summary::speaker_names::identify_other_speakers(app_bg, pool_bg, meeting_bg).await;
             });
+            if let Some(folder) = stop_pass_folder {
+                crate::audio::stop_pass::spawn(app.clone(), pool.clone(), meeting_id.clone(), folder);
+            }
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",

@@ -6,6 +6,7 @@ import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
@@ -48,6 +49,7 @@ function MeetingDetailsContent() {
     loadMore,
     refetch,
     applySpeakerNames,
+    refreshLoaded,
     error: transcriptError,
   } = usePaginatedTranscripts({ meetingId: meetingId || '' });
 
@@ -143,6 +145,19 @@ function MeetingDetailsContent() {
       setCurrentMeeting({ id: metadata.id, title: metadata.title });
     }
   }, [metadata, transcripts, meetingId, isLoadingTranscripts, setCurrentMeeting]);
+
+  // The stop pass rewrote this meeting's lines from the saved recording.
+  useEffect(() => {
+    if (!meetingId) return;
+    const unlisten = listen<{ meeting_id: string; lines_updated: number }>('meeting-transcript-refined', (event) => {
+      if (event.payload.meeting_id === meetingId) {
+        void refreshLoaded();
+      }
+    });
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, [meetingId, refreshLoaded]);
 
   // Handle transcript loading errors
   useEffect(() => {

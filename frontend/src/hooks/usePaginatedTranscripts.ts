@@ -27,6 +27,8 @@ interface UsePaginatedTranscriptsReturn {
     refetch: () => Promise<void>;
     /** Applies saved speaker names to the loaded lines without reloading. */
     applySpeakerNames: (transcriptIds: string[], name: string | null) => void;
+    /** Re-reads the lines already loaded and replaces them by id, keeping the list and scroll. */
+    refreshLoaded: () => Promise<void>;
 }
 
 /**
@@ -213,6 +215,23 @@ export function usePaginatedTranscripts({
         ));
     }, []);
 
+    const refreshLoaded = useCallback(async () => {
+        const requestId = requestIdRef.current;
+        if (!meetingId || !isCurrentRequest(requestId)) return;
+        try {
+            const response = await invoke<PaginatedTranscriptsResponse>('api_get_meeting_transcripts', {
+                meetingId,
+                limit: Math.max(offsetRef.current, DEFAULT_PAGE_SIZE),
+                offset: 0,
+            });
+            if (!isCurrentRequest(requestId)) return;
+            const fresh = new Map(response.transcripts.map(t => [t.id, t]));
+            setTranscripts(prev => prev.map(t => fresh.get(t.id) ?? t));
+        } catch (err) {
+            console.error('Failed to refresh transcripts:', err);
+        }
+    }, [meetingId, isCurrentRequest]);
+
     // Convert to segments (memoized)
     const segments = useMemo(() =>
         convertTranscriptsToSegments(transcripts),
@@ -233,5 +252,6 @@ export function usePaginatedTranscripts({
         reset,
         refetch,
         applySpeakerNames,
+        refreshLoaded,
     };
 }
