@@ -7,6 +7,7 @@ import { Label } from './ui/label';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
+import { MeetingLanguagePicker } from './MeetingLanguagePicker';
 
 
 export interface TranscriptModelProps {
@@ -102,6 +103,11 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                     <h3 className="text-lg font-semibold text-gray-900">Transcript Settings</h3>
                 </div> */}
                 <div className="space-y-4 pb-6">
+                    <MeetingLanguagePicker
+                        savedProvider={transcriptModelConfig.provider}
+                        shownProvider={uiProvider}
+                        onUseWhisper={() => setUiProvider('localWhisper')}
+                    />
                     <div>
                         <Label className="block text-sm font-medium text-gray-700 mb-1">
                             Transcript Model
