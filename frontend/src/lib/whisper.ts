@@ -244,6 +244,10 @@ export function getModelTagline(modelName: string, speed: ProcessingSpeed, accur
     featureText = 'Balanced quality';
   } else if (baseName === 'tiny') {
     featureText = 'Fastest option';
+  } else if (baseName === 'he-large-v3-turbo') {
+    featureText = 'Tuned for Hebrew';
+  } else if (baseName === 'yi-large-v3-turbo') {
+    featureText = 'Tuned for Yiddish';
   }
 
   // Add quantization note if applicable

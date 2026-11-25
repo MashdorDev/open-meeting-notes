@@ -256,8 +256,9 @@ export function ModelManager({
             duration: 4000
           });
 
-          // Auto-select after download using stable refs
-          if (onModelSelectRef.current) {
+          // Auto-select after download using stable refs. A language-tuned model
+          // waits for the user to pick it, since it forces its own language.
+          if (onModelSelectRef.current && !LANGUAGE_MODEL_NAMES.includes(modelName)) {
             onModelSelectRef.current(modelName);
             if (autoSaveRef.current) {
               saveModelSelection(modelName);
