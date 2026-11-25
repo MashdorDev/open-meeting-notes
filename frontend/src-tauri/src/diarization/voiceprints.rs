@@ -197,6 +197,44 @@ const MAX_PROFILE_LINES: usize = 200;
 pub struct OwnVoiceProfile {
     pub embedding: Vec<f32>,
     pub lines: usize,
+    /// The call-side voices the user marked as theirs. Heard through a
+    /// colleague's mic, the user can sound unlike their own mic, so these
+    /// are compared too, not only the mic voice.
+    #[serde(default)]
+    pub call_voices: Vec<Vec<f32>>,
+}
+
+/// Marked call-side voices kept; the oldest go first.
+const MAX_CALL_VOICES: usize = 20;
+/// A meeting adds at most this many lines' weight to the profile, so one
+/// long meeting does not wash out the rest.
+const MAX_MEETING_LINES: usize = 50;
+
+impl OwnVoiceProfile {
+    /// The profile after the user marks a call-side voice as theirs. The
+    /// first mark starts the profile from that voice.
+    pub fn with_marked_voice(saved: Option<OwnVoiceProfile>, voice: &Voiceprint) -> OwnVoiceProfile {
+        let mut profile = saved.unwrap_or_else(|| OwnVoiceProfile {
+            embedding: voice.embedding.clone(),
+            lines: voice.segments,
+            call_voices: Vec::new(),
+        });
+        profile.call_voices.push(voice.embedding.clone());
+        if profile.call_voices.len() > MAX_CALL_VOICES {
+            profile.call_voices.remove(0);
+        }
+        profile
+    }
+}
+
+/// What call-side voices are compared with to find the user: this
+/// meeting's mic voice (see `own_voice_anchor`) and the marked call voices.
+pub fn own_voice_references(mic: &[Voiceprint], profile: Option<&OwnVoiceProfile>) -> Vec<Vec<f32>> {
+    let mut references: Vec<Vec<f32>> = own_voice_anchor(mic, profile).into_iter().collect();
+    if let Some(profile) = profile {
+        references.extend(profile.call_voices.iter().cloned());
+    }
+    references
 }
 
 /// The mic voice closest to the saved profile, when one is close enough.
@@ -231,7 +269,7 @@ pub fn update_own_profile(mic: &[Voiceprint], profile: Option<&OwnVoiceProfile>)
     let profile = profile?;
     let voice = profile_match(mic, profile)?;
     let old = profile.lines.min(MAX_PROFILE_LINES) as f32;
-    let new = voice.segments as f32;
+    let new = voice.segments.min(MAX_MEETING_LINES) as f32;
     let mut embedding: Vec<f32> = profile
         .embedding
         .iter()
@@ -243,7 +281,11 @@ pub fn update_own_profile(mic: &[Voiceprint], profile: Option<&OwnVoiceProfile>)
         return None;
     }
     embedding.iter_mut().for_each(|x| *x /= norm);
-    Some(OwnVoiceProfile { embedding, lines: (profile.lines + voice.segments).min(MAX_PROFILE_LINES) })
+    Some(OwnVoiceProfile {
+        embedding,
+        lines: (profile.lines + voice.segments).min(MAX_PROFILE_LINES),
+        call_voices: profile.call_voices.clone(),
+    })
 }
 
 pub fn read_own_voice_profile(path: &Path) -> Option<OwnVoiceProfile> {
@@ -408,7 +450,7 @@ mod tests {
 
     #[test]
     fn a_profile_keeps_a_talkative_colleague_from_becoming_the_user() {
-        let profile = OwnVoiceProfile { embedding: vec![1.0, 0.0], lines: 50 };
+        let profile = OwnVoiceProfile { embedding: vec![1.0, 0.0], lines: 50, call_voices: Vec::new() };
         let colleague = mic_voice("Speaker 1", 40, [0.0, 1.0]);
         let user = mic_voice("Speaker 2", 5, [0.8, 0.6]);
         assert_eq!(own_voice_anchor(&[colleague.clone(), user.clone()], Some(&profile)), Some(vec![0.8, 0.6]));
@@ -420,8 +462,23 @@ mod tests {
     }
 
     #[test]
+    fn a_marked_call_voice_counts_even_when_the_mic_voice_matches() {
+        let call = mic_voice("Speaker 2", 6, [0.6, 0.8]);
+        let profile = OwnVoiceProfile::with_marked_voice(None, &call);
+        let user_mic = mic_voice("Speaker 1", 30, [0.8, 0.6]);
+        let references = own_voice_references(&[user_mic.clone()], Some(&profile));
+        assert_eq!(references, vec![vec![0.8, 0.6], vec![0.6, 0.8]]);
+        // Blending the mic voice in keeps the marked call voice.
+        let updated = update_own_profile(&[user_mic], Some(&profile)).unwrap();
+        assert_eq!(updated.call_voices, vec![vec![0.6, 0.8]]);
+        // A second mark adds to the profile rather than replacing it.
+        let again = OwnVoiceProfile::with_marked_voice(Some(updated.clone()), &mic_voice("Speaker 4", 3, [0.0, 1.0]));
+        assert_eq!((again.embedding, again.call_voices.len()), (updated.embedding, 2));
+    }
+
+    #[test]
     fn a_matching_meeting_blends_into_the_profile() {
-        let profile = OwnVoiceProfile { embedding: vec![1.0, 0.0], lines: 10 };
+        let profile = OwnVoiceProfile { embedding: vec![1.0, 0.0], lines: 10, call_voices: Vec::new() };
         let user = mic_voice("Speaker 1", 10, [0.8, 0.6]);
         let updated = update_own_profile(&[user], Some(&profile)).unwrap();
         assert_eq!(updated.lines, 20);

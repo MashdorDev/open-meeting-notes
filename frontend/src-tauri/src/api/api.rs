@@ -1156,7 +1156,7 @@ pub async fn mark_speaker_as_me(
         .join(voiceprints::OWN_VOICE_PROFILE_FILE);
     {
         let _write = voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let profile = voiceprints::OwnVoiceProfile { embedding: voice.embedding, lines: voice.segments };
+        let profile = voiceprints::OwnVoiceProfile::with_marked_voice(voiceprints::read_own_voice_profile(&path), &voice);
         voiceprints::write_own_voice_profile(&path, &profile).map_err(|e| format!("Could not save your voice: {}", e))?;
     }
     let mut tx = pool.begin().await.map_err(|e| format!("Database error: {}", e))?;

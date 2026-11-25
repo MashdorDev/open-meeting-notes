@@ -5,7 +5,7 @@
 
 use super::clustering::{change_windows, cosine_similarity, SpeakerClusterer, CLUSTER_SIMILARITY_THRESHOLD};
 use super::embedding::{EmbeddingError, EmbeddingExtractor};
-use super::voiceprints::{guess_names, own_voice_anchor, update_own_profile, OwnVoiceProfile, VoiceProfile, Voiceprint};
+use super::voiceprints::{guess_names, own_voice_references, update_own_profile, OwnVoiceProfile, VoiceProfile, Voiceprint};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -101,17 +101,19 @@ impl DiarizationSession {
         }
     }
 
-    /// Voices on the call side that sound like the user's mic: the user
-    /// heard through another mic on the call.
+    /// Voices on the call side that sound like the user's mic, or like a
+    /// call voice the user marked as theirs: the user heard through another
+    /// mic on the call.
     pub fn own_voice_labels(&self) -> Vec<String> {
-        let Some(own) = own_voice_anchor(&self.mic_voices.voiceprints(), self.own_profile.as_ref()) else {
+        let references = own_voice_references(&self.mic_voices.voiceprints(), self.own_profile.as_ref());
+        if references.is_empty() {
             return Vec::new();
-        };
+        }
         self.clusterer
             .voiceprints()
             .into_iter()
             .filter(|voice| self.lines.get(&voice.label).copied().unwrap_or(0) >= MIN_LINES_FOR_OWN_VOICE)
-            .filter(|voice| cosine_similarity(&voice.embedding, &own) >= OWN_VOICE_SIMILARITY)
+            .filter(|voice| references.iter().any(|own| cosine_similarity(&voice.embedding, own) >= OWN_VOICE_SIMILARITY))
             .map(|voice| voice.label)
             .collect()
     }
