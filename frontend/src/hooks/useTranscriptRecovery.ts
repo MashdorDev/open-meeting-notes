@@ -176,6 +176,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         duration: (t as any).duration,
         speaker: toTranscriptSpeaker(t.source),
         speaker_label: typeof t.speaker_label === 'string' ? t.speaker_label : undefined,
+        words: Array.isArray(t.words) ? t.words : undefined,
       }));
 
       // 6. Save to backend database using existing save utilities

@@ -14,15 +14,20 @@ interface MeetingAudioPlayerProps {
   onPlayOrSeek: () => void;
 }
 
+/** How far playback moves before the transcript hears of it, while playing. */
+const PLAYHEAD_STEP_SECONDS = 0.05;
+
 /** Plays the meeting's saved recording; renders nothing when none was saved. */
 export function MeetingAudioPlayer({ meetingId, audioRef, onAvailable, onPlayhead, onPlayOrSeek }: MeetingAudioPlayerProps) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [playing, setPlaying] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     setSrc(null);
     setFailed(false);
+    setPlaying(false);
     invoke<string | null>('get_meeting_audio_path', { meetingId })
       .then(path => {
         if (!cancelled && path) setSrc(convertFileSrc(path));
@@ -34,6 +39,24 @@ export function MeetingAudioPlayer({ meetingId, audioRef, onAvailable, onPlayhea
   }, [meetingId]);
 
   useEffect(() => onAvailable(!!src && !failed), [src, failed, onAvailable]);
+
+  // timeupdate fires about four times a second, too coarse to follow single
+  // words, so while playing the position is read every frame instead.
+  useEffect(() => {
+    if (!playing) return;
+    let frame = 0;
+    let sent = -1;
+    const tick = () => {
+      const seconds = audioRef.current?.currentTime;
+      if (seconds !== undefined && Math.abs(seconds - sent) >= PLAYHEAD_STEP_SECONDS) {
+        sent = seconds;
+        onPlayhead(seconds);
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [playing, audioRef, onPlayhead]);
 
   if (!src) return null;
   // Linux WebKitGTK cannot always stream from the asset scheme
@@ -57,7 +80,12 @@ export function MeetingAudioPlayer({ meetingId, audioRef, onAvailable, onPlayhea
         onPlayhead(e.currentTarget.currentTime);
         onPlayOrSeek();
       }}
-      onPlay={onPlayOrSeek}
+      onPlay={() => {
+        setPlaying(true);
+        onPlayOrSeek();
+      }}
+      onPause={() => setPlaying(false)}
+      onEnded={() => setPlaying(false)}
       className="mt-3 w-full h-9"
     />
   );
