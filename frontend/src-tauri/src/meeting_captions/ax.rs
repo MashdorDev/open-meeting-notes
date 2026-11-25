@@ -47,20 +47,25 @@ pub fn run(stop: &AtomicBool) -> Vec<CaptionPiece> {
     }
     // A browser that hangs must not hold up the reader.
     let _ = ax::UiElement::sys_wide().set_messaging_timeout_secs(1.0);
-    let mut exposed = HashMap::new();
-    let pieces = capture(stop, || find_meet_captions(&mut exposed, stop, false), |region| match caption_texts(region, stop) {
+    let mut exposed = Exposures::default();
+    capture(stop, || find_meet_captions(&mut exposed.0, stop, false), |region| match caption_texts(region, stop) {
         Some(texts) => Read::Texts(texts),
         None => Read::Gone,
-    });
-    unexpose(&exposed);
-    pieces
+    })
 }
 
-/// Turns AXEnhancedUserInterface back off where this reader turned it on.
-fn unexpose(exposed: &HashMap<i32, Exposed>) {
-    for (pid, how) in exposed {
-        if *how == Exposed::Enhanced {
-            set_flag(&mut ax::UiElement::with_app_pid(*pid), cf::str!(c"AXEnhancedUserInterface"), false);
+/// The switches asked of each browser. Dropping it, at the end of the
+/// reader or in a panic, turns AXEnhancedUserInterface back off where this
+/// reader turned it on.
+#[derive(Default)]
+struct Exposures(HashMap<i32, Exposed>);
+
+impl Drop for Exposures {
+    fn drop(&mut self) {
+        for (pid, how) in &self.0 {
+            if *how == Exposed::Enhanced {
+                set_flag(&mut ax::UiElement::with_app_pid(*pid), cf::str!(c"AXEnhancedUserInterface"), false);
+            }
         }
     }
 }
@@ -275,8 +280,9 @@ mod live {
         println!("Accessibility permission: {}", ax::is_process_trusted());
         let _ = ax::UiElement::sys_wide().set_messaging_timeout_secs(1.0);
         let stop = AtomicBool::new(false);
-        let mut exposed = HashMap::new();
-        let mut region = find_meet_captions(&mut exposed, &stop, true);
+        let mut exposures = Exposures::default();
+        let exposed = &mut exposures.0;
+        let mut region = find_meet_captions(exposed, &stop, true);
         for _ in 0..2 {
             if region.is_some() {
                 break;
@@ -285,13 +291,10 @@ mod live {
             // second switch is tried only a search interval later.
             std::thread::sleep(search_wait(0));
             println!("searching again");
-            region = find_meet_captions(&mut exposed, &stop, true);
+            region = find_meet_captions(exposed, &stop, true);
         }
         println!("found: {}", region.is_some());
-        let Some(region) = region else {
-            unexpose(&exposed);
-            return;
-        };
+        let Some(region) = region else { return };
         for _ in 0..43 {
             let texts = caption_texts(&region, &stop);
             println!("texts: {:?}", texts);
@@ -300,6 +303,5 @@ mod live {
             }
             std::thread::sleep(Duration::from_millis(700));
         }
-        unexpose(&exposed);
     }
 }

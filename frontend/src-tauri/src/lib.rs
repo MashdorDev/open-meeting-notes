@@ -982,6 +982,10 @@ pub fn run() {
                 tauri::RunEvent::Exit => {
                     log::info!("Application exiting, cleaning up resources...");
                     tauri::async_runtime::block_on(async {
+                        // Ends a caption reader still running, which undoes the
+                        // accessibility switch it may have set on a browser.
+                        crate::meeting_captions::stop().await;
+
                         // Clean up database connection and checkpoint WAL
                         if let Some(app_state) = _app_handle.try_state::<state::AppState>() {
                             log::info!("Starting database cleanup...");
