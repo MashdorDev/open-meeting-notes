@@ -727,7 +727,11 @@ impl ParakeetEngine {
         tokio::select! {
             biased;
             _ = active_download.cancellation.cancelled() => Err(DownloadCancelled.into()),
-            response = request.send() => response
+            // The client has no whole-request timeout (a 2.4 GB file on a slow
+            // line takes hours), so the wait for headers is bounded here and
+            // the body loop stops after 30 s without data.
+            response = timeout(Duration::from_secs(60), request.send()) => response
+                .map_err(|_| anyhow!("Failed to start download for {}: no response in 60 seconds", file_url))?
                 .map_err(|error| anyhow!("Failed to start download for {}: {}", file_url, error)),
         }
     }
@@ -889,7 +893,6 @@ impl ParakeetEngine {
             .user_agent(concat!("OpenMeetingNotes/", env!("CARGO_PKG_VERSION")))
             .tcp_nodelay(true)
             .pool_max_idle_per_host(1)
-            .timeout(Duration::from_secs(3600))
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| anyhow!("Failed to create HTTP client: {}", error))?;
