@@ -1,8 +1,8 @@
 //! The stop pass: once a recording is saved, transcribe the whole recording
 //! again in the background with Parakeet and put the new words on the lines
 //! the live pass made. Lines keep their times, speaker, label and name; the
-//! live text is kept in `live_text` so it can be restored. Any failure leaves
-//! the live text as it was.
+//! live text and word times are kept in `live_text` and `live_words` so they
+//! can be restored. Any failure leaves the live text as it was.
 
 use super::decoder::decode_audio_file;
 use super::retranscription::{
@@ -200,8 +200,8 @@ async fn load_model(dir: PathBuf, quantized: bool) -> Result<ParakeetModel> {
 }
 
 /// Writes the new words onto the meeting's lines in one transaction. Lines
-/// that get no words keep their live text; `live_text` keeps the first live
-/// text, so running again never loses it.
+/// that get no words keep their live text; `live_text` and `live_words` keep
+/// the first live version, so running again never loses it.
 async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) -> Result<usize> {
     let mut tx = pool.begin().await?;
     let lines: Vec<(String, f64, f64)> = sqlx::query_as(
@@ -220,8 +220,12 @@ async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) 
             continue;
         }
         let text = line_words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        // live_words is keyed on live_text, not on itself: live words can be
+        // NULL, and a later run must not store its own words as the live ones.
         sqlx::query(
-            "UPDATE transcripts SET live_text = COALESCE(live_text, transcript), transcript = ?, words = ?
+            "UPDATE transcripts SET live_text = COALESCE(live_text, transcript),
+                 live_words = CASE WHEN live_text IS NULL THEN words ELSE live_words END,
+                 transcript = ?, words = ?
              WHERE id = ?",
         )
         .bind(text)

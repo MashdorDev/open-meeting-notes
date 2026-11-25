@@ -38,6 +38,7 @@ impl DatabaseManager {
         ensure_transcripts_column(&pool, "speaker_name_pinned", "INTEGER").await?;
         ensure_transcripts_column(&pool, "words", "TEXT").await?;
         ensure_transcripts_column(&pool, "live_text", "TEXT").await?;
+        ensure_transcripts_column(&pool, "live_words", "TEXT").await?;
         ensure_voice_samples_table(&pool).await?;
 
         Ok(DatabaseManager { pool })
@@ -218,8 +219,9 @@ impl DatabaseManager {
 /// or voice, kept apart from the automatic label so the two can be compared)
 /// and `speaker_name_pinned` (1 when the name was given to that line alone,
 /// so naming the whole voice leaves it), `words` (JSON word times for
-/// read-along) and `live_text` (the live pass's text of a line the stop pass
-/// rewrote, so it can be restored). Added here rather than as
+/// read-along), `live_text` (the live pass's text of a line the stop pass
+/// rewrote, so it can be restored) and `live_words` (the live word times of
+/// that line, NULL when the live pass had none). Added here rather than as
 /// migrations: an applied migration that a build does not know makes that
 /// build refuse to open the database. Only ever called with literals.
 async fn ensure_transcripts_column(pool: &SqlitePool, column: &str, sql_type: &str) -> Result<()> {
