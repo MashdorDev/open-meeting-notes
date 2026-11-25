@@ -10,7 +10,8 @@ import {
   ParakeetModelInfo,
   formatFileSize,
   getModelDisplayInfo,
-  getModelDisplayName
+  getModelDisplayName,
+  isAfterRecordingModel
 } from '../lib/parakeet';
 
 interface ParakeetModelManagerProps {
@@ -37,11 +38,13 @@ export function ParakeetModelManager({
   // Refs for stable callbacks
   const onModelSelectRef = useRef(onModelSelect);
   const autoSaveRef = useRef(autoSave);
+  const modelsRef = useRef(models);
 
   useEffect(() => {
     onModelSelectRef.current = onModelSelect;
     autoSaveRef.current = autoSave;
-  }, [onModelSelect, autoSave]);
+    modelsRef.current = models;
+  }, [onModelSelect, autoSave, models]);
 
   // Progress throttle map to prevent rapid updates
   const progressThrottleRef = useRef<Map<string, { progress: number; timestamp: number }>>(new Map());
@@ -174,8 +177,10 @@ export function ParakeetModelManager({
               duration: 4000
             });
 
-            // Auto-select after download using stable refs
-            if (onModelSelectRef.current) {
+            // Auto-select after download using stable refs. The full-precision
+            // model is not a live choice, so it is never selected.
+            const downloaded = modelsRef.current.find(model => model.name === modelName);
+            if (onModelSelectRef.current && !(downloaded && isAfterRecordingModel(downloaded))) {
               onModelSelectRef.current(modelName);
               if (autoSaveRef.current) {
                 saveModelSelection(modelName);
@@ -434,7 +439,7 @@ export function ParakeetModelManager({
               isSelected={selectedModel === model.name}
               isRecommended={false}
               onSelect={() => {
-                if (model.status === 'Available') {
+                if (model.status === 'Available' && !isAfterRecordingModel(model)) {
                   selectModel(model.name);
                 }
               }}
@@ -493,6 +498,8 @@ function ModelCard({
   const tagline = displayInfo?.tagline || model.description || '';
 
   const isAvailable = model.status === 'Available';
+  const afterRecording = isAfterRecordingModel(model);
+  const isSelectable = isAvailable && !afterRecording;
   const isMissing = model.status === 'Missing';
   const isError = typeof model.status === 'object' && 'Error' in model.status;
   const isCorrupted = typeof model.status === 'object' && 'Corrupted' in model.status;
@@ -511,16 +518,16 @@ function ModelCard({
       onMouseLeave={() => setIsHovered(false)}
       className={`
         relative rounded-lg border-2 transition-all cursor-pointer
-        ${isSelected && isAvailable
+        ${isSelected && isSelectable
           ? 'border-blue-500 bg-blue-50'
-          : isAvailable
+          : isSelectable
             ? 'border-gray-200 hover:border-gray-300 bg-white'
             : 'border-gray-200 bg-gray-50'
         }
-        ${isAvailable ? '' : 'cursor-default'}
+        ${isSelectable ? '' : 'cursor-default'}
       `}
       onClick={() => {
-        if (isAvailable) onSelect();
+        if (isSelectable) onSelect();
       }}
     >
       {/* Recommended Badge */}
@@ -537,7 +544,12 @@ function ModelCard({
             <div className="flex items-center gap-2 mb-1">
               <span className="text-2xl">{icon}</span>
               <h3 className="font-semibold text-gray-900">{displayName}</h3>
-              {isSelected && isAvailable && (
+              {afterRecording && (
+                <span className="bg-gray-200 text-gray-700 px-2 py-0.5 rounded-full text-xs font-medium">
+                  Used after each recording
+                </span>
+              )}
+              {isSelected && isSelectable && (
                 <motion.span
                   initial={{ scale: 0 }}
                   animate={{ scale: 1 }}
