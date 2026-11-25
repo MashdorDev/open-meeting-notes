@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+mod ax;
 #[cfg(windows)]
 mod uia;
 
@@ -208,11 +210,14 @@ static RUNNING: Mutex<Option<Reader>> = Mutex::new(None);
 /// Starts reading captions for a new recording.
 pub fn start() {
     set_paused(false);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag = stop_flag.clone();
+        #[cfg(windows)]
         let handle = std::thread::spawn(move || uia::run(&flag));
+        #[cfg(target_os = "macos")]
+        let handle = std::thread::spawn(move || ax::run(&flag));
         let previous = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).replace((stop_flag, handle));
         // A reader left over from a recording that never stopped: let it
         // finish on its own rather than wait for it here.
@@ -222,9 +227,9 @@ pub fn start() {
     }
 }
 
-/// Stops reading and hands back what was captured (nothing off Windows).
-/// The reader may be in the middle of a slow read, so it is waited for
-/// off the async runtime's threads.
+/// Stops reading and hands back what was captured (nothing off Windows and
+/// macOS). The reader may be in the middle of a slow read, so it is waited
+/// for off the async runtime's threads.
 pub async fn stop() -> Vec<CaptionPiece> {
     let running = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).take();
     let Some((flag, handle)) = running else { return Vec::new() };
@@ -239,13 +244,13 @@ pub async fn stop() -> Vec<CaptionPiece> {
 }
 
 /// Captions show up within a second of the words; a read takes a few ms.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const READ_EVERY: Duration = Duration::from_millis(700);
 
 /// How long to wait before looking for the caption region again. The
 /// search walks browser windows, so after a minute without captions it is
 /// done less often.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn search_wait(misses: u32) -> Duration {
     match misses {
         0..=12 => Duration::from_secs(5),
@@ -258,7 +263,7 @@ fn search_wait(misses: u32) -> Duration {
 /// `find`, reads its texts with `read` (None once it is gone) and logs the
 /// new text against recording time, which is wall time minus pauses, like
 /// the audio's timestamps.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn capture<R>(
     stop: &AtomicBool,
     mut find: impl FnMut() -> Option<R>,
