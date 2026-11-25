@@ -17,16 +17,20 @@ pub struct TranscriptWord {
 const LAST_WORD_MAX_SECONDS: f64 = 0.6;
 
 /// Groups Parakeet's word pieces into words. A piece that starts with a space
-/// begins a word, except punctuation, which joins the word before it. Each
-/// word ends where the next one starts.
+/// begins a word; punctuation comes without one and joins the word before.
+/// Digits have no spaced pieces, so a number arrives as a bare space piece
+/// and then its digits. Each word ends where the next one starts.
 pub fn words_from_pieces(pieces: &[String], starts: &[f32], chunk_seconds: f64) -> Vec<TranscriptWord> {
     let mut words: Vec<TranscriptWord> = Vec::new();
+    let mut after_space = false;
     for (piece, &start) in pieces.iter().zip(starts) {
+        if piece == " " {
+            after_space = true;
+            continue;
+        }
         let start = start as f64;
-        let begins_word = piece
-            .strip_prefix(' ')
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(char::is_alphanumeric);
+        let begins_word = after_space || piece.starts_with(' ');
+        after_space = false;
         match words.last_mut() {
             Some(word) if !begins_word => word.text.push_str(piece.trim_start()),
             _ => {
@@ -85,7 +89,7 @@ mod tests {
     #[test]
     fn joins_pieces_and_punctuation_into_words() {
         let words = words_from_pieces(
-            &pieces(&[" Hel", "lo", " there", " ,", " Ben", "'s", " ."]),
+            &pieces(&[" Hel", "lo", " there", ",", " Ben", "'s", "."]),
             &[0.0, 0.16, 0.4, 0.64, 0.8, 1.04, 1.2],
             3.0,
         );
@@ -104,8 +108,20 @@ mod tests {
     }
 
     #[test]
+    fn numbers_and_spaced_symbols_start_their_own_words() {
+        let words = words_from_pieces(
+            &pieces(&[" it", " costs", " ", "1", "9", " dollars", " \u{bf}", "Qu", "\u{e9}", "?"]),
+            &[0.0, 0.2, 0.5, 0.5, 0.6, 0.8, 1.2, 1.2, 1.3, 1.4],
+            2.0,
+        );
+        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, ["it", "costs", "19", "dollars", "\u{bf}Qu\u{e9}?"]);
+        assert_eq!(words[2].start, 0.5);
+    }
+
+    #[test]
     fn leading_punctuation_does_not_drop_or_crash() {
-        let words = words_from_pieces(&pieces(&[" .", " ok"]), &[0.0, 0.2], 1.0);
+        let words = words_from_pieces(&pieces(&[".", " ok"]), &[0.0, 0.2], 1.0);
         let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(texts, [".", "ok"]);
     }

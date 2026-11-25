@@ -96,6 +96,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     othersLabel,
     isStreaming,
     showConfidence,
+    segment,
     onEditSpeaker,
     isActive,
     onSeek,
@@ -118,7 +119,9 @@ const TranscriptSegment = memo(function TranscriptSegment({
     othersLabel?: string;
     isStreaming: boolean;
     showConfidence: boolean;
-    onEditSpeaker?: () => void;
+    /** The row's own data, handed back to onEditSpeaker. */
+    segment: TranscriptSegmentData;
+    onEditSpeaker?: (segment: TranscriptSegmentData) => void;
     isActive: boolean;
     onSeek?: (seconds: number) => void;
 }) {
@@ -138,7 +141,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
             {label && (speaker === 'system' && onEditSpeaker ? (
                 <button
                     type="button"
-                    onClick={onEditSpeaker}
+                    onClick={() => onEditSpeaker(segment)}
                     title={isGuess ? 'Recognized from earlier meetings. Click to confirm or correct' : 'Name this speaker'}
                     className={`font-semibold mr-1 rounded hover:underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${label.className}`}
                 >
@@ -447,7 +450,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speakerName={segment.speakerName}
                                         speakerGuess={segment.speakerLabel ? speakerGuesses?.[segment.speakerLabel] : undefined}
                                         othersLabel={othersLabel}
-                                        onEditSpeaker={onEditSpeaker ? () => onEditSpeaker(segment) : undefined}
+                                        segment={segment}
+                                        onEditSpeaker={onEditSpeaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         isActive={segment.id === activeSegmentId}
@@ -514,7 +518,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speakerName={segment.speakerName}
                                         speakerGuess={segment.speakerLabel ? speakerGuesses?.[segment.speakerLabel] : undefined}
                                         othersLabel={othersLabel}
-                                        onEditSpeaker={onEditSpeaker ? () => onEditSpeaker(segment) : undefined}
+                                        segment={segment}
+                                        onEditSpeaker={onEditSpeaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         isActive={segment.id === activeSegmentId}

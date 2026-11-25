@@ -332,8 +332,9 @@ impl RecordingSaver {
             "total_segments": segments_clone.len()
         });
 
-        // Serialize to pretty JSON string
-        let json_string = serde_json::to_string_pretty(&json)
+        // Compact: the whole file is rewritten on every new line, and word
+        // times would make a pretty-printed file several times larger.
+        let json_string = serde_json::to_string(&json)
             .map_err(|e| {
                 error!("Failed to serialize transcripts to JSON: {}", e);
                 anyhow::anyhow!("JSON serialization failed: {}", e)

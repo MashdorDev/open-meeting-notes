@@ -385,6 +385,8 @@ async fn run_retranscription<R: Runtime>(
 
     // Process each speech segment with progress updates
     let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
+    // Word times for each entry of all_transcripts, in the same order.
+    let mut all_words: Vec<Vec<crate::audio::transcription::words::TranscriptWord>> = Vec::new();
     let mut total_confidence = 0.0f32;
 
     for (i, segment) in processable_segments.iter().enumerate() {
@@ -416,20 +418,20 @@ async fn run_retranscription<R: Runtime>(
         }
 
         // Transcribe this segment
-        let (text, conf) = if use_parakeet {
+        let (text, conf, words) = if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
+            let (text, words) = engine
+                .transcribe_audio_with_words(segment.samples.clone())
                 .await
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
+            (text, 0.9f32, words)
         } else {
             let engine = whisper_engine.as_ref().unwrap();
             let (text, conf, _) = engine
                 .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
+            (text, conf, Vec::new())
         };
 
         // Skip empty transcripts
@@ -441,6 +443,7 @@ async fn run_retranscription<R: Runtime>(
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
             all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+            all_words.push(crate::audio::transcription::words::shift_words(words, segment.start_timestamp_ms / 1000.0));
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -467,7 +470,10 @@ async fn run_retranscription<R: Runtime>(
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
     // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
+    let mut segments = create_transcript_segments(&all_transcripts);
+    for (segment, words) in segments.iter_mut().zip(all_words) {
+        segment.words = words;
+    }
 
     // Save to database
     let app_state = app
@@ -538,8 +544,8 @@ async fn run_retranscription<R: Runtime>(
             None => (None, 0),
         };
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, speaker_label, speaker_name, speaker_name_pinned)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, speaker_label, speaker_name, speaker_name_pinned, words)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -552,6 +558,7 @@ async fn run_retranscription<R: Runtime>(
         .bind(speaker_label)
         .bind(speaker_name)
         .bind(speaker_name_pinned)
+        .bind(crate::audio::transcription::words::words_to_json(&segment.words))
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
