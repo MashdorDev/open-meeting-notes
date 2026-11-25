@@ -11,7 +11,8 @@ import {
   getModelPerformanceBadge,
   isQuantizedModel,
   getModelTagline,
-  WhisperAPI
+  WhisperAPI,
+  LANGUAGE_MODEL_NAMES,
 } from '../lib/whisper';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
 
@@ -448,11 +449,13 @@ export function ModelManager({
       "medium-q5_0": "Medium",
       "large-v3-q5_0": "Large V3 Compressed",
       "large-v3-turbo": "Large V3 Turbo",
-      "large-v3": "Large V3"
+      "large-v3": "Large V3",
+      "he-large-v3-turbo": "Hebrew (ivrit.ai)",
+      "yi-large-v3-turbo": "Yiddish (ivrit.ai)"
     };
 
-    const basicModelNames = ["small", "medium-q5_0", "large-v3-q5_0", "large-v3-turbo", "large-v3"];
-    if (basicModelNames.includes(modelName)) {
+    const namedModels = ["small", "medium-q5_0", "large-v3-q5_0", "large-v3-turbo", "large-v3", ...LANGUAGE_MODEL_NAMES];
+    if (namedModels.includes(modelName)) {
       return modelNameMapping[modelName] || modelName;
     }
     return `Whisper ${modelName}`;
@@ -482,7 +485,28 @@ export function ModelManager({
   const basicModelNames = ["small", "medium-q5_0", "large-v3-q5_0", "large-v3-turbo", "large-v3"];
   const basicModels = models.filter(m => basicModelNames.includes(m.name))
     .sort((a, b) => basicModelNames.indexOf(a.name) - basicModelNames.indexOf(b.name));
-  const advancedModels = models.filter(m => !basicModelNames.includes(m.name));
+  const languageModels = models.filter(m => LANGUAGE_MODEL_NAMES.includes(m.name))
+    .sort((a, b) => LANGUAGE_MODEL_NAMES.indexOf(a.name) - LANGUAGE_MODEL_NAMES.indexOf(b.name));
+  const advancedModels = models.filter(m => !basicModelNames.includes(m.name) && !LANGUAGE_MODEL_NAMES.includes(m.name));
+  const renderCard = (model: ModelInfo) => (
+    <ModelCard
+      key={model.name}
+      model={model}
+      isSelected={selectedModel === model.name}
+      isRecommended={false}
+      onSelect={() => {
+        if (model.status === 'Available') {
+          selectModel(model.name);
+        }
+      }}
+      onDownload={() => downloadModel(model.name)}
+      onCancel={() => cancelDownload(model.name)}
+      onDelete={() => deleteModel(model.name)}
+      isDownloading={downloadingModels.has(model.name)}
+      isCancelling={cancellingModels.has(model.name)}
+      displayName={getDisplayName(model.name)}
+    />
+  );
 
   return (
     <div className={`space-y-3 ${className}`}>
@@ -511,6 +535,25 @@ export function ModelManager({
           );
         })}
       </div>
+
+      {/* Language-tuned models: better for one language, always run in it */}
+      {languageModels.length > 0 && (
+        <Accordion type="single" collapsible className="w-full">
+          <AccordionItem value="language-models">
+            <AccordionTrigger>
+              <span className='text-lg'>Language-tuned Models</span>
+            </AccordionTrigger>
+            <AccordionContent>
+              <p className="text-xs text-gray-500 pt-2">
+                Tuned for one language. They always transcribe in that language, whatever the language setting says.
+              </p>
+              <div className="space-y-3 pt-3">
+                {languageModels.map(renderCard)}
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+      )}
 
       {/* Advanced Models */}
       {advancedModels.length > 0 && (

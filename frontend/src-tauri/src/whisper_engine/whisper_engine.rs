@@ -380,6 +380,21 @@ impl WhisperEngine {
         unloaded
     }
 
+    /// A language-tuned model always runs in its own language, whatever the
+    /// user's language setting says.
+    async fn effective_language(&self, language: Option<String>) -> Option<String> {
+        let forced = self
+            .current_model
+            .read()
+            .await
+            .as_deref()
+            .and_then(crate::config::whisper_model_language);
+        match forced {
+            Some(lang) => Some(lang.to_string()),
+            None => language,
+        }
+    }
+
     pub async fn get_current_model(&self) -> Option<String> {
         self.current_model.read().await.clone()
     }
@@ -543,6 +558,8 @@ impl WhisperEngine {
     
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+        // Released before the context lock is taken, so the two locks are never held together.
+        let language = self.effective_language(language).await;
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -664,6 +681,8 @@ impl WhisperEngine {
         audio_data: Vec<f32>,
         language: Option<String>,
     ) -> Result<String> {
+        // Released before the context lock is taken, so the two locks are never held together.
+        let language = self.effective_language(language).await;
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock
             .as_ref()
@@ -968,6 +987,8 @@ impl WhisperEngine {
             "medium-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin",
             "large-v3-turbo-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
             "large-v3-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
+            "he-large-v3-turbo" => "https://huggingface.co/ivrit-ai/whisper-large-v3-turbo-ggml/resolve/main/ggml-model.bin",
+            "yi-large-v3-turbo" => "https://huggingface.co/ivrit-ai/yi-whisper-large-v3-turbo-ggml/resolve/main/ggml-model.bin",
             _ => return Err(anyhow!("Unsupported model: {}", model_name)),
         };
 
