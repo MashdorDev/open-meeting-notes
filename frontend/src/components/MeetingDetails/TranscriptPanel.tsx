@@ -129,6 +129,7 @@ export function TranscriptPanel({
       speaker: t.speaker,
       speakerLabel: t.speaker_label,
       speakerName: t.speaker_name,
+      words: t.words,
     }));
   }, [transcripts, usePagination, segments]);
 
@@ -222,6 +223,7 @@ export function TranscriptPanel({
           speakerGuesses={speakerGuesses}
           onEditSpeaker={meetingId && !isRecording ? setSpeakerToName : undefined}
           activeSegmentId={activeSegmentId}
+          playhead={playhead ?? undefined}
           onSeek={hasAudio && !isRecording ? seekTo : undefined}
           followKey={followKey}
           disableAutoScroll={disableAutoScroll}

@@ -6,6 +6,13 @@ export function toTranscriptSpeaker(source?: string): TranscriptSpeaker | undefi
   return source === 'mic' || source === 'system' ? source : undefined;
 }
 
+/** One spoken word and when it was said, in seconds from the recording start. */
+export interface TranscriptWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
 export interface Message {
   id: string;
   content: string;
@@ -29,6 +36,8 @@ export interface Transcript {
   speaker_label?: string;
   /** The name Dor gave this line or its voice. */
   speaker_name?: string;
+  /** Word times from the engine; absent for older meetings and Whisper. */
+  words?: TranscriptWord[];
 }
 
 export interface TranscriptUpdate {
@@ -44,6 +53,7 @@ export interface TranscriptUpdate {
   audio_end_time: number;   // Seconds from recording start
   duration: number;          // Segment duration in seconds
   speaker_label?: string;
+  words?: TranscriptWord[];
 }
 
 export interface Block {
@@ -158,4 +168,5 @@ export interface TranscriptSegmentData {
   speaker?: TranscriptSpeaker;
   speakerLabel?: string;
   speakerName?: string;
+  words?: TranscriptWord[];
 }

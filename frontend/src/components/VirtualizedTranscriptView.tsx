@@ -8,7 +8,8 @@ import { ConfidenceIndicator } from "./ConfidenceIndicator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
-import { TranscriptSegmentData, TranscriptSpeaker } from "@/types";
+import { TranscriptSegmentData, TranscriptSpeaker, TranscriptWord } from "@/types";
+import { timeWords, wordAt } from "@/lib/word-times";
 
 const SPEAKER_LABELS: Record<TranscriptSpeaker, { text: string; className: string }> = {
     mic: { text: "Me", className: "text-blue-600" },
@@ -40,6 +41,8 @@ export interface VirtualizedTranscriptViewProps {
     disableAutoScroll?: boolean;
     /** The line the recording is playing, lit and kept in view. */
     activeSegmentId?: string;
+    /** The playback position, to light the word being said on the active line. */
+    playhead?: number;
     /** Plays the recording from a line's time; without it times are plain text. */
     onSeek?: (seconds: number) => void;
     /** Changes on each play or seek: following resumes after a manual scroll. */
@@ -93,12 +96,20 @@ const TranscriptSegment = memo(function TranscriptSegment({
     othersLabel,
     isStreaming,
     showConfidence,
+    segment,
     onEditSpeaker,
     isActive,
     onSeek,
+    endTime,
+    words,
+    playhead,
 }: {
     id: string;
     timestamp: number;
+    endTime?: number;
+    words?: TranscriptWord[];
+    /** Set on the active line only, so the other lines skip re-rendering. */
+    playhead?: number;
     text: string;
     confidence?: number;
     speaker?: TranscriptSpeaker;
@@ -108,11 +119,18 @@ const TranscriptSegment = memo(function TranscriptSegment({
     othersLabel?: string;
     isStreaming: boolean;
     showConfidence: boolean;
-    onEditSpeaker?: () => void;
+    /** The row's own data, handed back to onEditSpeaker. */
+    segment: TranscriptSegmentData;
+    onEditSpeaker?: (segment: TranscriptSegmentData) => void;
     isActive: boolean;
     onSeek?: (seconds: number) => void;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const timedWords = useMemo(
+        () => (isActive ? timeWords(displayText, timestamp, endTime ?? timestamp, words) : undefined),
+        [isActive, displayText, timestamp, endTime, words],
+    );
+    const spoken = timedWords && playhead !== undefined ? wordAt(timedWords, playhead) : -1;
     const label = speaker ? SPEAKER_LABELS[speaker] : undefined;
     // A name given by hand beats a name recognized from earlier meetings,
     // which beats the bare voice label.
@@ -123,7 +141,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
             {label && (speaker === 'system' && onEditSpeaker ? (
                 <button
                     type="button"
-                    onClick={onEditSpeaker}
+                    onClick={() => onEditSpeaker(segment)}
                     title={isGuess ? 'Recognized from earlier meetings. Click to confirm or correct' : 'Name this speaker'}
                     className={`font-semibold mr-1 rounded hover:underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${label.className}`}
                 >
@@ -137,7 +155,11 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     {labelText}:
                 </span>
             ))}
-            {displayText}
+            {timedWords ? timedWords.map((word, i) => (
+                <span key={i} className={i === spoken ? 'rounded-sm bg-amber-300' : undefined}>
+                    {i > 0 && ' '}{word.text}
+                </span>
+            )) : displayText}
         </p>
     );
 
@@ -198,6 +220,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     showConfidence = true,
     disableAutoScroll = false,
     activeSegmentId,
+    playhead,
     onSeek,
     followKey,
     hasMore = false,
@@ -427,11 +450,15 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speakerName={segment.speakerName}
                                         speakerGuess={segment.speakerLabel ? speakerGuesses?.[segment.speakerLabel] : undefined}
                                         othersLabel={othersLabel}
-                                        onEditSpeaker={onEditSpeaker ? () => onEditSpeaker(segment) : undefined}
+                                        segment={segment}
+                                        onEditSpeaker={onEditSpeaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         isActive={segment.id === activeSegmentId}
                                         onSeek={onSeek}
+                                        endTime={segment.endTime}
+                                        words={segment.words}
+                                        playhead={segment.id === activeSegmentId ? playhead : undefined}
                                     />
                                 </div>
                             );
@@ -491,11 +518,15 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speakerName={segment.speakerName}
                                         speakerGuess={segment.speakerLabel ? speakerGuesses?.[segment.speakerLabel] : undefined}
                                         othersLabel={othersLabel}
-                                        onEditSpeaker={onEditSpeaker ? () => onEditSpeaker(segment) : undefined}
+                                        segment={segment}
+                                        onEditSpeaker={onEditSpeaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         isActive={segment.id === activeSegmentId}
                                         onSeek={onSeek}
+                                        endTime={segment.endTime}
+                                        words={segment.words}
+                                        playhead={segment.id === activeSegmentId ? playhead : undefined}
                                     />
                                 </motion.div>
                             );
