@@ -49,6 +49,7 @@ function MeetingDetailsContent() {
     loadMore,
     refetch,
     applySpeakerNames,
+    refreshLoaded,
     error: transcriptError,
   } = usePaginatedTranscripts({ meetingId: meetingId || '' });
 
@@ -150,13 +151,13 @@ function MeetingDetailsContent() {
     if (!meetingId) return;
     const unlisten = listen<{ meeting_id: string; lines_updated: number }>('meeting-transcript-refined', (event) => {
       if (event.payload.meeting_id === meetingId) {
-        void refetch();
+        void refreshLoaded();
       }
     });
     return () => {
       unlisten.then(fn => fn());
     };
-  }, [meetingId, refetch]);
+  }, [meetingId, refreshLoaded]);
 
   // Handle transcript loading errors
   useEffect(() => {
