@@ -366,17 +366,17 @@ pub fn start_transcription_task<R: Runtime>(
 
                                     let sequence_id =
                                         SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                    let mut speaker_label = match system_audio {
+                                    let speaker_label = match system_audio {
                                         Some(samples) => diarization.label(samples).await,
                                         None => None,
                                     };
                                     if let Some(samples) = mic_audio {
                                         diarization.learn_own_voice(samples).await;
                                     }
+                                    // The line keeps its voice label, so the check
+                                    // at stop can move it back if that voice turns
+                                    // out not to be the user.
                                     let own_voice = speaker_label.as_deref().is_some_and(|l| diarization.is_own_voice(l));
-                                    if own_voice {
-                                        speaker_label = None;
-                                    }
                                     if speaker_label.is_some() {
                                         let guesses = diarization.guesses();
                                         if guesses != sent_guesses {

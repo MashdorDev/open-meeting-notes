@@ -1034,10 +1034,7 @@ pub async fn api_save_transcript<R: Runtime>(
             if let Some(target) = segment.speaker_label.as_ref().and_then(|l| folds.get(l)) {
                 segment.speaker_label = target.clone();
             }
-            if segment.speaker_label.as_ref().is_some_and(|l| own_voice.contains(l)) {
-                segment.speaker = Some("mic".to_string());
-                segment.speaker_label = None;
-            }
+            crate::audio::recording_saver::settle_own_voice(&mut segment.speaker, &mut segment.speaker_label, &own_voice);
         }
     }
 

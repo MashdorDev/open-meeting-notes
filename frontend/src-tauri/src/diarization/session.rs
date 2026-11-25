@@ -50,9 +50,9 @@ pub struct DiarizationSession {
     /// Lines given each label, including those after Stop while the queue
     /// drains, which the recording saver no longer receives.
     lines: HashMap<String, usize>,
-    /// Sum of the user's mic line embeddings, and how many went in.
-    own_voice: Vec<f32>,
-    own_voice_lines: usize,
+    /// Voices on the user's mic. Someone in the room can be heard there
+    /// too, so the user is the voice with the most mic lines.
+    mic_voices: SpeakerClusterer,
 }
 
 /// The voices of one recording at its end.
@@ -70,8 +70,7 @@ impl DiarizationSession {
             clusterer: SpeakerClusterer::new(),
             profiles,
             lines: HashMap::new(),
-            own_voice: Vec::new(),
-            own_voice_lines: 0,
+            mic_voices: SpeakerClusterer::new(),
         })
     }
 
@@ -82,13 +81,7 @@ impl DiarizationSession {
         }
         match self.extractor.compute(mic_16k) {
             Ok(embedding) => {
-                if self.own_voice.is_empty() {
-                    self.own_voice = vec![0.0; embedding.len()];
-                }
-                for (sum, value) in self.own_voice.iter_mut().zip(&embedding) {
-                    *sum += value;
-                }
-                self.own_voice_lines += 1;
+                self.mic_voices.assign(&embedding);
             }
             Err(e) => log::warn!("Could not learn the user's voice from a mic line: {}", e),
         }
@@ -97,14 +90,16 @@ impl DiarizationSession {
     /// Voices on the call side that sound like the user's mic: the user
     /// heard through another mic on the call.
     pub fn own_voice_labels(&self) -> Vec<String> {
-        if self.own_voice_lines < MIN_LINES_FOR_OWN_VOICE {
+        let Some(own) = self
+            .mic_voices
+            .voiceprints()
+            .into_iter()
+            .max_by_key(|voice| voice.segments)
+            .filter(|voice| voice.segments >= MIN_LINES_FOR_OWN_VOICE)
+            .map(|voice| voice.embedding)
+        else {
             return Vec::new();
-        }
-        let norm = self.own_voice.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if norm == 0.0 {
-            return Vec::new();
-        }
-        let own: Vec<f32> = self.own_voice.iter().map(|v| v / norm).collect();
+        };
         self.clusterer
             .voiceprints()
             .into_iter()

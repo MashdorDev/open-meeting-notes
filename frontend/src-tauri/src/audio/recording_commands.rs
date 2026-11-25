@@ -1267,11 +1267,12 @@ async fn stop_recording_for_session<R: Runtime>(
                 Ok(()) => info!("Saved {} speaker voiceprints with the meeting", voiceprints.len()),
                 Err(e) => warn!("Failed to save speaker voiceprints: {}", e),
             }
-            if !folds.is_empty() {
-                match crate::diarization::voiceprints::write_folds(folder, &folds) {
-                    Ok(()) => info!("Folded {} one-line voices into the others", folds.len()),
-                    Err(e) => warn!("Failed to save speaker folds: {}", e),
-                }
+        }
+        // Even when no voice was kept: the folds may point at the user's.
+        if let (Some(folder), false) = (&meeting_folder, folds.is_empty()) {
+            match crate::diarization::voiceprints::write_folds(folder, &folds) {
+                Ok(()) => info!("Folded {} one-line voices into the others", folds.len()),
+                Err(e) => warn!("Failed to save speaker folds: {}", e),
             }
         }
 
