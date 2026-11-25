@@ -541,6 +541,16 @@ impl ParakeetEngine {
 
     /// Transcribe audio samples using the loaded Parakeet model
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>) -> Result<String> {
+        Ok(self.transcribe_audio_with_words(audio_data).await?.0)
+    }
+
+    /// Like `transcribe_audio`, with when each word starts and ends within
+    /// the audio (16 kHz).
+    pub async fn transcribe_audio_with_words(
+        &self,
+        audio_data: Vec<f32>,
+    ) -> Result<(String, Vec<crate::audio::transcription::words::TranscriptWord>)> {
+        let seconds = audio_data.len() as f64 / 16_000.0;
         let mut model_guard = self.current_model.write().await;
         let model = model_guard
             .as_mut()
@@ -551,8 +561,8 @@ impl ParakeetEngine {
             .transcribe_samples(audio_data)
             .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
 
-
-        Ok(result.text)
+        let words = crate::audio::transcription::words::words_from_pieces(&result.tokens, &result.timestamps, seconds);
+        Ok((result.text, words))
     }
 
     /// Get the models directory path

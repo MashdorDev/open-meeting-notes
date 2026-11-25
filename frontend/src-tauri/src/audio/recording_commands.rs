@@ -614,6 +614,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     sequence_id: update.sequence_id,
                     speaker: Some(update.source.clone()),
                     speaker_label: update.speaker_label.clone(),
+                    words: update.words.clone(),
                 };
 
                 // Save to recording manager
@@ -831,6 +832,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                     sequence_id: update.sequence_id,
                     speaker: Some(update.source.clone()),
                     speaker_label: update.speaker_label.clone(),
+                    words: update.words.clone(),
                 };
 
                 // Save to recording manager

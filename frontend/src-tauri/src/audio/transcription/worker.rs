@@ -177,6 +177,9 @@ pub struct TranscriptUpdate {
     /// mic and before the diarization model is ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    /// When each word was said, for read-along; empty when the engine gave no times.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<crate::audio::transcription::words::TranscriptWord>,
 }
 
 /// The speaker model's sample rate; segments at any other rate are not split.
@@ -328,7 +331,7 @@ pub fn start_transcription_task<R: Runtime>(
                         stats.record_failure(WorkerFailureCategory::ModelNotLoaded);
                     } else {
                         match transcribe_chunk_with_provider(&engine_clone, chunk, &app_clone).await {
-                            Ok((transcript, confidence_opt, is_partial)) => {
+                            Ok((transcript, confidence_opt, is_partial, words)) => {
                                 if let Some(confidence) = confidence_opt {
                                     stats.confidence_total += confidence as f64;
                                     stats.confidence_count += 1;
@@ -384,6 +387,7 @@ pub fn start_transcription_task<R: Runtime>(
                                         audio_start_time: chunk_timestamp,
                                         audio_end_time: chunk_timestamp + chunk_duration,
                                         duration: chunk_duration,
+                                        words: super::words::shift_words(words, chunk_timestamp),
                                     };
 
                                     if app_clone.emit("transcript-update", &update).is_ok() {
@@ -506,12 +510,12 @@ pub fn start_transcription_task<R: Runtime>(
 }
 
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
-/// Returns: (text, confidence Option, is_partial)
+/// Returns: (text, confidence Option, is_partial, word times within the chunk)
 async fn transcribe_chunk_with_provider<R: Runtime>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     app: &AppHandle<R>,
-) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
+) -> std::result::Result<(String, Option<f32>, bool, Vec<super::words::TranscriptWord>), TranscriptionError> {
     let speech_samples = if chunk.sample_rate != 16000 {
         crate::audio::audio_processing::resample_audio(&chunk.data, chunk.sample_rate, 16000)
     } else {
@@ -533,7 +537,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                 .await
             {
                 Ok((text, confidence, is_partial)) => {
-                    Ok((text.trim().to_string(), Some(confidence), is_partial))
+                    Ok((text.trim().to_string(), Some(confidence), is_partial, Vec::new()))
                 }
                 Err(error) => {
                     let transcription_error = TranscriptionError::EngineFailed(error.to_string());
@@ -551,8 +555,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             }
         }
         TranscriptionEngine::Parakeet(parakeet_engine) => {
-            match parakeet_engine.transcribe_audio(speech_samples).await {
-                Ok(text) => Ok((text.trim().to_string(), None, false)),
+            match parakeet_engine.transcribe_audio_with_words(speech_samples).await {
+                Ok((text, words)) => Ok((text.trim().to_string(), None, false, words)),
                 Err(error) => {
                     let transcription_error = TranscriptionError::EngineFailed(error.to_string());
                     let _ = app.emit(
@@ -575,6 +579,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     result.text.trim().to_string(),
                     result.confidence,
                     result.is_partial,
+                    Vec::new(),
                 )),
                 Err(error) => {
                     let _ = app.emit(

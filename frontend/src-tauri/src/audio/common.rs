@@ -65,6 +65,7 @@ pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> 
                 duration: Some(duration),
                 speaker: None,
                 speaker_label: None,
+                words: Vec::new(),
             }
         })
         .collect()

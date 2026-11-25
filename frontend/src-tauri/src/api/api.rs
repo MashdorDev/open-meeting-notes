@@ -147,6 +147,9 @@ pub struct MeetingTranscript {
     /// The name Dor gave this line or its voice; None until named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_name: Option<String>,
+    /// When each word was said, for read-along; empty when the engine gave no times.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<crate::audio::transcription::words::TranscriptWord>,
 }
 
 /// Meeting metadata without transcripts (for pagination)
@@ -204,6 +207,9 @@ pub struct TranscriptSegment {
     /// Which voice on the other side ("Speaker 2"); None for the mic and old rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    /// When each word was said, for read-along; empty when the engine gave no times.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<crate::audio::transcription::words::TranscriptWord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -945,6 +951,7 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
                     speaker: t.speaker,
                     speaker_label: t.speaker_label,
                     speaker_name: t.speaker_name,
+                    words: crate::audio::transcription::words::words_from_json(t.words.as_deref()),
                 })
                 .collect::<Vec<_>>();
 

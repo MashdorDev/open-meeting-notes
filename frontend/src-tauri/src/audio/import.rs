@@ -1204,6 +1204,7 @@ mod tests {
                 duration: Some(1.5),
                 speaker: None,
                 speaker_label: None,
+                words: Vec::new(),
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1214,6 +1215,7 @@ mod tests {
                 duration: Some(1.5),
                 speaker: None,
                 speaker_label: None,
+                words: Vec::new(),
             },
         ];
 

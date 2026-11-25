@@ -95,6 +95,7 @@ impl MeetingsRepository {
                     speaker: t.speaker,
                     speaker_label: t.speaker_label,
                     speaker_name: t.speaker_name,
+                    words: crate::audio::transcription::words::words_from_json(t.words.as_deref()),
                 })
                 .collect::<Vec<_>>();
 

@@ -28,6 +28,9 @@ pub struct TranscriptSegment {
     /// Which voice on the other side ("Speaker 2"); None for the mic and old rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    /// When each word was said, for read-along; empty when the engine gave no times.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<crate::audio::transcription::words::TranscriptWord>,
 }
 
 /// Meeting metadata structure
@@ -156,6 +159,7 @@ impl RecordingSaver {
             sequence_id: 0,
             speaker: None,
             speaker_label: None,
+            words: Vec::new(),
         };
         self.add_transcript_segment(segment);
     }

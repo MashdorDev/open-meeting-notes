@@ -41,6 +41,9 @@ pub struct Transcript {
     /// The name Dor gave this line or its voice; None until named.
     #[sqlx(default)]
     pub speaker_name: Option<String>,
+    /// JSON list of word times; NULL for lines without them.
+    #[sqlx(default)]
+    pub words: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
