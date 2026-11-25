@@ -235,21 +235,19 @@ async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) 
 }
 
 /// Groups words by line, in the order of `spans`. Lines whose spans overlap
-/// another line never get words: the recording is mixed, so a word in the
-/// overlap cannot be given to one voice. A word that starts inside an overlap
-/// is dropped. Any other word goes to the eligible line whose span holds its
+/// another line never get words: the recording is mixed, so a word there
+/// cannot be given to one voice. A word that starts anywhere inside such a
+/// line's span is dropped. Any other word goes to the eligible line whose span holds its
 /// start, else to the nearest eligible line within MAX_WORD_DISTANCE_SECONDS,
 /// else it is dropped. Words keep their order.
 fn assign_words(spans: &[(f64, f64)], words: Vec<TranscriptWord>) -> Vec<Vec<TranscriptWord>> {
     let overlaps = |a: (f64, f64), b: (f64, f64)| (a.0 < b.1 && b.0 < a.1) || a == b;
-    let mut overlapped: Vec<(f64, f64)> = Vec::new();
     let mut eligible = vec![true; spans.len()];
     for i in 0..spans.len() {
         for j in i + 1..spans.len() {
             if overlaps(spans[i], spans[j]) {
                 eligible[i] = false;
                 eligible[j] = false;
-                overlapped.push((spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1)));
             }
         }
     }
@@ -257,7 +255,11 @@ fn assign_words(spans: &[(f64, f64)], words: Vec<TranscriptWord>) -> Vec<Vec<Tra
     let mut per_line: Vec<Vec<TranscriptWord>> = vec![Vec::new(); spans.len()];
     for word in words {
         let t = word.start;
-        if overlapped.iter().any(|&(start, end)| start <= t && t <= end) {
+        let in_ineligible = spans
+            .iter()
+            .zip(&eligible)
+            .any(|(&(start, end), &ok)| !ok && start <= t && t <= end);
+        if in_ineligible {
             continue;
         }
         let distance = |&(start, end): &(f64, f64)| (start - t).max(t - end).max(0.0);
