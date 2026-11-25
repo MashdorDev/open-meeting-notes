@@ -143,7 +143,18 @@ pub async fn start_retranscription<R: Runtime>(
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
+    // The command checked the guard before spawning this task, but the stop
+    // pass can take it in between; tell the dialog so it does not spin.
+    let _guard = match RetranscriptionGuard::acquire() {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = app.emit(
+                "retranscription-error",
+                RetranscriptionError { meeting_id: meeting_id.clone(), error: e.to_string() },
+            );
+            return Err(anyhow!(e));
+        }
+    };
 
     // Reset cancellation flag
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
