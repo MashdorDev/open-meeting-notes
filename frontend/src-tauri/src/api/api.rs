@@ -1134,7 +1134,6 @@ pub async fn mark_speaker_as_me(
     meeting_id: String,
     speaker_label: String,
 ) -> Result<Vec<String>, String> {
-    use tauri::Manager;
     use crate::diarization::voiceprints;
     let pool = state.db_manager.pool();
     let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
@@ -1149,16 +1148,7 @@ pub async fn mark_speaker_as_me(
         .into_iter()
         .find(|v| v.label == speaker_label)
         .ok_or_else(|| format!("No saved voice for {}", speaker_label))?;
-    let path = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join(voiceprints::OWN_VOICE_PROFILE_FILE);
-    {
-        let _write = voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let profile = voiceprints::OwnVoiceProfile::with_marked_voice(voiceprints::read_own_voice_profile(&path), &voice);
-        voiceprints::write_own_voice_profile(&path, &profile).map_err(|e| format!("Could not save your voice: {}", e))?;
-    }
+    let path = own_voice_profile_path(&app)?;
     let mut tx = pool.begin().await.map_err(|e| format!("Database error: {}", e))?;
     let moved: Vec<String> = sqlx::query_scalar(
         "UPDATE transcripts SET speaker = 'mic', speaker_label = NULL, speaker_name = NULL, speaker_name_pinned = 0
@@ -1176,9 +1166,48 @@ pub async fn mark_speaker_as_me(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("Database error: {}", e))?;
+    // Saved only once the lines are ready to move, so a failed move leaves
+    // no mark behind (dropping tx rolls the moves back).
+    {
+        let _write = voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let profile = voiceprints::OwnVoiceProfile::with_marked_voice(voiceprints::read_own_voice_profile(&path), &voice);
+        voiceprints::write_own_voice_profile(&path, &profile).map_err(|e| format!("Could not save your voice: {}", e))?;
+    }
     tx.commit().await.map_err(|e| format!("Database error: {}", e))?;
     log_info!("Saved {} as the user's voice ({} lines moved)", speaker_label, moved.len());
     Ok(moved)
+}
+
+fn own_voice_profile_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join(crate::diarization::voiceprints::OWN_VOICE_PROFILE_FILE))
+}
+
+/// How many voices the user has marked as theirs; None when no voice is saved.
+#[tauri::command]
+pub async fn own_voice_status(app: tauri::AppHandle) -> Result<Option<usize>, String> {
+    let path = own_voice_profile_path(&app)?;
+    Ok(crate::diarization::voiceprints::read_own_voice_profile(&path).map(|p| p.call_voices.len().max(1)))
+}
+
+/// Forgets the user's saved voice, to undo a voice marked by mistake. Lines
+/// already moved stay where they are; new meetings start from the mic again.
+#[tauri::command]
+pub async fn forget_own_voice(app: tauri::AppHandle) -> Result<(), String> {
+    let path = own_voice_profile_path(&app)?;
+    let _write = crate::diarization::voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            log_info!("Forgot the user's saved voice");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Could not forget your voice: {}", e)),
+    }
 }
 
 /// Keeps a speaker's voice as a sample of the person it is named after, from

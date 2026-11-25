@@ -22,6 +22,49 @@ interface RecordingSettingsProps {
   onSave?: (preferences: RecordingPreferences) => void;
 }
 
+/** The voice saved from "This is me", with a way to forget a wrong mark. */
+function OwnVoiceSetting() {
+  const [marked, setMarked] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    invoke<number | null>('own_voice_status').then(setMarked).catch(() => setMarked(null));
+  }, []);
+  const forget = async () => {
+    setBusy(true);
+    try {
+      await invoke('forget_own_voice');
+      setMarked(null);
+      toast.success('Your saved voice was forgotten');
+    } catch (error) {
+      toast.error(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="flex items-center justify-between border-t pt-6">
+      <div>
+        <div className="font-medium">Your voice</div>
+        <div className="text-sm text-gray-600">
+          {marked === null
+            ? `Not saved. Use "This is me" on a speaker who is you, heard through someone else's mic.`
+            : `Saved from ${marked} voice${marked === 1 ? '' : 's'} you marked as you. Lines from it show as Me.`}
+        </div>
+      </div>
+      {marked !== null && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void forget()}
+          className="rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-100 disabled:opacity-50"
+        >
+          Forget my voice
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [preferences, setPreferences] = useState<RecordingPreferences>({
     save_folder: '',
@@ -246,6 +289,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           onCheckedChange={handleNotificationToggle}
         />
       </div>
+
+      <OwnVoiceSetting />
 
       {/* Device Preferences */}
       <div className="space-y-4">
