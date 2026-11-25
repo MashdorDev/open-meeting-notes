@@ -281,6 +281,16 @@ pub fn current_guesses() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Drops the own-voice profile from the current recording, after the user
+/// forgot it, so a wrong mark stops counting right away rather than at stop.
+pub fn forget_current_own_profile() {
+    if let Some(live) = CURRENT.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        if let Some(session) = live.session.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            session.set_own_profile(None);
+        }
+    }
+}
+
 /// The diarization session of one recording, shared with the transcription
 /// worker. The model downloads and loads in the background; segments that
 /// arrive before it is ready get no label.

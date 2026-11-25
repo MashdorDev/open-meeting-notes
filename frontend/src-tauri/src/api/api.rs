@@ -1200,6 +1200,7 @@ pub async fn own_voice_status(app: tauri::AppHandle) -> Result<Option<usize>, St
 pub async fn forget_own_voice(app: tauri::AppHandle) -> Result<(), String> {
     let path = own_voice_profile_path(&app)?;
     let _write = crate::diarization::voiceprints::OWN_VOICE_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    crate::diarization::session::forget_current_own_profile();
     match std::fs::remove_file(&path) {
         Ok(()) => {
             log_info!("Forgot the user's saved voice");

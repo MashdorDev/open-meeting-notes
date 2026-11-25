@@ -219,6 +219,10 @@ impl OwnVoiceProfile {
             lines: voice.segments,
             call_voices: Vec::new(),
         });
+        // A retry after a failed save marks the same voice again.
+        if profile.call_voices.contains(&voice.embedding) {
+            return profile;
+        }
         profile.call_voices.push(voice.embedding.clone());
         if profile.call_voices.len() > MAX_CALL_VOICES {
             profile.call_voices.remove(0);
@@ -473,7 +477,10 @@ mod tests {
         assert_eq!(updated.call_voices, vec![vec![0.6, 0.8]]);
         // A second mark adds to the profile rather than replacing it.
         let again = OwnVoiceProfile::with_marked_voice(Some(updated.clone()), &mic_voice("Speaker 4", 3, [0.0, 1.0]));
-        assert_eq!((again.embedding, again.call_voices.len()), (updated.embedding, 2));
+        assert_eq!((again.embedding, again.call_voices.len()), (updated.embedding.clone(), 2));
+        // Marking the same voice twice keeps it once.
+        let twice = OwnVoiceProfile::with_marked_voice(Some(updated), &call);
+        assert_eq!(twice.call_voices.len(), 1);
     }
 
     #[test]
