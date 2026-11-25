@@ -81,16 +81,19 @@ impl CaptionLog {
         // Blocks scroll off the top and new ones come in at the bottom, so
         // this read lines up with the end of the last one. Matching by place
         // keeps two blocks that start the same way ("Yeah") apart. The shift
-        // is chosen by strict matches only: the most, then the fewest
-        // mismatches, then the largest shift, since in a two-person call a
-        // block also lines up with the same speaker's block two places on.
+        // is chosen by strict matches only. Best is a shift whose matches run
+        // unbroken from the top of this read to the last block shown before;
+        // then the longest unbroken run, then the most matches, then the
+        // largest shift, since in a two-person call a block also lines up
+        // with the same speaker's block two places on.
         let strict = |old: &(String, String), new: &(String, String)| old.0 == new.0 && same_block(&old.1, &new.1);
         let shift = (0..=self.shown.len())
             .max_by_key(|&s| {
-                let (good, bad) = self.shown[s..].iter().zip(blocks).fold((0, 0), |(g, b), (old, new)| {
-                    if strict(old, new) { (g + 1, b) } else { (g, b + 1) }
-                });
-                (good, std::cmp::Reverse(bad))
+                let overlap = || self.shown[s..].iter().zip(blocks);
+                let run = overlap().take_while(|(old, new)| strict(old, new)).count();
+                let total = overlap().filter(|(old, new)| strict(old, new)).count();
+                let to_end = run > 0 && run == self.shown.len() - s;
+                (to_end, run, total)
             })
             .unwrap_or(0);
         // In a place the strict matches fixed, a one-word draft rewritten
@@ -455,5 +458,14 @@ mod tests {
         let turns: Vec<(String, f64, String)> =
             log.into_pieces().into_iter().map(|p| (p.speaker, p.time, p.text)).collect();
         assert_eq!(turns, vec![("A".into(), 10.0, "Yeah definitely".into())]);
+
+        // Short replies that repeat: the run to the last block shown wins
+        // over a longer one that stops short of it.
+        let mut log = CaptionLog::default();
+        log.baseline(&blocks(&[("A", "I think so"), ("B", "Yeah"), ("A", "I think we"), ("B", "Yeah")]));
+        log.observe("meet", 11.0, &blocks(&[("A", "I think we"), ("B", "Yeah"), ("A", "I think that works")]));
+        let repeats: Vec<(String, f64, String)> =
+            log.into_pieces().into_iter().map(|p| (p.speaker, p.time, p.text)).collect();
+        assert_eq!(repeats, vec![("A".into(), 11.0, "I think that works".into())]);
     }
 }
