@@ -25,6 +25,7 @@ import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcess
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
+import { startTheme, THEME_BOOT_SCRIPT } from '@/lib/theme'
 
 
 // Both SIL Open Font License, from versioned @fontsource packages. Loading
@@ -83,6 +84,8 @@ export default function RootLayout({
   const [showDropOverlay, setShowDropOverlay] = useState(false)
   const [showImportDialog, setShowImportDialog] = useState(false)
   const [importFilePath, setImportFilePath] = useState<string | null>(null)
+
+  useEffect(() => startTheme(), [])
 
   useEffect(() => {
     // Check onboarding status first
@@ -239,7 +242,10 @@ export default function RootLayout({
   }
 
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
+      </head>
       <body className={`${figtree.variable} ${bricolage.variable} font-sans antialiased`}>
         <AnalyticsProvider>
           <RecordingStateProvider>
