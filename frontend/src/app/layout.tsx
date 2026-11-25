@@ -11,6 +11,7 @@ import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback } from 'react'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { useRouter } from 'next/navigation'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { RecordingStateProvider } from '@/contexts/RecordingStateContext'
 import { OllamaDownloadProvider } from '@/contexts/OllamaDownloadContext'
@@ -78,6 +79,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   const [showOnboarding, setShowOnboarding] = useState(false)
+  const router = useRouter()
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
 
   // Import audio state
@@ -137,6 +139,18 @@ export default function RootLayout({
       unlisten.then(fn => fn());
     };
   }, [showOnboarding]);
+
+  // The tray's Settings item. A client-side push keeps the page's state and
+  // history; a full reload from the tray could land on the old page or leave
+  // Back on a blank one.
+  useEffect(() => {
+    const unlisten = listen('open-settings', () => {
+      router.push('/settings');
+    });
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, [router]);
 
   // Handle file drop for audio import
   const handleFileDrop = useCallback((paths: string[]) => {
