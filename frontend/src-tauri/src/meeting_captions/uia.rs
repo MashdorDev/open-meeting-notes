@@ -1,7 +1,7 @@
 //! Reads Meet's caption region from the browser through Windows UI Automation.
 
 use super::{capture, parse_caption_texts, CaptionPiece};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
@@ -27,7 +27,7 @@ pub fn run(stop: &AtomicBool) -> Vec<CaptionPiece> {
         let pieces = match CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
             Ok(automation) => capture(
                 stop,
-                || find_meet_captions(&automation, false).ok().flatten(),
+                || find_meet_captions(&automation, stop, false).ok().flatten(),
                 |region| caption_texts(&automation, region).ok(),
             ),
             Err(e) => {
@@ -71,13 +71,16 @@ unsafe fn focused_window(automation: &IUIAutomation) -> Option<IUIAutomationElem
 
 /// The caption region of a Meet tab, when captions are on. With several
 /// Meet tabs, the one in the focused window and on screen wins; otherwise
-/// the first, and the log says which.
-unsafe fn find_meet_captions(automation: &IUIAutomation, trace: bool) -> windows::core::Result<Option<IUIAutomationElement>> {
+/// the first, and the log says which. Gives up as soon as `stop` is set.
+unsafe fn find_meet_captions(automation: &IUIAutomation, stop: &AtomicBool, trace: bool) -> windows::core::Result<Option<IUIAutomationElement>> {
     let documents = automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_DocumentControlTypeId.0))?;
     let windows = automation.GetRootElement()?.FindAll(TreeScope_Children, &automation.CreateTrueCondition()?)?;
     let focused = focused_window(automation);
     let mut found: Vec<(u8, String, IUIAutomationElement)> = Vec::new();
     for i in 0..windows.Length()? {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let window = windows.GetElement(i)?;
         let class = window.CurrentClassName()?.to_string();
         if !BROWSER_CLASSES.contains(&class.as_str()) || !is_browser(&window) {
@@ -92,6 +95,9 @@ unsafe fn find_meet_captions(automation: &IUIAutomation, trace: bool) -> windows
             println!("window [{}] {:?} focused: {} documents: {}", class, window.CurrentName()?.to_string(), in_focus, docs.Length()?);
         }
         for j in 0..docs.Length()? {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             let doc = docs.GetElement(j)?;
             let title = doc.CurrentName()?.to_string();
             if trace {
@@ -101,7 +107,7 @@ unsafe fn find_meet_captions(automation: &IUIAutomation, trace: bool) -> windows
             if !title.starts_with("Meet ") {
                 continue;
             }
-            if let Some(region) = caption_region(automation, &doc, trace)? {
+            if let Some(region) = caption_region(automation, &doc, stop, trace)? {
                 // A background tab's document is off screen.
                 let on_screen = !doc.CurrentIsOffscreen()?.as_bool();
                 found.push((in_focus as u8 * 2 + on_screen as u8, title, region));
@@ -125,6 +131,7 @@ unsafe fn find_meet_captions(automation: &IUIAutomation, trace: bool) -> windows
 unsafe fn caption_region(
     automation: &IUIAutomation,
     doc: &IUIAutomationElement,
+    stop: &AtomicBool,
     trace: bool,
 ) -> windows::core::Result<Option<IUIAutomationElement>> {
     let labelled = automation.CreateAndCondition(
@@ -136,6 +143,9 @@ unsafe fn caption_region(
     let candidates = doc.FindAll(TreeScope_Descendants, &automation.CreateOrCondition(&labelled, &landmark)?)?;
     let mut shaped = Vec::new();
     for i in 0..candidates.Length()? {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let region = candidates.GetElement(i)?;
         let name = region.CurrentName()?.to_string();
         if name == CAPTIONS_LABEL {
@@ -162,25 +172,23 @@ unsafe fn caption_texts(automation: &IUIAutomation, region: &IUIAutomationElemen
     region.CurrentName()?;
     let walker = automation.ControlViewWalker()?;
     let mut texts = Vec::new();
-    walk(&walker, region, 0, &mut texts)?;
+    walk(&walker, region, 0, &mut texts);
     Ok(texts)
 }
 
-unsafe fn walk(
-    walker: &IUIAutomationTreeWalker,
-    parent: &IUIAutomationElement,
-    depth: usize,
-    texts: &mut Vec<(usize, String)>,
-) -> windows::core::Result<()> {
+/// An element that goes away mid-read (Meet replaces caption lines as it
+/// revises) is skipped, not taken as the region being gone.
+unsafe fn walk(walker: &IUIAutomationTreeWalker, parent: &IUIAutomationElement, depth: usize, texts: &mut Vec<(usize, String)>) {
     let mut child = walker.GetFirstChildElement(parent).ok();
     while let Some(element) = child {
-        if element.CurrentControlType()? == UIA_TextControlTypeId {
-            texts.push((depth, element.CurrentName()?.to_string()));
+        if element.CurrentControlType().is_ok_and(|t| t == UIA_TextControlTypeId) {
+            if let Ok(name) = element.CurrentName() {
+                texts.push((depth, name.to_string()));
+            }
         }
-        walk(walker, &element, depth + 1, texts)?;
+        walk(walker, &element, depth + 1, texts);
         child = walker.GetNextSiblingElement(&element).ok();
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -195,7 +203,7 @@ mod live {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
-            let found = find_meet_captions(&automation, true);
+            let found = find_meet_captions(&automation, &AtomicBool::new(false), true);
             println!("found: {:?}", found.as_ref().map(|f| f.is_some()));
             if let Ok(Some(region)) = found {
                 println!("texts: {:?}", caption_texts(&automation, &region));
