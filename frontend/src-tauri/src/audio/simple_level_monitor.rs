@@ -64,6 +64,12 @@ where
 /// wave, so the level bars never reflected the microphone.) An empty list
 /// means the system default microphone, the one a recording would use.
 pub async fn start_monitoring<R: Runtime>(app_handle: AppHandle<R>, mut device_names: Vec<String>) -> Result<()> {
+    // Linux microphones are PulseAudio sources that cpal can't open (recording
+    // goes through pulse_mic), and opening ALSA off the global lock can abort
+    // the process. No level check there until it has a Pulse path.
+    if cfg!(target_os = "linux") {
+        return Err(anyhow::anyhow!("The microphone check is not available on Linux yet"));
+    }
     if device_names.is_empty() {
         device_names.push(super::devices::default_input_device()?.name);
     }
@@ -91,9 +97,13 @@ pub async fn start_monitoring<R: Runtime>(app_handle: AppHandle<R>, mut device_n
 
     // cpal streams can't move between threads, so they live on their own
     // thread and are dropped (closing the microphone) when monitoring stops.
+    // The thread reports how many streams it started, so a busy or
+    // unsupported microphone fails the start instead of showing a flat bar.
     let stream_meters = meters.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<usize, String>>();
     std::thread::spawn(move || {
         let mut streams = Vec::new();
+        let mut last_error = String::new();
         for (name, device, supported) in devices {
             let config: cpal::StreamConfig = supported.config();
             let meter = stream_meters[&name].clone();
@@ -106,15 +116,31 @@ pub async fn start_monitoring<R: Runtime>(app_handle: AppHandle<R>, mut device_n
             };
             match built.and_then(|s| s.play().map(|_| s).map_err(Into::into)) {
                 Ok(stream) => streams.push(stream),
-                Err(e) => warn!("Level monitor: microphone {} not started: {}", name, e),
+                Err(e) => {
+                    warn!("Level monitor: microphone {} not started: {}", name, e);
+                    last_error = e.to_string();
+                }
             }
         }
-        while running() {
+        let _ = started_tx.send(if streams.is_empty() { Err(last_error) } else { Ok(streams.len()) });
+        while running() && !streams.is_empty() {
             std::thread::sleep(EMIT_EVERY);
         }
         drop(streams);
         info!("Audio level monitoring closed its microphones");
     });
+
+    let started = tokio::task::spawn_blocking(move || started_rx.recv())
+        .await
+        .map_err(|e| anyhow::anyhow!("Level monitor thread failed: {}", e))?;
+    match started {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            IS_MONITORING.store(false, Ordering::SeqCst);
+            return Err(anyhow::anyhow!("The microphone could not be opened: {}", e));
+        }
+        Err(_) => return Err(anyhow::anyhow!("Level monitor thread ended before starting")),
+    }
 
     tokio::spawn(async move {
         while running() {
@@ -152,6 +178,9 @@ pub async fn start_monitoring<R: Runtime>(app_handle: AppHandle<R>, mut device_n
 
 pub async fn stop_monitoring() -> Result<()> {
     info!("Stopping audio level monitoring");
+    // A new generation ends the current run even if a start that began
+    // before this stop sets the flag back afterwards.
+    GENERATION.fetch_add(1, Ordering::SeqCst);
     IS_MONITORING.store(false, Ordering::SeqCst);
     Ok(())
 }

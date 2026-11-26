@@ -44,6 +44,11 @@ export function MicCheck({ micId }: { micId: string | null }) {
         if (cancelled) return;
         // No id: the backend opens the system default, as a recording would.
         await invoke('start_audio_level_monitoring', { deviceNames: micId ? [micId] : [] });
+        // Ended while starting: the cleanup's stop may have run first.
+        if (cancelled) {
+          invoke('stop_audio_level_monitoring').catch(error => console.error('Failed to stop the microphone check:', error));
+          return;
+        }
         stopTimer.current = setTimeout(() => setChecking(false), CHECK_SECONDS * 1000);
       } catch (error) {
         console.error('Microphone check failed:', error);

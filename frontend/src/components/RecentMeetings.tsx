@@ -8,6 +8,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { resolveDeviceLabel } from '@/lib/audioDevices';
 import { Button } from '@/components/ui/button';
 import { MicCheck } from '@/components/MicCheck';
+import { useIsLinux } from '@/hooks/usePlatform';
 
 interface HomeMeeting {
   id: string;
@@ -85,6 +86,8 @@ export function RecentMeetings({ hasMicrophone, hasSystemAudio }: { hasMicrophon
   // The sidebar's list changes when a meeting is saved, renamed or deleted.
   const { meetings: sidebarMeetings, setCurrentMeeting } = useSidebar();
   const { selectedDevices } = useConfig();
+  // No microphone check on Linux yet (see simple_level_monitor.rs).
+  const isLinux = useIsLinux();
   const [overview, setOverview] = useState<HomeOverview | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [micLabel, setMicLabel] = useState<string | null>(null);
@@ -142,7 +145,7 @@ export function RecentMeetings({ hasMicrophone, hasSystemAudio }: { hasMicrophon
       {hasMicrophone && (
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-8">
           <p className="text-sm text-gray-500">Ready to record · {ready}</p>
-          <MicCheck micId={selectedDevices.micDevice} />
+          {!isLinux && <MicCheck micId={selectedDevices.micDevice} />}
         </div>
       )}
 
