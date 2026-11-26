@@ -43,10 +43,10 @@ const MIN_OVERLAP_MIC_SPEECH_SHARE: f64 = 0.2;
 const MIN_OVERLAP_SYS_SPEECH_SHARE: f64 = 0.2;
 
 /// Windows and speech intervals older than this behind the newest window are
-/// dropped (about 23 MB of raw audio at 48 kHz). A VAD segment longer than
-/// this (only under unbroken speech, since live segments have no length cap
-/// yet, see #756) is labelled from its last minute and is not split.
-const RETAIN_MS: f64 = 60_000.0;
+/// dropped (about 23 MB of raw audio at 48 kHz). Live VAD segments are capped
+/// well below this (`LIVE_MAX_SEGMENT_MS` in pipeline.rs), so a segment's
+/// whole span is always still here when it is labelled.
+pub(crate) const RETAIN_MS: f64 = 60_000.0;
 
 struct Window {
     start_ms: f64,

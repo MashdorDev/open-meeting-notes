@@ -286,6 +286,8 @@ async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) 
     Ok(updated)
 }
 
+const TOUCH_SECONDS: f64 = 0.001;
+
 /// Groups words by line, in the order of `spans`. Lines whose spans overlap
 /// another line never get words: the recording is mixed, so a word there
 /// cannot be given to one voice. A word that starts anywhere inside such a
@@ -293,7 +295,12 @@ async fn store(pool: &SqlitePool, meeting_id: &str, words: Vec<TranscriptWord>) 
 /// start, else to the nearest eligible line within MAX_WORD_DISTANCE_SECONDS,
 /// else it is dropped. Words keep their order.
 fn assign_words(spans: &[(f64, f64)], words: Vec<TranscriptWord>) -> Vec<Vec<TranscriptWord>> {
-    let overlaps = |a: (f64, f64), b: (f64, f64)| (a.0 < b.1 && b.0 < a.1) || a == b;
+    // Live segments capped mid-speech sit end to start, and their times are
+    // rounded along two different paths, so a touching pair can disagree by a
+    // float step. Less than a millisecond of overlap is not two voices at once.
+    let overlaps = |a: (f64, f64), b: (f64, f64)| {
+        (a.0 + TOUCH_SECONDS < b.1 && b.0 + TOUCH_SECONDS < a.1) || a == b
+    };
     let mut eligible = vec![true; spans.len()];
     for i in 0..spans.len() {
         for j in i + 1..spans.len() {
@@ -328,4 +335,31 @@ fn assign_words(spans: &[(f64, f64)], words: Vec<TranscriptWord>) -> Vec<Vec<Tra
         }
     }
     per_line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(text: &str, start: f64) -> TranscriptWord {
+        TranscriptWord { text: text.into(), start, end: start + 0.2 }
+    }
+
+    #[test]
+    fn touching_lines_with_rounding_noise_both_get_words() {
+        // Two capped live segments: the first line's end was computed as
+        // start + len/16000, the second's start through whole milliseconds.
+        let spans = [(10.0, 22.000000000000004), (22.0, 34.0)];
+        let words = vec![word("one", 15.0), word("two", 25.0)];
+        let per_line = assign_words(&spans, words);
+        assert_eq!(per_line[0].len(), 1);
+        assert_eq!(per_line[1].len(), 1);
+    }
+
+    #[test]
+    fn lines_that_really_overlap_get_no_words() {
+        let spans = [(10.0, 22.5), (22.0, 34.0)];
+        let per_line = assign_words(&spans, vec![word("one", 15.0), word("two", 25.0)]);
+        assert!(per_line.iter().all(|w| w.is_empty()));
+    }
 }

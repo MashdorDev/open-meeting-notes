@@ -30,7 +30,18 @@ pub struct ContinuousVadProcessor {
     speech_start_sample: usize,
     last_logged_state: bool,
     large_speech_buffer_warned: bool,
+    /// Longest segment handed out while speech is still going on. `None` waits
+    /// for a pause, which suits the batch paths; the live path sets it so a
+    /// speaker who never pauses for the redemption time still shows up.
+    max_segment_samples: Option<usize>,
+    /// How much of the speech in progress has already gone out as capped
+    /// segments, counted from the start of `session.get_current_speech()`.
+    emitted_speech_samples: usize,
 }
+
+/// A capped segment is cut at the quietest 30 ms frame within this much of its
+/// end, so the cut lands between words more often than inside one.
+const CUT_SEARCH_SAMPLES: usize = VAD_SAMPLE_RATE as usize * 3;
 
 impl ContinuousVadProcessor {
     pub fn new(input_sample_rate: u32, redemption_time_ms: u32) -> Result<Self> {
@@ -49,8 +60,8 @@ impl ContinuousVadProcessor {
         // Use the caller's redemption time without additional capping. The batch
         // paths (`import.rs`, `retranscription.rs`) pass 2000ms to bridge natural
         // pauses; the live path (`pipeline.rs`) passes 500ms to reduce pause-induced
-        // latency. A qualifying silence is still required; bounded uninterrupted-
-        // speech delivery is tracked in #756.
+        // latency. The live path also caps segment length (`with_max_segment_ms`)
+        // so speech without any qualifying silence still goes out.
         config.redemption_time = Duration::from_millis(redemption_time_ms as u64);
         config.pre_speech_pad = Duration::from_millis(300);   // Pre-speech padding for context
         config.post_speech_pad = Duration::from_millis(400);  // Increased: more context at end
@@ -84,7 +95,64 @@ impl ContinuousVadProcessor {
             speech_start_sample: 0,
             last_logged_state: false,
             large_speech_buffer_warned: false,
+            max_segment_samples: None,
+            emitted_speech_samples: 0,
         })
+    }
+
+    /// Hand out speech in progress once it reaches `max_ms`, instead of waiting
+    /// for a pause. Continuous audio (a podcast, a long monologue) otherwise
+    /// keeps one segment open for a minute or more and the live transcript
+    /// stays empty that whole time.
+    pub fn with_max_segment_ms(mut self, max_ms: u32) -> Self {
+        self.max_segment_samples = Some(max_ms as usize * VAD_SAMPLE_RATE as usize / 1000);
+        self
+    }
+
+    fn samples_to_ms(samples: usize) -> f64 {
+        samples as f64 * 1000.0 / VAD_SAMPLE_RATE as f64
+    }
+
+    /// Cut point inside `window` (its length is the cap): the middle of the
+    /// quietest frame in the last `CUT_SEARCH_SAMPLES`.
+    fn quiet_cut(window: &[f32], frame: usize) -> usize {
+        let search_from = window.len().saturating_sub(CUT_SEARCH_SAMPLES);
+        let mut best = (window.len(), f32::MAX);
+        let mut start = search_from;
+        while start + frame <= window.len() {
+            let energy: f32 = window[start..start + frame].iter().map(|x| x * x).sum();
+            if energy < best.1 {
+                best = (start + frame / 2, energy);
+            }
+            start += frame;
+        }
+        best.0.max(1)
+    }
+
+    fn emit_capped_segment(&mut self) {
+        let Some(max) = self.max_segment_samples else { return };
+        // During a pause the segment is about to end on its own, and the speech
+        // buffer already holds trailing silence that SpeechEnd will leave out.
+        if !self.in_speech || self.session.current_silence_samples() > 0 {
+            return;
+        }
+        let speech = self.session.get_current_speech();
+        let emitted = self.emitted_speech_samples;
+        if speech.len() < emitted + max {
+            return;
+        }
+        let cut = emitted + Self::quiet_cut(&speech[emitted..emitted + max], self.chunk_size);
+        let start_ms = Self::samples_to_ms(self.speech_start_sample + emitted);
+        let end_ms = Self::samples_to_ms(self.speech_start_sample + cut);
+        let samples = speech[emitted..cut].to_vec();
+        debug!("VAD: capped segment {:.0}-{:.0}ms while speech continues", start_ms, end_ms);
+        self.speech_segments.push_back(SpeechSegment {
+            samples,
+            start_timestamp_ms: start_ms,
+            end_timestamp_ms: end_ms,
+            confidence: 0.9,
+        });
+        self.emitted_speech_samples = cut;
     }
 
     /// Process incoming audio samples and return any complete speech segments
@@ -218,9 +286,9 @@ impl ContinuousVadProcessor {
                     real_sample_count
                 ));
             }
-            let samples = active_speech[..real_sample_count].to_vec();
-            let start_ms =
-                (self.speech_start_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
+            let emitted = self.emitted_speech_samples.min(real_sample_count);
+            let samples = active_speech[emitted..real_sample_count].to_vec();
+            let start_ms = Self::samples_to_ms(self.speech_start_sample + emitted);
             let end_ms = (real_end_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
 
             debug!("VAD flush: Force-ending speech - start={}ms, end={}ms, duration={}ms, samples={}",
@@ -233,9 +301,12 @@ impl ContinuousVadProcessor {
                 confidence: 0.8, // Estimated confidence for forced end
             };
 
-            self.speech_segments.push_back(segment);
+            if !segment.samples.is_empty() {
+                self.speech_segments.push_back(segment);
+            }
             self.current_speech.clear();
             self.in_speech = false;
+            self.emitted_speech_samples = 0;
         }
 
         // Extract all remaining segments
@@ -277,6 +348,7 @@ impl ContinuousVadProcessor {
                     // ~2x the file duration and sorted to the end of the transcript.
                     self.speech_start_sample = timestamp_ms * VAD_SAMPLE_RATE as usize / 1000;
                     self.current_speech.clear();
+                    self.emitted_speech_samples = 0;
                 }
                 VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {
                     // Only log if we were previously in speech state
@@ -287,16 +359,20 @@ impl ContinuousVadProcessor {
                     self.in_speech = false;
 
                     // Use samples from VAD transition if available, otherwise use accumulated samples
-                    let speech_samples = if !samples.is_empty() {
+                    let mut speech_samples = if !samples.is_empty() {
                         samples
                     } else {
                         self.current_speech.clone()
                     };
+                    // Whatever went out as capped segments is not sent twice.
+                    let emitted = self.emitted_speech_samples.min(speech_samples.len());
+                    speech_samples.drain(..emitted);
+                    self.emitted_speech_samples = 0;
 
                     if !speech_samples.is_empty() {
                         let segment = SpeechSegment {
                             samples: speech_samples,
-                            start_timestamp_ms: start_timestamp_ms as f64,
+                            start_timestamp_ms: start_timestamp_ms as f64 + Self::samples_to_ms(emitted),
                             end_timestamp_ms: end_timestamp_ms as f64,
                             confidence: 0.9, // VAD confidence
                         };
@@ -315,6 +391,7 @@ impl ContinuousVadProcessor {
         if self.in_speech {
             self.current_speech.extend_from_slice(chunk);
         }
+        self.emit_capped_segment();
 
         self.processed_samples += chunk.len();
         Ok(())
@@ -448,6 +525,88 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(audio: &[f32], redemption_ms: u32, max_ms: Option<u32>) -> Vec<SpeechSegment> {
+        let mut p = ContinuousVadProcessor::new(16000, redemption_ms).expect("vad");
+        if let Some(ms) = max_ms {
+            p = p.with_max_segment_ms(ms);
+        }
+        let mut out = Vec::new();
+        // Feed it the way the live pipeline does, one short window at a time.
+        for window in audio.chunks(9600) {
+            out.extend(p.process_audio(window).expect("process"));
+        }
+        out.extend(p.flush().expect("flush"));
+        out
+    }
+
+    /// Same checks for synthetic and real audio: every capped segment fits the
+    /// cap, segments follow each other without gaps or overlap inside one
+    /// stretch of speech, and together they hold exactly the uncapped audio.
+    fn assert_capped_matches_uncapped(audio: &[f32], redemption_ms: u32, max_ms: u32) {
+        let uncapped = run(audio, redemption_ms, None);
+        let capped = run(audio, redemption_ms, Some(max_ms));
+        let total = |segs: &[SpeechSegment]| segs.iter().map(|s| s.samples.len()).sum::<usize>();
+        let longest = |segs: &[SpeechSegment]| segs.iter().map(|s| s.samples.len()).max().unwrap_or(0) as f32 / 16000.0;
+        println!("uncapped: {} segments, longest {:.1}s; capped: {} segments, longest {:.1}s",
+            uncapped.len(), longest(&uncapped), capped.len(), longest(&capped));
+        assert!(total(&uncapped) > 0, "the VAD found no speech, so the test proves nothing");
+        assert!(capped.len() > uncapped.len(), "nothing was long enough to be capped");
+        assert_eq!(total(&capped), total(&uncapped));
+
+        // Capping pauses while a silence runs, so the segment that ends a stretch
+        // can also carry that silence (at most the redemption time) and the
+        // post-speech pad.
+        let max_samples = (max_ms + redemption_ms + 400) as usize * 16;
+        for s in &capped {
+            assert!(s.samples.len() <= max_samples, "segment of {} samples over the cap", s.samples.len());
+            let span = ((s.end_timestamp_ms - s.start_timestamp_ms) * 16.0).round() as usize;
+            assert!(span.abs_diff(s.samples.len()) <= 16, "timestamps do not match the samples");
+        }
+        let joined: Vec<f32> = capped.iter().flat_map(|s| s.samples.iter().copied()).collect();
+        let original: Vec<f32> = uncapped.iter().flat_map(|s| s.samples.iter().copied()).collect();
+        assert!(joined == original, "capped segments do not add up to the same audio");
+    }
+
+    #[test]
+    fn quiet_cut_lands_in_the_quietest_frame() {
+        let mut window = vec![0.5f32; 16000 * 12];
+        // On the 480-sample frame grid that starts CUT_SEARCH_SAMPLES from the end.
+        let quiet_at = window.len() - CUT_SEARCH_SAMPLES + 480 * 30;
+        window[quiet_at..quiet_at + 480].fill(0.0);
+        assert_eq!(ContinuousVadProcessor::quiet_cut(&window, 480), quiet_at + 240);
+    }
+
+    #[test]
+    fn quiet_cut_ignores_quiet_audio_before_the_search_range() {
+        let mut window = vec![0.5f32; 16000 * 12];
+        window[0..480].fill(0.0);
+        let cut = ContinuousVadProcessor::quiet_cut(&window, 480);
+        assert!(cut >= window.len() - CUT_SEARCH_SAMPLES);
+    }
+
+    #[test]
+    fn capped_segments_split_continuous_speech_without_losing_audio() {
+        let audio = generate_test_audio_with_speech(60.0, 16000);
+        // Silero only accepts short stretches of these tones as speech, hence the small cap.
+        assert_capped_matches_uncapped(&audio, 2000, 300);
+    }
+
+    /// Real continuous speech (a podcast) instead of synthetic tones:
+    ///   ffmpeg -i podcast.mp3 -t 120 -ar 16000 -ac 1 -f f32le speech.f32
+    ///   OMN_LIVE_SPEECH_AUDIO=speech.f32 cargo test --lib capped_segments_on_real_speech -- --ignored
+    #[test]
+    #[ignore]
+    fn capped_segments_on_real_speech() {
+        let path = std::env::var("OMN_LIVE_SPEECH_AUDIO").expect("OMN_LIVE_SPEECH_AUDIO");
+        let bytes = std::fs::read(path).expect("read audio");
+        let audio: Vec<f32> = bytes
+            .chunks_exact(4)
+            // Decoded mp3 overshoots a little; the app normalizes before the VAD.
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).clamp(-1.0, 1.0))
+            .collect();
+        assert_capped_matches_uncapped(&audio, 500, 12_000);
+    }
 
     /// Generate synthetic speech-like audio with alternating speech/silence
     fn generate_test_audio_with_speech(duration_seconds: f32, sample_rate: u32) -> Vec<f32> {
