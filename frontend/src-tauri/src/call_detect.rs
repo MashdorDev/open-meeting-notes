@@ -4,9 +4,8 @@
 //! they capture.
 //!
 //! macOS 14+ lists the audio clients and whether each is taking input
-//! (Core Audio process objects, by bundle id). Windows keeps the apps using
-//! the microphone in the CapabilityAccessManager consent store: an entry
-//! whose last stop time is 0 is in use right now.
+//! (Core Audio process objects, by bundle id). On Windows, the audio
+//! session list says which executables are capturing from a microphone.
 
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -42,7 +41,7 @@ pub const CALL_APPS: &[CallApp] = &[
         key: "teams",
         name: "Microsoft Teams",
         mac: &["com.microsoft.teams2", "com.microsoft.teams"],
-        windows: &["ms-teams.exe", "teams.exe"],
+        windows: &["ms-teams.exe", "msteams.exe", "teams.exe"],
     },
     CallApp { key: "slack", name: "Slack", mac: &["com.tinyspeck.slackmacgap"], windows: &["slack.exe"] },
     CallApp { key: "discord", name: "Discord", mac: &["com.hnc.Discord"], windows: &["discord.exe"] },
@@ -155,53 +154,94 @@ fn microphone_users() -> Vec<String> {
         .collect()
 }
 
+/// The executables with an active capture session on any microphone,
+/// virtual ones included (NVIDIA Broadcast, Krisp): the live audio session
+/// list Windows itself uses for its "in use" icon. (The
+/// CapabilityAccessManager registry history stopped updating on newer
+/// Windows 11 builds, so a call there went unnoticed.)
 #[cfg(target_os = "windows")]
 fn microphone_users() -> Vec<String> {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-    const STORE: &str = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
-    let me = std::env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "#").to_ascii_lowercase());
-    // FILETIME (100 ns since 1601) of 12 hours ago. Windows leaves the stop
-    // time at 0 when an app crashes holding the microphone, so an entry that
-    // "started" long ago is a leftover, not a call.
-    const FILETIME_UNIX_OFFSET: u64 = 116_444_736_000_000_000;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64 / 100 + FILETIME_UNIX_OFFSET)
-        .unwrap_or(0);
-    let recent = now.saturating_sub(12 * 3600 * 10_000_000);
-    let in_use = |key: &RegKey| key.get_value::<u64, _>("LastUsedTimeStop").map_or(false, |stop| stop == 0)
-        && key.get_value::<u64, _>("LastUsedTimeStart").map_or(false, |start| start > recent);
-    let mut users = Vec::new();
-    let Ok(root) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(STORE) else { return users };
-    // Store apps sit directly under the key; desktop apps under NonPackaged,
-    // named by their path with '\' written as '#'.
-    for name in root.enum_keys().flatten() {
-        if name == "NonPackaged" {
-            if let Ok(non_packaged) = root.open_subkey(&name) {
-                for exe in non_packaged.enum_keys().flatten() {
-                    let lower = exe.to_ascii_lowercase();
-                    if Some(&lower) == me.as_ref() {
-                        continue;
-                    }
-                    if non_packaged.open_subkey(&exe).is_ok_and(|k| in_use(&k)) {
-                        users.push(lower.replace('#', "\\"));
+    use windows::core::Interface;
+    use windows::Win32::Media::Audio::{
+        eCapture, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
+        MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+
+    let me = std::process::id();
+    let mut pids: Vec<u32> = Vec::new();
+    // SAFETY: plain COM calls on this thread; every interface is released
+    // when it goes out of scope.
+    unsafe {
+        // Already initialized on this pool thread is fine (S_FALSE, or a
+        // different apartment mode we can still call into).
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
+            return Vec::new();
+        };
+        let Ok(devices) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else { return Vec::new() };
+        for i in 0..devices.GetCount().unwrap_or(0) {
+            let Ok(device) = devices.Item(i) else { continue };
+            let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+            let Ok(sessions) = manager.GetSessionEnumerator() else { continue };
+            for j in 0..sessions.GetCount().unwrap_or(0) {
+                let Ok(control) = sessions.GetSession(j) else { continue };
+                let Ok(control) = control.cast::<IAudioSessionControl2>() else { continue };
+                if control.GetState().map_or(true, |state| state != AudioSessionStateActive) {
+                    continue;
+                }
+                if let Ok(pid) = control.GetProcessId() {
+                    if pid != 0 && pid != me && !pids.contains(&pid) {
+                        pids.push(pid);
                     }
                 }
             }
-        } else if root.open_subkey(&name).is_ok_and(|k| in_use(&k)) {
-            // Packaged apps (new Teams: "MSTeams_8wekyb3d8bbwe") map by name.
-            let lower = name.to_ascii_lowercase();
-            if lower.starts_with("msteams") {
-                users.push("ms-teams.exe".into());
-            } else if lower.contains("whatsapp") {
-                users.push("whatsapp.exe".into());
-            }
         }
     }
-    users
+    let processes = windows_processes();
+    pids.iter()
+        .filter_map(|pid| {
+            let (exe, parent) = processes.get(pid)?;
+            // New Teams and other WebView2 apps capture in a WebView2 helper:
+            // name the app that owns the helper.
+            if exe == "msedgewebview2.exe" {
+                let mut owner = *parent;
+                for _ in 0..4 {
+                    let (parent_exe, grand) = processes.get(&owner)?;
+                    if parent_exe != "msedgewebview2.exe" {
+                        return Some(parent_exe.clone());
+                    }
+                    owner = *grand;
+                }
+                return None;
+            }
+            Some(exe.clone())
+        })
+        .collect()
+}
+
+/// Every process's executable name (lowercase) and parent id, by id.
+#[cfg(target_os = "windows")]
+fn windows_processes() -> HashMap<u32, (String, u32)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    let mut map = HashMap::new();
+    // SAFETY: the snapshot handle is closed below; entries are plain data.
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return map };
+        let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
+        while ok {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            let exe = String::from_utf16_lossy(&entry.szExeFile[..len]).to_ascii_lowercase();
+            map.insert(entry.th32ProcessID, (exe, entry.th32ParentProcessID));
+            ok = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    map
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -355,6 +395,7 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
     }
     tauri::async_runtime::spawn(async move {
         let mut tracker = Tracker::default();
+        let mut last_users: Vec<String> = Vec::new();
         loop {
             tokio::time::sleep(POLL_EVERY).await;
             let settings = load_settings(&app);
@@ -362,7 +403,14 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                 tracker = Tracker::default();
                 continue;
             }
-            let users = tokio::task::spawn_blocking(microphone_users).await.unwrap_or_default();
+            let mut users = tokio::task::spawn_blocking(microphone_users).await.unwrap_or_default();
+            users.sort();
+            // Which apps hold the microphone, when that changes: shows the
+            // process name to add when a call app goes unnoticed.
+            if users != last_users {
+                info!("Call detection: microphone in use by {:?}", users);
+                last_users = users.clone();
+            }
             // Every call app is tracked; the ignore list only silences
             // prompts, so unticking an app mid-call doesn't look like the
             // call ended.
