@@ -7,6 +7,7 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { resolveDeviceLabel } from '@/lib/audioDevices';
 import { Button } from '@/components/ui/button';
+import { MicCheck } from '@/components/MicCheck';
 
 interface HomeMeeting {
   id: string;
@@ -138,7 +139,12 @@ export function RecentMeetings({ hasMicrophone, hasSystemAudio }: { hasMicrophon
 
   return (
     <div className="pt-6 pb-28 text-left">
-      {hasMicrophone && <p className="text-sm text-gray-500 mb-8">Ready to record · {ready}</p>}
+      {hasMicrophone && (
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-8">
+          <p className="text-sm text-gray-500">Ready to record · {ready}</p>
+          <MicCheck micId={selectedDevices.micDevice} />
+        </div>
+      )}
 
       {loadFailed && overview === null && (
         <p className="text-sm text-gray-500">The home page could not load. Your meetings are still in the sidebar.</p>
