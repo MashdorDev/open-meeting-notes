@@ -22,8 +22,6 @@ pub enum NotificationType {
     TranscriptionComplete,
     MeetingReminder(u64), // Duration in minutes
     SystemError(String),
-    /// A call app started using the microphone (call_detect).
-    CallDetected,
     Test, // For testing notifications
 }
 
@@ -37,7 +35,6 @@ impl NotificationType {
             Self::TranscriptionComplete => "transcription_complete",
             Self::MeetingReminder(_) => "meeting_reminder",
             Self::SystemError(_) => "system_error",
-            Self::CallDetected => "call_detected",
             Self::Test => "test",
         }
     }

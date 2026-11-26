@@ -287,20 +287,6 @@ impl Tracker {
     }
 }
 
-/// Through the notification manager, so the user's notification consent
-/// and Do Not Disturb apply.
-async fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
-    use crate::notifications::commands::NotificationManagerState;
-    use crate::notifications::types::{Notification, NotificationType};
-    use tauri::Manager;
-    let state = app.state::<NotificationManagerState<R>>();
-    let manager = state.read().await;
-    let Some(manager) = manager.as_ref() else { return };
-    if let Err(e) = manager.show_notification(Notification::new(title, body, NotificationType::CallDetected)).await {
-        warn!("Call detection: notification failed: {}", e);
-    }
-}
-
 /// Which recording belongs to which call. Record (or auto-start) leaves a
 /// pending mark; the next recording to start within a short wait claims it
 /// by its session number. Stop acts only on that exact recording, so a
@@ -364,16 +350,9 @@ fn recording_for_call() -> Option<String> {
     mark_for_session(current_session(), crate::audio::recording_commands::recording_started_at())
 }
 
-/// The prompt's Record: remembers which call the recording is for.
-#[tauri::command]
-pub fn mark_recording_for_call(key: String) {
-    mark_pending(key);
-}
-
 /// The call-ended prompt's Stop: stops only a recording started for that
 /// call, never one started by hand.
-#[tauri::command]
-pub async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String) -> bool {
+async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String) -> bool {
     if !crate::is_recording().await || recording_for_call().as_deref() != Some(key.as_str()) {
         info!("Call detection: Stop for {} refused, the running recording isn't that call's", key);
         return false;
@@ -381,6 +360,99 @@ pub async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String)
     info!("Call detection: stopping the {} call's recording", key);
     crate::tray::stop_recording_from_detection(app).await;
     true
+}
+
+/// The floating prompt (public/call-prompt.html): a small window over
+/// whatever app is in front, as Spark shows it, since the call app has the
+/// focus and the main window is usually hidden. It never takes the focus.
+const PROMPT_LABEL: &str = "call-prompt";
+const PROMPT_SECONDS: u64 = 30;
+const PROMPT_WIDTH: f64 = 400.0;
+const PROMPT_HEIGHT: f64 = 96.0;
+/// Bumped per prompt, so an old prompt's timer can't close a newer one.
+static PROMPT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn query_value(text: &str) -> String {
+    text.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b == b'-' { (b as char).to_string() } else { format!("%{:02X}", b) })
+        .collect()
+}
+
+fn close_prompt<R: Runtime>(app: &AppHandle<R>) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window(PROMPT_LABEL) {
+        let _ = window.close();
+    }
+}
+
+/// Shows the prompt at the top centre of the main screen: notification
+/// banners stack in the top-right corner on macOS, above always-on-top
+/// windows, and would cover it (Zoom posts its own banner as a call starts). `kind` is
+/// "started" (offer to record) or "ended" (offer to stop).
+fn show_prompt<R: Runtime>(app: &AppHandle<R>, key: &str, name: &str, kind: &'static str) {
+    use std::sync::atomic::Ordering;
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    close_prompt(app);
+    let generation = PROMPT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let url = format!("call-prompt.html?key={}&name={}&kind={}", query_value(key), query_value(name), kind);
+    // Below the macOS menu bar; near the top edge on Windows.
+    let top_gap = if cfg!(target_os = "macos") { 34.0 } else { 12.0 };
+    let (x, y) = match app.primary_monitor() {
+        Ok(Some(monitor)) => {
+            let scale = monitor.scale_factor();
+            let size = monitor.size().to_logical::<f64>(scale);
+            let origin = monitor.position().to_logical::<f64>(scale);
+            (origin.x + (size.width - PROMPT_WIDTH) / 2.0, origin.y + top_gap)
+        }
+        _ => (40.0, top_gap),
+    };
+    let built = WebviewWindowBuilder::new(app, PROMPT_LABEL, WebviewUrl::App(url.into()))
+        .title("Open Meeting Notes")
+        .inner_size(PROMPT_WIDTH, PROMPT_HEIGHT)
+        .position(x, y)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(false)
+        .build();
+    if let Err(e) = built {
+        warn!("Call detection: prompt window not shown: {}", e);
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(PROMPT_SECONDS)).await;
+        if PROMPT_GENERATION.load(Ordering::SeqCst) == generation {
+            close_prompt(&app);
+        }
+    });
+}
+
+/// A button on the floating prompt. Record starts a recording for the call
+/// (unless one is running); Stop stops that call's recording.
+#[tauri::command]
+pub async fn call_prompt_answer<R: Runtime>(app: AppHandle<R>, key: String, kind: String, accept: bool) {
+    close_prompt(&app);
+    if !accept {
+        return;
+    }
+    match kind.as_str() {
+        "started" => {
+            if crate::is_recording().await {
+                return;
+            }
+            mark_pending(key);
+            crate::tray::start_recording_from_detection(&app);
+        }
+        "ended" => {
+            stop_recording_for_call(app, key).await;
+        }
+        _ => {}
+    }
 }
 
 async fn onboarding_done<R: Runtime>(app: &AppHandle<R>) -> bool {
@@ -432,15 +504,18 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                     mark_pending(key.to_string());
                     crate::tray::start_recording_from_detection(&app);
                 } else {
-                    notify(&app, "Call detected", &format!("{} is using your microphone. Open Meeting Notes to record it.", call_app.name)).await;
+                    show_prompt(&app, key, call_app.name, "started");
                 }
                 let _ = app.emit("call-detected", CallEvent { key: key.into(), name: call_app.name.into(), auto_started });
             }
             for key in ended {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 info!("Call detection: {} stopped using the microphone", call_app.name);
+                // A record prompt still up for this call has nothing left to offer.
+                close_prompt(&app);
                 if call_recording.as_deref() == Some(key) {
                     info!("Call detection: asking whether to stop the {} call's recording", key);
+                    show_prompt(&app, key, call_app.name, "ended");
                     let _ = app.emit("call-ended", CallEvent { key: key.into(), name: call_app.name.into(), auto_started: false });
                 }
             }

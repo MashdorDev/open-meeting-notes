@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call detected</title>
+<style>
+  /* A small card floating over other apps (call_detect.rs opens it in a
+     transparent, always-on-top window). Plain HTML: it must open fast and
+     not load the whole app. */
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; background: transparent; overflow: hidden; }
+  body {
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none; cursor: default;
+  }
+  .card {
+    margin: 8px; padding: 12px 14px; border-radius: 12px;
+    background: #ffffff; color: #111827;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .text { flex: 1; min-width: 0; }
+  .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .detail { color: #4b5563; margin-top: 2px; }
+  .actions { display: flex; flex-direction: column; gap: 6px; }
+  button {
+    font: inherit; border-radius: 7px; padding: 5px 12px; cursor: default;
+    border: 1px solid #d1d5db; background: #ffffff; color: #111827; white-space: nowrap;
+  }
+  button.primary { background: #dc2626; border-color: #dc2626; color: #ffffff; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    .card { background: #1f2937; color: #f9fafb; border-color: rgba(255, 255, 255, 0.1); }
+    .detail { color: #9ca3af; }
+    button { background: #374151; border-color: #4b5563; color: #f9fafb; }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="text">
+      <div class="title" id="title"></div>
+      <div class="detail" id="detail"></div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="yes"></button>
+      <button id="no"></button>
+    </div>
+  </div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const key = params.get('key') || '';
+  const name = params.get('name') || 'A call app';
+  const ended = params.get('kind') === 'ended';
+  document.getElementById('title').textContent = ended ? `${name} call ended` : `${name} call detected`;
+  document.getElementById('detail').textContent = ended ? 'Stop the recording?' : 'Record it with Open Meeting Notes?';
+  document.getElementById('yes').textContent = ended ? 'Stop recording' : 'Record';
+  document.getElementById('no').textContent = ended ? 'Keep recording' : 'Not now';
+  // No bundler here, so the Tauri bridge is used directly.
+  const invoke = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args);
+  document.getElementById('yes').onclick = () => invoke('call_prompt_answer', { key, kind: ended ? 'ended' : 'started', accept: true });
+  document.getElementById('no').onclick = () => invoke('call_prompt_answer', { key, kind: ended ? 'ended' : 'started', accept: false });
+</script>
+</body>
+</html>

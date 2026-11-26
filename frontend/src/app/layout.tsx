@@ -140,54 +140,14 @@ export default function RootLayout({
     };
   }, [showOnboarding]);
 
-  // Call detection (call_detect.rs): a call app started or stopped using the
-  // microphone. The notification reaches the user outside the app; these
-  // toasts carry the actions inside it.
+  // Call detection (call_detect.rs) asks in its own floating window over
+  // the call app; inside the app only auto-start is reported.
   useEffect(() => {
-    type CallEvent = { key: string; name: string; auto_started: boolean };
-    const started = listen<CallEvent>('call-detected', ({ payload }) => {
-      // Not during setup: there may be no model yet, and Record would leave
-      // a start flag behind for later.
-      if (showOnboarding) return;
-      if (payload.auto_started) {
-        toast.success(`Recording your ${payload.name} call`);
-        return;
-      }
-      toast(`${payload.name} is using your microphone`, {
-        description: 'Record this call?',
-        duration: 30_000,
-        action: {
-          label: 'Record',
-          onClick: async () => {
-            // The toast lives 30 s; a recording may have started meanwhile.
-            if (await invoke<boolean>('is_recording')) {
-              toast('Already recording');
-              return;
-            }
-            await invoke('mark_recording_for_call', { key: payload.key });
-            sessionStorage.setItem('autoStartRecording', 'true');
-            window.location.assign('/');
-          },
-        },
-      });
-    });
-    const ended = listen<CallEvent>('call-ended', ({ payload }) => {
-      toast(`${payload.name} stopped using your microphone`, {
-        description: 'Stop recording?',
-        duration: 60_000,
-        action: {
-          label: 'Stop',
-          onClick: () => {
-            invoke<boolean>('stop_recording_for_call', { key: payload.key })
-              .then(stopped => { if (!stopped) toast('No recording of this call to stop'); })
-              .catch(error => console.error('Stop failed:', error));
-          },
-        },
-      });
+    const started = listen<{ name: string; auto_started: boolean }>('call-detected', ({ payload }) => {
+      if (payload.auto_started && !showOnboarding) toast.success(`Recording your ${payload.name} call`);
     });
     return () => {
       started.then(fn => fn());
-      ended.then(fn => fn());
     };
   }, [showOnboarding]);
 

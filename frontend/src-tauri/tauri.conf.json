@@ -38,6 +38,16 @@
             },
             "capabilities": [
                 {
+                    "identifier": "call-prompt",
+                    "description": "The floating call prompt: only its own answer command",
+                    "windows": [
+                        "call-prompt"
+                    ],
+                    "permissions": [
+                        "core:default"
+                    ]
+                },
+                {
                     "identifier": "main",
                     "description": "Main window capability with file system and media access",
                     "windows": [
