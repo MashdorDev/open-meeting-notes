@@ -178,7 +178,9 @@ export default function RootLayout({
         action: {
           label: 'Stop',
           onClick: () => {
-            invoke('stop_recording_for_call', { key: payload.key }).catch(error => console.error('Stop failed:', error));
+            invoke<boolean>('stop_recording_for_call', { key: payload.key })
+              .then(stopped => { if (!stopped) toast('No recording of this call to stop'); })
+              .catch(error => console.error('Stop failed:', error));
           },
         },
       });

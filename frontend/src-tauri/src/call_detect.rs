@@ -261,16 +261,30 @@ async fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
     }
 }
 
-/// The call a running recording was started for (by auto-start or the
-/// prompt's Record), so "stop recording?" is offered only for that one.
-static RECORDING_FOR_CALL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The call a recording was started for (by auto-start or the prompt's
+/// Record), and when, so "stop recording?" is offered only for that one.
+static RECORDING_FOR_CALL: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// How long a mark waits for its recording to start: the prompt's Record
+/// reloads the page first, so the recording begins a few seconds later.
+const MARK_WAITS_FOR_START: Duration = Duration::from_secs(60);
 
 fn recording_for_call() -> Option<String> {
-    RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(k, _)| k.clone())
 }
 
 fn set_recording_for_call(key: Option<String>) {
-    *RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()) = key;
+    *RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()) = key.map(|k| (k, std::time::Instant::now()));
+}
+
+/// Drops the mark once its recording has ended, or when no recording
+/// followed it in time. Never while it waits for its recording to start.
+fn expire_mark(was_recording: bool, recording: bool) {
+    let mut mark = RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner());
+    let waited_too_long = mark.as_ref().is_some_and(|(_, at)| at.elapsed() > MARK_WAITS_FOR_START);
+    if (was_recording && !recording) || (!recording && waited_too_long) {
+        *mark = None;
+    }
 }
 
 /// The prompt's Record: remembers which call the recording is for.
@@ -303,6 +317,7 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
     }
     tauri::async_runtime::spawn(async move {
         let mut tracker = Tracker::default();
+        let mut was_recording = false;
         loop {
             tokio::time::sleep(POLL_EVERY).await;
             let settings = load_settings(&app);
@@ -317,9 +332,8 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
             let present: HashSet<&'static str> = users.iter().filter_map(|id| classify(id)).map(|a| a.key).collect();
             let (started, ended) = tracker.poll(&present);
             let recording = crate::is_recording().await;
-            if !recording {
-                set_recording_for_call(None);
-            }
+            expire_mark(was_recording, recording);
+            was_recording = recording;
             for key in started {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 if recording || settings.ignored_apps.iter().any(|k| k == key) || !onboarding_done(&app).await {
@@ -369,6 +383,20 @@ mod tests {
         t.poll(&set(&["teams"]));
         t.poll(&set(&[]));
         assert_eq!(t.poll(&set(&["teams"])), (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_mark_survives_until_its_recording_ends() {
+        set_recording_for_call(Some("zoom".into()));
+        // Waiting for the recording to start (the page reloads first).
+        expire_mark(false, false);
+        assert_eq!(recording_for_call().as_deref(), Some("zoom"));
+        expire_mark(false, true);
+        expire_mark(true, true);
+        assert_eq!(recording_for_call().as_deref(), Some("zoom"));
+        // The recording ended.
+        expire_mark(true, false);
+        assert_eq!(recording_for_call(), None);
     }
 
     #[test]
