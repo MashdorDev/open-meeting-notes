@@ -21,9 +21,14 @@ use super::speaker_source::{Attribution, SpeakerEnergyTimeline};
 /// length. The live path cannot: with continuous audio (e.g. a podcast played
 /// as system audio) a 2000ms redemption keeps one VAD segment open
 /// indefinitely, withholds live transcript emission, and overruns the
-/// accumulated-speech-buffer warning threshold. Bounded live segmentation
-/// during continuous speech is tracked separately in #756.
+/// accumulated-speech-buffer warning threshold.
 const VAD_REDEMPTION_TIME_MS: u32 = 500;
+
+/// Even 500ms is too long a pause to wait for when speech never stops: a
+/// podcast played as system audio produced a first segment of 57 s, so the
+/// live transcript stayed empty for a minute. Speech that runs this long goes
+/// out anyway, cut at a quiet spot near the end (see `with_max_segment_ms`).
+const LIVE_MAX_SEGMENT_MS: u32 = 12_000;
 
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
@@ -794,10 +799,9 @@ impl AudioPipeline {
         // batch value (2000ms, `import.rs`/`retranscription.rs`) was tried here
         // first, but under continuous system audio it kept a VAD segment open
         // indefinitely and withheld live transcript emission, so live and batch
-        // deliberately diverge. Bounded live segments under continuous speech
-        // are tracked in #756.
-        let vad_processor =
-            ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+        // deliberately diverge.
+        let vad_processor = ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?
+            .with_max_segment_ms(LIVE_MAX_SEGMENT_MS);
         let mic_vad = ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
         let sys_vad = ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
         info!(
@@ -1462,9 +1466,15 @@ mod tests {
 
     #[test]
     fn test_live_vad_redemption_matches_pro_policy() {
-        // Live uses the established 500ms pause policy; it does not bound
-        // uninterrupted speech. Batch import/retranscription use 2000ms.
-        // See #679 and #756.
+        // Live uses the established 500ms pause policy. Batch
+        // import/retranscription use 2000ms. See #679.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
+    }
+
+    #[test]
+    fn live_segments_fit_inside_the_speaker_timeline() {
+        // The speaker timeline only keeps the last RETAIN_MS of audio; a longer
+        // segment would be labelled from part of its span.
+        assert!((LIVE_MAX_SEGMENT_MS as f64) < crate::audio::speaker_source::RETAIN_MS);
     }
 }
