@@ -77,8 +77,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Auto-scroll when transcripts change (only if user is at bottom)
   useEffect(() => {
-    // Only auto-scroll if user was at the bottom before new content
-    if (isUserAtBottomRef.current && transcriptContainerRef.current) {
+    // Only auto-scroll if user was at the bottom before new content. With no
+    // transcript the panel shows the home page, which must open at its top.
+    if (transcripts.length > 0 && isUserAtBottomRef.current && transcriptContainerRef.current) {
       // Wait for Framer Motion animation to complete (150ms) before scrolling
       // This ensures scrollHeight includes the full rendered height of the new transcript
       const scrollTimeout = setTimeout(() => {

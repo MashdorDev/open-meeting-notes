@@ -866,7 +866,7 @@ pub fn run() {
             api::own_voice_status,
             api::forget_own_voice,
             api::set_transcript_speaker_name,
-            api::api_get_recent_meetings,
+            api::home::api_get_home_overview,
             api::get_meeting_speaker_guesses,
             api::dismiss_speaker_guess,
             api::confirm_speaker_guesses,
