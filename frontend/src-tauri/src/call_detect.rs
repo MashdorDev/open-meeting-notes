@@ -368,9 +368,11 @@ async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String) -> 
 const PROMPT_LABEL: &str = "call-prompt";
 const PROMPT_SECONDS: u64 = 30;
 const PROMPT_WIDTH: f64 = 400.0;
-const PROMPT_HEIGHT: f64 = 96.0;
+const PROMPT_HEIGHT: f64 = 120.0;
 /// Bumped per prompt, so an old prompt's timer can't close a newer one.
 static PROMPT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The call the open prompt is about, so another call ending leaves it.
+static PROMPT_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn query_value(text: &str) -> String {
     text.bytes()
@@ -378,10 +380,39 @@ fn query_value(text: &str) -> String {
         .collect()
 }
 
+/// Destroys at once: close() only requests it, and the label stays taken
+/// until a later event, so a new prompt built right after would fail.
 fn close_prompt<R: Runtime>(app: &AppHandle<R>) {
     use tauri::Manager;
+    *PROMPT_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if let Some(window) = app.get_webview_window(PROMPT_LABEL) {
-        let _ = window.close();
+        let _ = window.destroy();
+    }
+}
+
+/// Closes the prompt only if it is about this call.
+fn close_prompt_for<R: Runtime>(app: &AppHandle<R>, key: &str) {
+    let current = PROMPT_KEY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if current.as_deref() == Some(key) {
+        close_prompt(app);
+    }
+}
+
+/// macOS: also show over a call app in native fullscreen (another Space).
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)] // objc 0.2's msg_send! checks a cfg this crate doesn't declare
+fn show_over_fullscreen<R: Runtime>(window: &tauri::WebviewWindow<R>) {
+    use objc::{msg_send, sel, sel_impl};
+    // NSWindowCollectionBehaviorCanJoinAllSpaces | FullScreenAuxiliary.
+    const BEHAVIOR: u64 = 1 << 0 | 1 << 8;
+    if let Ok(ns_window) = window.ns_window() {
+        let ns_window = ns_window as *mut objc::runtime::Object;
+        // SAFETY: a live NSWindow; setCollectionBehavior is safe on the main
+        // thread, where Tauri builds windows.
+        unsafe {
+            let current: u64 = msg_send![ns_window, collectionBehavior];
+            let _: () = msg_send![ns_window, setCollectionBehavior: current | BEHAVIOR];
+        }
     }
 }
 
@@ -406,6 +437,7 @@ fn show_prompt<R: Runtime>(app: &AppHandle<R>, key: &str, name: &str, kind: &'st
         }
         _ => (40.0, top_gap),
     };
+    *PROMPT_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.to_string());
     let built = WebviewWindowBuilder::new(app, PROMPT_LABEL, WebviewUrl::App(url.into()))
         .title("Open Meeting Notes")
         .inner_size(PROMPT_WIDTH, PROMPT_HEIGHT)
@@ -418,10 +450,19 @@ fn show_prompt<R: Runtime>(app: &AppHandle<R>, key: &str, name: &str, kind: &'st
         .skip_taskbar(true)
         .resizable(false)
         .focused(false)
+        // The first click presses the button even though the call app has
+        // the focus (macOS would otherwise spend it activating this app).
+        .accept_first_mouse(true)
         .build();
-    if let Err(e) = built {
-        warn!("Call detection: prompt window not shown: {}", e);
-        return;
+    match built {
+        Ok(_window) => {
+            #[cfg(target_os = "macos")]
+            show_over_fullscreen(&_window);
+        }
+        Err(e) => {
+            warn!("Call detection: prompt window not shown: {}", e);
+            return;
+        }
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -512,7 +553,7 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 info!("Call detection: {} stopped using the microphone", call_app.name);
                 // A record prompt still up for this call has nothing left to offer.
-                close_prompt(&app);
+                close_prompt_for(&app, key);
                 if call_recording.as_deref() == Some(key) {
                     info!("Call detection: asking whether to stop the {} call's recording", key);
                     show_prompt(&app, key, call_app.name, "ended");

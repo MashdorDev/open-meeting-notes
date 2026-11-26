@@ -59,8 +59,13 @@
   document.getElementById('no').textContent = ended ? 'Keep recording' : 'Not now';
   // No bundler here, so the Tauri bridge is used directly.
   const invoke = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args);
-  document.getElementById('yes').onclick = () => invoke('call_prompt_answer', { key, kind: ended ? 'ended' : 'started', accept: true });
-  document.getElementById('no').onclick = () => invoke('call_prompt_answer', { key, kind: ended ? 'ended' : 'started', accept: false });
+  // One answer only: a double click would start (or stop) twice.
+  const answer = (accept) => {
+    document.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    invoke('call_prompt_answer', { key, kind: ended ? 'ended' : 'started', accept });
+  };
+  document.getElementById('yes').onclick = () => answer(true);
+  document.getElementById('no').onclick = () => answer(false);
 </script>
 </body>
 </html>
