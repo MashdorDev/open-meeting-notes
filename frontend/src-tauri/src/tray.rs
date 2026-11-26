@@ -35,10 +35,29 @@ pub fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
+/// A key held down, or pressed twice, sends the toggle again. The recording
+/// flag clears before the stopped meeting is saved, so a second toggle in
+/// that window would start a new recording over the save.
+const SHORTCUT_TOGGLE_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+static LAST_SHORTCUT_TOGGLE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Start or stop recording from the menu bar or a keyboard shortcut, ignoring
+/// a repeat within SHORTCUT_TOGGLE_GAP.
+pub(crate) fn toggle_recording_from_keys<R: Runtime>(app: &AppHandle<R>) {
+    let mut last = LAST_SHORTCUT_TOGGLE.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < SHORTCUT_TOGGLE_GAP) {
+        log::info!("Recording toggle ignored: repeated within {:?}", SHORTCUT_TOGGLE_GAP);
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+    toggle_recording_handler(app);
+}
+
 /// Ctrl+Shift+R on Windows: the tray's Start/Stop Recording, from the keyboard.
 #[tauri::command]
 pub fn toggle_recording_from_shortcut<R: Runtime>(app: AppHandle<R>) {
-    toggle_recording_handler(&app);
+    toggle_recording_from_keys(&app);
 }
 
 pub(crate) fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {

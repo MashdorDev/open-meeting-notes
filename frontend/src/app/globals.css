@@ -246,9 +246,11 @@ html[data-platform] a[href] {
   cursor: pointer;
 }
 
-/* Controls and labels can't be selected or dragged like page text. Meeting
-   text, notes and fields stay selectable. */
-html[data-platform] :is(button, [role="button"], [role="tab"], [role="menuitem"], label, nav, h1, h2, h3, h4, svg) {
+/* Controls can't be selected or dragged like page text. Editors (the
+   summary's headings are real h1-h3 inside BlockNote) and the transcript,
+   whose speaker and time labels are buttons, stay selectable so a copy
+   keeps them. */
+html[data-platform] :is(button, [role="button"], [role="tab"], [role="menuitem"], label, nav, svg):not([contenteditable] *):not([data-selectable-text] *) {
   -webkit-user-select: none;
   user-select: none;
 }

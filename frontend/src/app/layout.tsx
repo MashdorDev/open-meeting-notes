@@ -120,8 +120,12 @@ export default function RootLayout({
       const handleContextMenu = (e: MouseEvent) => {
         const target = e.target as HTMLElement | null;
         const editable = target?.closest('input, textarea, [contenteditable="true"]');
-        const hasSelection = (window.getSelection()?.toString().trim() ?? '') !== '';
-        if (!editable && !hasSelection) e.preventDefault();
+        // Only a right-click on the selected text itself: a selection elsewhere
+        // must not open the webview menu (Refresh) over the app's controls.
+        const selection = window.getSelection();
+        const onSelection = !!target && !!selection && selection.toString().trim() !== ''
+          && selection.containsNode(target, true);
+        if (!editable && !onSelection) e.preventDefault();
       };
       document.addEventListener('contextmenu', handleContextMenu);
       return () => document.removeEventListener('contextmenu', handleContextMenu);
@@ -308,23 +312,35 @@ export default function RootLayout({
 
   // The menu bar's Import Audio… (macOS), and the same commands as keyboard
   // shortcuts on Windows, where apps usually have no menu bar.
+  // Same gates as the other ways in: not during onboarding (no model yet),
+  // and only with the Import beta on, saying so when it is off.
+  const openImportFromShortcut = useCallback(() => {
+    if (showOnboarding) return;
+    if (!loadBetaFeatures().importAndRetranscribe) {
+      toast.error('Beta feature disabled', {
+        description: 'Enable "Import Audio & Retranscribe" in Settings > Beta to use this feature.'
+      });
+      return;
+    }
+    handleOpenImportDialog();
+  }, [showOnboarding, handleOpenImportDialog]);
   useEffect(() => {
-    const unlisten = listen('open-import-dialog', () => handleOpenImportDialog());
+    const unlisten = listen('open-import-dialog', openImportFromShortcut);
     return () => {
       unlisten.then(fn => fn());
     };
-  }, [handleOpenImportDialog]);
+  }, [openImportFromShortcut]);
   useEffect(() => {
     if (document.documentElement.dataset.platform !== 'windows') return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!e.ctrlKey || e.altKey || e.metaKey) return;
+      if (!e.ctrlKey || e.altKey || e.metaKey || e.repeat) return;
       const key = e.key.toLowerCase();
       if (key === ',' && !e.shiftKey) {
         e.preventDefault();
         router.push('/settings');
       } else if (key === 'o' && !e.shiftKey) {
         e.preventDefault();
-        handleOpenImportDialog();
+        openImportFromShortcut();
       } else if (key === 'r' && e.shiftKey) {
         e.preventDefault();
         invoke('toggle_recording_from_shortcut').catch(error => console.error('Shortcut failed:', error));
@@ -332,7 +348,7 @@ export default function RootLayout({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [router, handleOpenImportDialog]);
+  }, [router, openImportFromShortcut]);
 
   const handleOnboardingComplete = () => {
     console.log('[Layout] Onboarding completed, reloading app')

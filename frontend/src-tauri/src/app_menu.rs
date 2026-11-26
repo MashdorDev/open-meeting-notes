@@ -58,9 +58,10 @@ pub fn handle_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
                 log::error!("Menu: failed to emit open-import-dialog: {}", e);
             }
         }
-        // Settings and recording do exactly what the tray items do.
+        // Settings does what the tray item does; the recording toggle skips
+        // a key repeat (Cmd+Shift+R held down).
         "menu_settings" => crate::tray::handle_menu_event(app, "settings"),
-        "menu_toggle_recording" => crate::tray::handle_menu_event(app, "toggle_recording"),
+        "menu_toggle_recording" => crate::tray::toggle_recording_from_keys(app),
         _ => {}
     }
 }
