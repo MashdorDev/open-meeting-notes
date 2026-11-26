@@ -7,7 +7,7 @@ interface AccuracyCounts {
   scored: number;
   correct: number;
   unlabelled: number;
-  /** Lines whose voice had a suggested name. */
+  /** Lines whose voice was named from an earlier meeting. */
   guessed: number;
 }
 
@@ -52,7 +52,7 @@ export function SpeakerAccuracy({ meetingId, refreshKey }: SpeakerAccuracyProps)
       )}
       {percent(result.overall)} of {result.overall.scored} across all meetings
       {result.overall.unlabelled > 0 && ` (${result.overall.unlabelled} had no label)`}.
-      {result.overall.guessed > 0 && ` ${result.overall.guessed} had a suggested name (from earlier meetings or from the transcript).`}
+      {result.overall.guessed > 0 && ` ${result.overall.guessed} were named automatically from earlier meetings.`}
     </p>
   );
 }

@@ -70,7 +70,7 @@ impl SpeakerClusterer {
     pub fn voiceprints(&self) -> Vec<Voiceprint> {
         self.clusters
             .iter()
-            .map(|c| Voiceprint { label: c.label.clone(), segments: c.count, embedding: c.centroid.clone(), name: None, dismissed: false, heard_name: None, lines: 0 })
+            .map(|c| Voiceprint { label: c.label.clone(), segments: c.count, embedding: c.centroid.clone(), name: None, dismissed: false, heard_name: None, heard_dismissed: None, lines: 0 })
             .collect()
     }
 

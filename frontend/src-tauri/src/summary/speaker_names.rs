@@ -183,9 +183,30 @@ fn clean_name(name: &str) -> Option<String> {
     ok.then(|| name.to_string())
 }
 
+/// How far after a name said to someone the answer is looked for.
+const ANSWER_LOOKAHEAD_LINES: usize = 3;
+
+/// The line that answers line `at`: the next one from a different voice
+/// within a few lines. After a Me line that is any Others line; after an
+/// Others line it is a Me line or an Others line with another label.
+fn answer_after(lines: &[Line], at: usize) -> Option<&Line> {
+    let line = &lines[at];
+    lines[at + 1..].iter().take(ANSWER_LOOKAHEAD_LINES).find(|l| match line.side {
+        Side::Me => l.side == Side::Others,
+        Side::Others => l.side == Side::Me || (l.label.is_some() && l.label != line.label),
+    })
+}
+
+/// Whether the name at `at` in the line introduces that line's speaker.
+fn introduces_speaker(line: &Line, name_words: &[String]) -> bool {
+    let words = lowercase(&raw_words(&line.text));
+    find_name(&words, name_words).is_some_and(|at| is_self_intro(&words, at, name_words.len()))
+}
+
 /// Keeps proposals whose quoted line holds the name (capitalised there, in
 /// scripts with case, so "I will" does not back "Will") and that are not a
-/// name Dor introduces himself with. In order, without duplicates.
+/// name Dor introduces himself with or answers to. In order, without
+/// duplicates.
 #[cfg(test)]
 fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
     accept_proposals(lines, proposals).into_iter().map(|p| p.name).collect()
@@ -215,6 +236,14 @@ fn accept_proposals(lines: &[Line], proposals: &[Proposal]) -> Vec<Proposal> {
         if !capitalised || own_name(&name_words) {
             continue;
         }
+        // Said to someone on the other side, and Dor is the one who answers:
+        // "Dor, what do you think?" names Dor, not anyone on the call.
+        let said_to_me = line.side == Side::Others
+            && !introduces_speaker(line, &name_words)
+            && answer_after(lines, proposal.line).is_some_and(|l| l.side == Side::Me);
+        if said_to_me {
+            continue;
+        }
         // "Ana" and "Ana Silva" are the same person.
         let same_person = |a: &String| {
             let a = lowercase(&raw_words(a));
@@ -230,9 +259,6 @@ fn accept_proposals(lines: &[Line], proposals: &[Proposal]) -> Vec<Proposal> {
     accepted
 }
 
-/// How far after a name said to someone the answer is looked for.
-const ANSWER_LOOKAHEAD_LINES: usize = 3;
-
 /// The voice each accepted name belongs to, as (label, name). A line that
 /// introduces its speaker ("I'm Sarah") names that line's voice. A name said
 /// to someone ("Alyssa, you're up first") names the next voice that answers,
@@ -243,17 +269,11 @@ fn voices_for_names(lines: &[Line], accepted: &[Proposal]) -> Vec<(String, Strin
     let mut found: Vec<(String, String)> = Vec::new();
     for p in accepted {
         let Some(line) = lines.get(p.line) else { continue };
-        let words = lowercase(&raw_words(&line.text));
         let name_words = lowercase(&raw_words(&p.name));
-        let Some(at) = find_name(&words, &name_words) else { continue };
-        let label = if line.side == Side::Others && is_self_intro(&words, at, name_words.len()) {
+        let label = if line.side == Side::Others && introduces_speaker(line, &name_words) {
             line.label.clone()
         } else {
-            lines[p.line + 1..]
-                .iter()
-                .take(ANSWER_LOOKAHEAD_LINES)
-                .find(|l| l.side == Side::Others && l.label.is_some() && (line.side == Side::Me || l.label != line.label))
-                .and_then(|l| l.label.clone())
+            answer_after(lines, p.line).filter(|l| l.side == Side::Others).and_then(|l| l.label.clone())
         };
         let Some(label) = label else { continue };
         if found.iter().any(|(l, n)| *l == label || *n == p.name) {
@@ -481,6 +501,18 @@ mod tests {
     }
 
     #[test]
+    fn a_name_said_to_the_user_is_not_someone_on_the_call() {
+        let lines = vec![
+            voice("Speaker 1", "Dor, what do you think?"),
+            me("I think we ship it."),
+            voice("Speaker 3", "Agreed."),
+        ];
+        let accepted = accept_proposals(&lines, &[proposal("Dor", 0)]);
+        assert!(accepted.is_empty());
+        assert!(voices_for_names(&lines, &accepted).is_empty());
+    }
+
+    #[test]
     fn each_voice_gets_one_name() {
         let lines = vec![
             me("Sarah, can you start?"),
@@ -498,7 +530,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let print = |label: &str, heard: Option<&str>| Voiceprint {
             label: label.into(), segments: 3, embedding: vec![1.0], name: None, dismissed: false,
-            heard_name: heard.map(Into::into), lines: 3,
+            heard_name: heard.map(Into::into), heard_dismissed: None, lines: 3,
         };
         write_voiceprints(folder.path(), &[print("Speaker 1", Some("Old")), print("Speaker 2", None)]).unwrap();
         let heard = vec![("Speaker 2".to_string(), "Alyssa".to_string())];
