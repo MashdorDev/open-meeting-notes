@@ -659,10 +659,18 @@ async fn run_import<R: Runtime>(
         warn!("Failed to write transcripts.json: {}", e);
     }
 
+    // A title left as the file name was picked by the app, not typed by the user.
+    let file_stem = std::path::Path::new(&source_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string);
+    let title_from_file = file_stem.as_deref() == Some(title.as_str());
+
     if let Err(e) = write_import_metadata(
         &meeting_folder,
         &meeting_id,
         &title,
+        title_from_file,
         duration_seconds,
         &dest_filename,
         "import",
@@ -670,12 +678,7 @@ async fn run_import<R: Runtime>(
         warn!("Failed to write metadata.json: {}", e);
     }
 
-    // A title left as the file name was picked by the app, not typed by the user.
-    let file_stem = std::path::Path::new(&source_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(str::to_string);
-    if file_stem.as_deref() == Some(title.as_str()) {
+    if title_from_file {
         let transcript_text = all_transcripts
             .iter()
             .map(|(text, _, _)| text.as_str())
@@ -908,6 +911,7 @@ fn write_import_metadata(
     folder: &Path,
     meeting_id: &str,
     title: &str,
+    title_from_file: bool,
     duration_seconds: f64,
     audio_filename: &str,
     source: &str,
@@ -920,6 +924,8 @@ fn write_import_metadata(
         "version": "1.0",
         "meeting_id": meeting_id,
         "meeting_name": title,
+        // The title is the file's name, so the auto title may replace it.
+        "title_from_file": title_from_file,
         "created_at": now,
         "completed_at": now,
         "duration_seconds": duration_seconds,
@@ -1254,6 +1260,7 @@ mod tests {
             dir.path(),
             "meeting-123",
             "Test Meeting",
+            false,
             1800.0,
             "audio.mp4",
             "import",
@@ -1268,6 +1275,7 @@ mod tests {
         assert_eq!(parsed["version"], "1.0");
         assert_eq!(parsed["meeting_id"], "meeting-123");
         assert_eq!(parsed["meeting_name"], "Test Meeting");
+        assert_eq!(parsed["title_from_file"], false);
         assert_eq!(parsed["duration_seconds"], 1800.0);
         assert_eq!(parsed["audio_file"], "audio.mp4");
         assert_eq!(parsed["status"], "completed");
