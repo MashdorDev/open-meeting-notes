@@ -10,6 +10,7 @@ import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { ModalType } from '@/hooks/useModalState';
 import { useIsLinux } from '@/hooks/usePlatform';
 import { useMemo } from 'react';
+import { RecentMeetings } from '@/components/RecentMeetings';
 
 /**
  * TranscriptPanel Component
@@ -107,6 +108,9 @@ export function TranscriptPanel({
       <div className="pb-20">
         <div className="flex justify-center">
           <div className="w-2/3 max-w-[750px]">
+            {segments.length === 0 && !isRecording && !isProcessingStop && !isStopping ? (
+              <RecentMeetings hasMicrophone={hasMicrophone} hasSystemAudio={hasSystemAudio} />
+            ) : (
             <VirtualizedTranscriptView
               segments={segments}
               isRecording={isRecording}
@@ -117,6 +121,7 @@ export function TranscriptPanel({
               showConfidence={true}
               speakerGuesses={speakerGuesses}
             />
+            )}
           </div>
         </div>
       </div>
