@@ -14,6 +14,7 @@ interface HomeMeeting {
   created_at: string;
   duration_seconds: number | null;
   names: string[];
+  has_summary: boolean;
   summary_line: string | null;
   action_items: number | null;
 }
@@ -159,8 +160,10 @@ export function RecentMeetings({ hasMicrophone, hasSystemAudio }: { hasMicrophon
               <Button size="sm" variant="outline" onClick={() => open(latest.id, latest.title)}>Open</Button>
             </div>
             <p className="text-sm text-gray-500 mt-0.5">{when(latest)}</p>
-            <p className="text-sm text-gray-800 mt-3">{latest.summary_line ?? 'No summary yet.'}</p>
-            {latest.action_items !== null && (
+            <p className="text-sm text-gray-800 mt-3">
+              {latest.has_summary ? latest.summary_line ?? 'Summary ready.' : 'No summary yet.'}
+            </p>
+            {latest.has_summary && latest.action_items !== null && (
               <p className="text-sm text-gray-500 mt-1">{actionItemsLabel(latest.action_items)}</p>
             )}
           </div>

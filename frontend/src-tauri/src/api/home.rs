@@ -23,11 +23,22 @@ const SUMMARY_LINE_CHARS: usize = 160;
 pub struct HomeMeeting {
     #[serde(flatten)]
     pub meeting: RecentMeeting,
-    /// The first sentence of the summary, when there is one.
+    /// A summary is stored, whatever its status (a cancelled or failed
+    /// regeneration keeps the old one, and the meeting page shows it).
+    pub has_summary: bool,
+    /// The first sentence of the Summary section, when it has one.
     pub summary_line: Option<String>,
-    /// Action items in the summary; None when there is no summary.
+    /// Tasks in the summary's task section; None when it has none (some
+    /// templates have no such section) or there is no summary.
     pub action_items: Option<usize>,
 }
+
+/// A summary run stuck in progress this long is taken as abandoned (the app
+/// was closed or crashed mid-run), so the meeting shows as unsummarized.
+const STALE_RUN_MINUTES: i64 = 60;
+
+/// Headings that hold the tasks, across the bundled templates.
+const TASK_SECTIONS: &[&str] = &["action item", "next step", "to do", "todo", "tasks"];
 
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -74,20 +85,23 @@ pub async fn api_get_home_overview(
 async fn home_overview(pool: &SqlitePool, week_start: DateTime<Utc>, now: DateTime<Utc>) -> Result<HomeOverview, sqlx::Error> {
     let mut meetings: Vec<HomeMeeting> = Vec::new();
     for meeting in recent_meetings(pool, HOME_MEETINGS).await? {
-        let markdown = summary_markdown(pool, &meeting.id).await;
+        let stored = stored_summary(pool, &meeting.id).await;
+        let markdown = stored.as_ref().and_then(summary_markdown);
         meetings.push(HomeMeeting {
+            has_summary: stored.is_some(),
             summary_line: markdown.as_deref().and_then(summary_line),
-            action_items: markdown.as_deref().map(action_item_count),
+            action_items: markdown.as_deref().and_then(action_item_count),
             meeting,
         });
     }
 
     // Every meeting with its start, length and summary status, newest first.
-    let rows: Vec<(String, String, DateTimeUtc, Option<f64>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(String, String, DateTimeUtc, Option<f64>, Option<String>, Option<bool>, Option<DateTimeUtc>)> = sqlx::query_as(
         "SELECT m.id, m.title, m.created_at,
                 (SELECT MAX(t.audio_end_time) FROM transcripts t WHERE t.meeting_id = m.id),
-                (SELECT s.status FROM summary_processes s WHERE s.meeting_id = m.id)
-         FROM meetings m ORDER BY m.created_at DESC",
+                LOWER(s.status), s.result IS NOT NULL, s.updated_at
+         FROM meetings m LEFT JOIN summary_processes s ON s.meeting_id = m.id
+         ORDER BY m.created_at DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -98,7 +112,7 @@ async fn home_overview(pool: &SqlitePool, week_start: DateTime<Utc>, now: DateTi
     let attention_since = now - chrono::Duration::days(ATTENTION_DAYS);
     // The latest meeting's card already says it has no summary.
     let latest_id = meetings.first().map(|m| m.meeting.id.clone());
-    for (id, title, created_at, duration, summary_status) in rows {
+    for (id, title, created_at, duration, status, has_result, updated_at) in rows {
         if created_at.0 >= week_start {
             week_meetings += 1;
             week_seconds += duration.unwrap_or(0.0);
@@ -106,39 +120,56 @@ async fn home_overview(pool: &SqlitePool, week_start: DateTime<Utc>, now: DateTi
         if created_at.0 < attention_since || attention.len() >= MAX_ATTENTION {
             continue;
         }
-        // Names first: confirming them also improves the summary's names.
+        // One row per meeting. Names first: confirming them also gives the
+        // summary the right names.
         let open = open_speaker_guesses(pool, &id).await.map(|g| g.len()).unwrap_or(0);
         if open > 0 {
-            attention.push(Attention { meeting_id: id.clone(), title: title.clone(), kind: AttentionKind::Names, count: open });
+            attention.push(Attention { meeting_id: id, title, kind: AttentionKind::Names, count: open });
+            continue;
         }
-        let kind = match summary_status.as_deref() {
-            Some("failed") => Some(AttentionKind::SummaryFailed),
-            // Only a meeting with something to summarize, not shown above.
-            None if duration.is_some_and(|d| d >= MIN_SUMMARY_SECONDS) && latest_id.as_deref() != Some(id.as_str()) => {
-                Some(AttentionKind::NoSummary)
-            }
+        let worth_summarizing = duration.is_some_and(|d| d >= MIN_SUMMARY_SECONDS);
+        let stale = updated_at.is_none_or(|t| now - t.0 > chrono::Duration::minutes(STALE_RUN_MINUTES));
+        let kind = match (status.as_deref(), has_result.unwrap_or(false)) {
+            // A stored summary counts, whatever happened to a later run.
+            (_, true) => None,
+            (Some("failed"), false) => Some(AttentionKind::SummaryFailed),
+            (Some("pending" | "processing"), false) if !stale => None,
+            _ if worth_summarizing => Some(AttentionKind::NoSummary),
             _ => None,
         };
+        // The latest meeting's card already says it has no summary.
+        if kind == Some(AttentionKind::NoSummary) && latest_id.as_deref() == Some(id.as_str()) {
+            continue;
+        }
         if let Some(kind) = kind {
-            if attention.len() < MAX_ATTENTION {
-                attention.push(Attention { meeting_id: id, title, kind, count: 0 });
-            }
+            attention.push(Attention { meeting_id: id, title, kind, count: 0 });
         }
     }
     Ok(HomeOverview { meetings, attention, week_meetings, week_seconds })
 }
 
-async fn summary_markdown(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
-    let result: Option<String> =
-        sqlx::query_scalar("SELECT result FROM summary_processes WHERE meeting_id = ? AND status = 'completed'")
-            .bind(meeting_id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .flatten();
-    let value: serde_json::Value = serde_json::from_str(&result?).ok()?;
-    value.get("markdown")?.as_str().map(str::to_string)
+/// The stored summary, whatever the run's status, as the meeting page reads it.
+async fn stored_summary(pool: &SqlitePool, meeting_id: &str) -> Option<serde_json::Value> {
+    let result: Option<String> = sqlx::query_scalar("SELECT result FROM summary_processes WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    serde_json::from_str(&result?).ok()
+}
+
+/// The summary as markdown to read the line and tasks from: the English copy
+/// when the summary was translated (the headings are found by their English
+/// names), else the markdown. Edited summaries saved only as editor blocks,
+/// and legacy ones, have neither.
+fn summary_markdown(stored: &serde_json::Value) -> Option<String> {
+    stored
+        .pointer("/english_cache/markdown")
+        .or_else(|| stored.get("markdown"))?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// A heading line's text: "## Action Items", "**Action Items**" or
@@ -168,11 +199,11 @@ fn is_placeholder(text: &str) -> bool {
     t.is_empty() || t.starts_with("none noted") || t == "none" || t == "n/a" || t == "-"
 }
 
-/// The summary's first sentence, without markdown, cut to a line.
+/// The first sentence of the Summary section, without markdown, cut to a
+/// line. None without that section: the first other line is often a field
+/// such as a date.
 fn summary_line(markdown: &str) -> Option<String> {
-    let lines = section(markdown, "summary").unwrap_or_else(|| {
-        markdown.lines().filter(|l| heading_text(l).is_none()).collect()
-    });
+    let lines = section(markdown, "summary")?;
     let paragraph = lines.iter().map(|l| l.trim()).find(|l| !l.is_empty() && !l.starts_with('|'))?;
     let plain = paragraph.trim_start_matches(['-', '*', ' ']).replace("**", "");
     if is_placeholder(&plain) {
@@ -189,20 +220,23 @@ fn summary_line(markdown: &str) -> Option<String> {
     Some(line.trim().to_string())
 }
 
-/// Rows of the Action Items table, or its list items, that hold a task.
-fn action_item_count(markdown: &str) -> usize {
-    let Some(lines) = section(markdown, "action item") else { return 0 };
+/// Rows of the task table, or its list items, that hold a task. None when
+/// the summary has no task section at all.
+fn action_item_count(markdown: &str) -> Option<usize> {
+    let lines = TASK_SECTIONS.iter().find_map(|name| section(markdown, name))?;
     let table_rows: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| l.starts_with('|')).collect();
     if !table_rows.is_empty() {
         let is_separator = |row: &str| row.trim_matches('|').split('|').all(|c| c.trim().chars().all(|ch| matches!(ch, '-' | ':' | ' ')));
-        return table_rows
-            .iter()
-            .skip(1) // header
-            .filter(|row| !is_separator(row))
-            .filter(|row| !row.trim_matches('|').split('|').all(is_placeholder))
-            .count();
+        return Some(
+            table_rows
+                .iter()
+                .skip(1) // header
+                .filter(|row| !is_separator(row))
+                .filter(|row| !row.trim_matches('|').split('|').all(is_placeholder))
+                .count(),
+        );
     }
-    lines
+    let count = lines
         .iter()
         .map(|l| l.trim())
         .filter_map(|l| {
@@ -211,7 +245,8 @@ fn action_item_count(markdown: &str) -> usize {
                 .or_else(|| l.split_once(". ").filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit())).map(|(_, t)| t))
         })
         .filter(|t| !is_placeholder(t))
-        .count()
+        .count();
+    Some(count)
 }
 
 #[cfg(test)]
@@ -224,16 +259,28 @@ mod tests {
     fn the_summary_line_is_the_first_sentence() {
         assert_eq!(summary_line(SUMMARY).as_deref(), Some("The panel discussed quality culture."));
         assert_eq!(summary_line("## Summary\nNone noted in this section."), None);
+        // The daily standup template has no Summary section; its first line is the date.
+        assert_eq!(summary_line("**Date**\n2026-11-26\n\n**Today**\n- Ship it"), None);
     }
 
     #[test]
     fn action_items_count_table_rows_and_list_items() {
-        assert_eq!(action_item_count(SUMMARY), 2);
+        assert_eq!(action_item_count(SUMMARY), Some(2));
         let empty = "**Action Items**\n\n| Owner | Task |\n| --- | --- |\n| None noted in this section. | None noted in this section. |";
-        assert_eq!(action_item_count(empty), 0);
-        assert_eq!(action_item_count("**Action Items**\nNone noted in this section.\n"), 0);
-        assert_eq!(action_item_count("## Action items\n- Dana: send the deck\n- Tom: book the room\n1. Ana: call back\n## Notes\n- not a task"), 3);
-        assert_eq!(action_item_count("**Summary**\nNo tasks section at all."), 0);
+        assert_eq!(action_item_count(empty), Some(0));
+        assert_eq!(action_item_count("**Action Items**\nNone noted in this section.\n"), Some(0));
+        assert_eq!(action_item_count("## Action items\n- Dana: send the deck\n- Tom: book the room\n1. Ana: call back\n## Notes\n- not a task"), Some(3));
+        assert_eq!(action_item_count("**Summary**\nNo tasks section at all."), None);
+        // The sales call template keeps its tasks under Next Steps.
+        assert_eq!(action_item_count("**Next Steps**\n- Send pricing\n- Book a demo"), Some(2));
+    }
+
+    #[test]
+    fn a_translated_summary_is_read_from_its_english_copy() {
+        let stored = serde_json::json!({ "markdown": "**סיכום**\nטקסט", "english_cache": { "markdown": SUMMARY } });
+        let md = summary_markdown(&stored).unwrap();
+        assert_eq!(action_item_count(&md), Some(2));
+        assert!(summary_markdown(&serde_json::json!({ "summary_json": [] })).is_none());
     }
 
     #[tokio::test]
@@ -241,7 +288,7 @@ mod tests {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, folder_path TEXT)").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, audio_start_time REAL, audio_end_time REAL, speaker_name TEXT, speaker_label TEXT, speaker_name_pinned INTEGER)").execute(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE summary_processes (meeting_id TEXT PRIMARY KEY, status TEXT, result TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE summary_processes (meeting_id TEXT PRIMARY KEY, status TEXT, result TEXT, updated_at TEXT)").execute(&pool).await.unwrap();
         for (id, title, at, end) in [
             ("a", "Summarized", "2026-11-26T09:00:00Z", 600.0),
             ("b", "Unsummarized", "2026-11-25T09:00:00Z", 600.0),
@@ -253,7 +300,9 @@ mod tests {
             sqlx::query("INSERT INTO transcripts (id, meeting_id, audio_start_time, audio_end_time) VALUES (?, ?, 0, ?)").bind(format!("t{id}")).bind(id).bind(end).execute(&pool).await.unwrap();
         }
         let result = serde_json::json!({ "markdown": SUMMARY }).to_string();
-        sqlx::query("INSERT INTO summary_processes VALUES ('a', 'completed', ?), ('c', 'failed', NULL)").bind(result).execute(&pool).await.unwrap();
+        // "c" failed with nothing stored; "e" is short. A regeneration of "a"
+        // that was cancelled keeps the old summary, so "a" still has one.
+        sqlx::query("INSERT INTO summary_processes VALUES ('a', 'CANCELLED', ?, '2026-11-26T09:30:00Z'), ('c', 'FAILED', NULL, '2026-11-24T10:00:00Z')").bind(result).execute(&pool).await.unwrap();
 
         let now = DateTime::parse_from_rfc3339("2026-11-26T12:00:00Z").unwrap().with_timezone(&Utc);
         let week_start = DateTime::parse_from_rfc3339("2026-11-23T00:00:00Z").unwrap().with_timezone(&Utc);
@@ -261,8 +310,10 @@ mod tests {
 
         assert_eq!(overview.week_meetings, 4);
         assert_eq!(overview.week_seconds, 1820.0);
+        assert!(overview.meetings[0].has_summary);
         assert_eq!(overview.meetings[0].summary_line.as_deref(), Some("The panel discussed quality culture."));
         assert_eq!(overview.meetings[0].action_items, Some(2));
+        assert!(!overview.meetings[1].has_summary);
         assert_eq!(overview.meetings[1].action_items, None);
         let kinds: Vec<_> = overview.attention.iter().map(|a| (a.meeting_id.as_str(), &a.kind)).collect();
         assert_eq!(kinds, [("b", &AttentionKind::NoSummary), ("c", &AttentionKind::SummaryFailed)]);
