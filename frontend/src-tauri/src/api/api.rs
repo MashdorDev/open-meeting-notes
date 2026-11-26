@@ -1324,7 +1324,9 @@ pub async fn get_speaker_accuracy(
 }
 
 /// The names the app guessed for a meeting's voices, by label, from the
-/// voiceprints saved with it. Empty when it has none or they can't be read.
+/// voiceprints saved with it: a voice that matched a profile, else the name
+/// it answered to in the transcript. Empty when it has none or they can't be
+/// read.
 /// With `with_dismissed`, guesses Dor rejected are included too (for the
 /// accuracy score, which counts them as wrong).
 async fn meeting_speaker_guesses(pool: &sqlx::SqlitePool, meeting_id: &str, with_dismissed: bool) -> HashMap<String, String> {
@@ -1333,7 +1335,7 @@ async fn meeting_speaker_guesses(pool: &sqlx::SqlitePool, meeting_id: &str, with
         Ok(voices) => voices
             .into_iter()
             .filter(|v| with_dismissed || !v.dismissed)
-            .filter_map(|v| Some((v.label, v.name?)))
+            .filter_map(|v| Some((v.label, v.name.or(v.heard_name)?)))
             .collect(),
         Err(e) => {
             log_warn!("Speaker guesses not read: {}", e);
@@ -1944,7 +1946,7 @@ mod tests {
         .unwrap();
         let folder = tempfile::tempdir().unwrap();
         let voice = |label: &str, name: &str, dismissed| Voiceprint {
-            label: label.into(), segments: 5, embedding: vec![0.6, 0.8], name: Some(name.into()), dismissed, lines: 5,
+            label: label.into(), segments: 5, embedding: vec![0.6, 0.8], name: Some(name.into()), dismissed, heard_name: None, lines: 5,
         };
         write_voiceprints(
             folder.path(),
@@ -2012,7 +2014,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         write_voiceprints(
             folder.path(),
-            &[Voiceprint { label: "Speaker 2".into(), segments: 7, embedding: vec![0.6, 0.8], name: None, dismissed: false, lines: 7 }],
+            &[Voiceprint { label: "Speaker 2".into(), segments: 7, embedding: vec![0.6, 0.8], name: None, dismissed: false, heard_name: None, lines: 7 }],
         )
         .unwrap();
         sqlx::query("INSERT INTO meetings VALUES ('m1', ?), ('m2', NULL)")

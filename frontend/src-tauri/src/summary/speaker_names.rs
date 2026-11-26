@@ -21,10 +21,11 @@ const MAX_NAME_CHARS: usize = 40;
 const MAX_NAMES: usize = 5;
 
 const SYSTEM_PROMPT: &str = "You find the names of the people on the other side of a call. \
-Each transcript line is numbered and starts with Me: (the user) or Others: (the other side). \
+Each transcript line is numbered and starts with Me: (the user) or Others: (the other side); \
+an Others line may name its voice, as in Others (Speaker 2):. \
 Reply with only JSON: {\"names\": [{\"name\": \"Sarah\", \"line\": 12}]}. \
 List a name only if an Others line introduces that person (\"I'm Sarah\", \"this is Dan\") \
-or a Me line speaks to someone by name and the other side answers. \
+or a line speaks to someone by name (\"Sarah, you're up first\") and a different voice answers. \
 \"line\" is the number of the line that contains the name. \
 Never list the user's own name or people who are only talked about. \
 If no name is clear, reply {\"names\": []}.";
@@ -43,6 +44,8 @@ enum Side {
 
 struct Line {
     side: Side,
+    /// The voice ("Speaker 2"), on lines the speaker separation labelled.
+    label: Option<String>,
     text: String,
 }
 
@@ -66,7 +69,11 @@ fn numbered_excerpt(lines: &[Line]) -> String {
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let who = if l.side == Side::Me { "Me" } else { "Others" };
+            let who = match (l.side, &l.label) {
+                (Side::Me, _) => "Me".to_string(),
+                (Side::Others, Some(label)) => format!("Others ({label})"),
+                (Side::Others, None) => "Others".to_string(),
+            };
             format!("[{i}] {who}: {}", l.text)
         })
         .collect();
@@ -179,7 +186,13 @@ fn clean_name(name: &str) -> Option<String> {
 /// Keeps proposals whose quoted line holds the name (capitalised there, in
 /// scripts with case, so "I will" does not back "Will") and that are not a
 /// name Dor introduces himself with. In order, without duplicates.
+#[cfg(test)]
 fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
+    accept_proposals(lines, proposals).into_iter().map(|p| p.name).collect()
+}
+
+/// `accept_names`, keeping the line each name was found on.
+fn accept_proposals(lines: &[Line], proposals: &[Proposal]) -> Vec<Proposal> {
     let introduces = |side: Side, name_words: &[String]| {
         lines.iter().filter(|l| l.side == side).any(|l| {
             let w = lowercase(&raw_words(&l.text));
@@ -191,7 +204,7 @@ fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
     let own_name =
         |name_words: &[String]| introduces(Side::Me, name_words) && !introduces(Side::Others, name_words);
 
-    let mut accepted: Vec<String> = Vec::new();
+    let mut accepted: Vec<Proposal> = Vec::new();
     for proposal in proposals {
         let Some(name) = clean_name(&proposal.name) else { continue };
         let Some(line) = lines.get(proposal.line) else { continue };
@@ -207,8 +220,8 @@ fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
             let a = lowercase(&raw_words(a));
             find_name(&a, &name_words).is_some() || find_name(&name_words, &a).is_some()
         };
-        if !accepted.iter().any(same_person) {
-            accepted.push(name);
+        if !accepted.iter().any(|a| same_person(&a.name)) {
+            accepted.push(Proposal { name, line: proposal.line });
         }
         if accepted.len() == MAX_NAMES {
             break;
@@ -217,9 +230,74 @@ fn accept_names(lines: &[Line], proposals: &[Proposal]) -> Vec<String> {
     accepted
 }
 
+/// How far after a name said to someone the answer is looked for.
+const ANSWER_LOOKAHEAD_LINES: usize = 3;
+
+/// The voice each accepted name belongs to, as (label, name). A line that
+/// introduces its speaker ("I'm Sarah") names that line's voice. A name said
+/// to someone ("Alyssa, you're up first") names the next voice that answers,
+/// a labelled Others line from a different voice within a few lines. Each
+/// voice and each name is used once, first found first. These are offered as
+/// guesses for Dor to confirm, never saved as names on their own.
+fn voices_for_names(lines: &[Line], accepted: &[Proposal]) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for p in accepted {
+        let Some(line) = lines.get(p.line) else { continue };
+        let words = lowercase(&raw_words(&line.text));
+        let name_words = lowercase(&raw_words(&p.name));
+        let Some(at) = find_name(&words, &name_words) else { continue };
+        let label = if line.side == Side::Others && is_self_intro(&words, at, name_words.len()) {
+            line.label.clone()
+        } else {
+            lines[p.line + 1..]
+                .iter()
+                .take(ANSWER_LOOKAHEAD_LINES)
+                .find(|l| l.side == Side::Others && l.label.is_some() && (line.side == Side::Me || l.label != line.label))
+                .and_then(|l| l.label.clone())
+        };
+        let Some(label) = label else { continue };
+        if found.iter().any(|(l, n)| *l == label || *n == p.name) {
+            continue;
+        }
+        found.push((label, p.name.clone()));
+    }
+    found
+}
+
+async fn meeting_folder(pool: &SqlitePool, meeting_id: &str) -> Option<std::path::PathBuf> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .map(std::path::PathBuf::from)
+}
+
+/// Puts each voice's heard name into the meeting's voiceprints, clearing
+/// names an earlier pass left on voices that no longer have one. Returns
+/// whether anything changed.
+fn store_heard_names(folder: &std::path::Path, heard: &[(String, String)]) -> std::io::Result<bool> {
+    use crate::diarization::voiceprints::{read_voiceprints, write_voiceprints};
+    let mut voices = read_voiceprints(folder)?;
+    let mut changed = false;
+    for v in voices.iter_mut() {
+        let name = heard.iter().find(|(label, _)| *label == v.label).map(|(_, n)| n.clone());
+        if v.heard_name != name {
+            v.heard_name = name;
+            changed = true;
+        }
+    }
+    if changed {
+        write_voiceprints(folder, &voices)?;
+    }
+    Ok(changed)
+}
+
 async fn load_lines(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<Line>, sqlx::Error> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT speaker, transcript FROM transcripts
+    let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT speaker, speaker_label, transcript FROM transcripts
          WHERE meeting_id = ? AND speaker IS NOT NULL
          ORDER BY audio_start_time, timestamp",
     )
@@ -228,9 +306,9 @@ async fn load_lines(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<Line>, sq
     .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(speaker, text)| {
+        .filter_map(|(speaker, label, text)| {
             let text = text.trim().to_string();
-            Some(Line { side: side_of(&speaker)?, text }).filter(|l| !l.text.is_empty())
+            Some(Line { side: side_of(&speaker)?, label, text }).filter(|l| !l.text.is_empty())
         })
         .collect())
 }
@@ -321,15 +399,39 @@ pub async fn identify_other_speakers<R: Runtime>(app: AppHandle<R>, pool: Sqlite
     };
     // An empty result is stored too: after a retranscription it replaces a
     // name the earlier, worse transcript produced (unless Dor set one).
-    let names = accept_names(&lines, &proposals);
-    info!("Speaker names for {meeting_id}: proposed {}, kept {}", proposals.len(), names.len());
+    let accepted = accept_proposals(&lines, &proposals);
+    let names: Vec<String> = accepted.iter().map(|p| p.name.clone()).collect();
+    let heard = voices_for_names(&lines, &accepted);
+    info!(
+        "Speaker names for {meeting_id}: proposed {}, kept {}, matched to a voice {}",
+        proposals.len(),
+        names.len(),
+        heard.len()
+    );
 
-    match store_found_names(&pool, &meeting_id, &names).await {
-        Ok(true) => {
-            let _ = app.emit("meeting-speakers-identified", MeetingSpeakersIdentified { meeting_id, names });
+    let heard_changed = match meeting_folder(&pool, &meeting_id).await {
+        Some(folder) => store_heard_names(&folder, &heard).unwrap_or_else(|e| {
+            warn!("Speaker names for {meeting_id}: voice names not saved: {e}");
+            false
+        }),
+        None => false,
+    };
+    let names_changed = match store_found_names(&pool, &meeting_id, &names).await {
+        Ok(stored) => {
+            if !stored {
+                info!("Speaker names for {meeting_id}: kept the names set by hand");
+            }
+            stored
         }
-        Ok(false) => info!("Speaker names for {meeting_id}: kept the names set by hand"),
-        Err(e) => warn!("Speaker names for {meeting_id}: failed to save: {e}"),
+        Err(e) => {
+            warn!("Speaker names for {meeting_id}: failed to save: {e}");
+            false
+        }
+    };
+    // The meeting page reloads the "Other side" names and the voice guesses.
+    if names_changed || heard_changed {
+        let names = get_other_speaker_names(&pool, &meeting_id).await.unwrap_or(names);
+        let _ = app.emit("meeting-speakers-identified", MeetingSpeakersIdentified { meeting_id, names });
     }
 }
 
@@ -338,10 +440,73 @@ mod tests {
     use super::*;
 
     fn me(text: &str) -> Line {
-        Line { side: Side::Me, text: text.to_string() }
+        Line { side: Side::Me, label: None, text: text.to_string() }
     }
     fn others(text: &str) -> Line {
-        Line { side: Side::Others, text: text.to_string() }
+        Line { side: Side::Others, label: None, text: text.to_string() }
+    }
+    fn voice(label: &str, text: &str) -> Line {
+        Line { side: Side::Others, label: Some(label.to_string()), text: text.to_string() }
+    }
+
+    #[test]
+    fn a_name_said_to_someone_goes_to_the_voice_that_answers() {
+        // The CNN podcast test: the host hands over to each guest by name.
+        let lines = vec![
+            voice("Speaker 1", "Something you can't stop talking about. Alright, Alyssa, you're up first."),
+            voice("Speaker 2", "For what? And for the record, I also say thank you."),
+            voice("Speaker 1", "Okay. Patrick, you've got an obsession."),
+            voice("Speaker 3", "Well I think this started when I turned sixty."),
+        ];
+        let accepted = accept_proposals(&lines, &[proposal("Alyssa", 0), proposal("Patrick", 2)]);
+        assert_eq!(
+            voices_for_names(&lines, &accepted),
+            vec![("Speaker 2".to_string(), "Alyssa".to_string()), ("Speaker 3".to_string(), "Patrick".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_self_introduction_names_its_own_voice() {
+        let lines = vec![me("Who's joining?"), voice("Speaker 4", "Hi, I'm Dana from support."), voice("Speaker 1", "Welcome.")];
+        let accepted = accept_proposals(&lines, &[proposal("Dana", 1)]);
+        assert_eq!(voices_for_names(&lines, &accepted), vec![("Speaker 4".to_string(), "Dana".to_string())]);
+    }
+
+    #[test]
+    fn a_name_with_no_other_voice_answering_names_nobody() {
+        // Only the same voice keeps talking, or the answer has no label.
+        let lines = vec![voice("Speaker 1", "Thanks, Dan."), voice("Speaker 1", "Moving on."), others("Sure.")];
+        let accepted = accept_proposals(&lines, &[proposal("Dan", 0)]);
+        assert!(voices_for_names(&lines, &accepted).is_empty());
+    }
+
+    #[test]
+    fn each_voice_gets_one_name() {
+        let lines = vec![
+            me("Sarah, can you start?"),
+            voice("Speaker 2", "Sure."),
+            me("And Tom, you're after Sarah."),
+            voice("Speaker 2", "Yes."),
+        ];
+        let accepted = accept_proposals(&lines, &[proposal("Sarah", 0), proposal("Tom", 2)]);
+        assert_eq!(voices_for_names(&lines, &accepted), vec![("Speaker 2".to_string(), "Sarah".to_string())]);
+    }
+
+    #[test]
+    fn heard_names_replace_the_last_pass_in_the_voiceprints() {
+        use crate::diarization::voiceprints::{read_voiceprints, write_voiceprints, Voiceprint};
+        let folder = tempfile::tempdir().unwrap();
+        let print = |label: &str, heard: Option<&str>| Voiceprint {
+            label: label.into(), segments: 3, embedding: vec![1.0], name: None, dismissed: false,
+            heard_name: heard.map(Into::into), lines: 3,
+        };
+        write_voiceprints(folder.path(), &[print("Speaker 1", Some("Old")), print("Speaker 2", None)]).unwrap();
+        let heard = vec![("Speaker 2".to_string(), "Alyssa".to_string())];
+        assert!(store_heard_names(folder.path(), &heard).unwrap());
+        let voices = read_voiceprints(folder.path()).unwrap();
+        assert_eq!(voices[0].heard_name, None);
+        assert_eq!(voices[1].heard_name.as_deref(), Some("Alyssa"));
+        assert!(!store_heard_names(folder.path(), &heard).unwrap());
     }
     fn proposal(name: &str, line: usize) -> Proposal {
         Proposal { name: name.to_string(), line }
