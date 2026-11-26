@@ -261,46 +261,68 @@ async fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
     }
 }
 
-/// The call a recording was started for (by auto-start or the prompt's
-/// Record), and when, so "stop recording?" is offered only for that one.
-static RECORDING_FOR_CALL: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
-
-/// How long a mark waits for its recording to start: the prompt's Record
-/// reloads the page first, so the recording begins a few seconds later.
-const MARK_WAITS_FOR_START: Duration = Duration::from_secs(60);
-
-fn recording_for_call() -> Option<String> {
-    RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(k, _)| k.clone())
+/// Which recording belongs to which call. Record (or auto-start) leaves a
+/// pending mark; the next recording to start within a short wait claims it
+/// by its session number. Stop acts only on that exact recording, so a
+/// recording the user started by hand, even right after, is never ended.
+#[derive(Debug, Clone, PartialEq)]
+enum CallMark {
+    Pending { key: String, at: std::time::Instant, after_session: u64 },
+    Bound { key: String, session: u64 },
 }
 
-fn set_recording_for_call(key: Option<String>) {
-    *RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()) = key.map(|k| (k, std::time::Instant::now()));
+static CALL_MARK: std::sync::Mutex<Option<CallMark>> = std::sync::Mutex::new(None);
+
+/// How long a pending mark waits for its recording: Record reloads the page
+/// and the recording starts a few seconds later. A start after this is
+/// someone pressing record by hand.
+const MARK_WAITS_FOR_START: Duration = Duration::from_secs(20);
+
+fn current_session() -> u64 {
+    crate::audio::recording_commands::recording_session()
 }
 
-/// Drops the mark once its recording has ended, or when no recording
-/// followed it in time. Never while it waits for its recording to start.
-fn expire_mark(was_recording: bool, recording: bool) {
-    let mut mark = RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner());
-    let waited_too_long = mark.as_ref().is_some_and(|(_, at)| at.elapsed() > MARK_WAITS_FOR_START);
-    if (was_recording && !recording) || (!recording && waited_too_long) {
-        *mark = None;
+fn mark_pending(key: String) {
+    *CALL_MARK.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(CallMark::Pending { key, at: std::time::Instant::now(), after_session: current_session() });
+}
+
+/// Binds a pending mark to the recording that started for it, drops one
+/// that waited too long, and returns the call the given recording is for.
+fn mark_for_session(session: u64) -> Option<String> {
+    let mut mark = CALL_MARK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(CallMark::Pending { key, at, after_session }) = mark.clone() {
+        if session > after_session {
+            // The first recording after the mark claims it, if it came in time.
+            *mark = (at.elapsed() <= MARK_WAITS_FOR_START).then(|| CallMark::Bound { key, session: after_session + 1 });
+        } else if at.elapsed() > MARK_WAITS_FOR_START {
+            *mark = None;
+        }
     }
+    match mark.as_ref() {
+        Some(CallMark::Bound { key, session: bound }) if *bound == session => Some(key.clone()),
+        _ => None,
+    }
+}
+
+/// The call the running recording was started for, if any.
+fn recording_for_call() -> Option<String> {
+    mark_for_session(current_session())
 }
 
 /// The prompt's Record: remembers which call the recording is for.
 #[tauri::command]
 pub fn mark_recording_for_call(key: String) {
-    set_recording_for_call(Some(key));
+    mark_pending(key);
 }
 
 /// The call-ended prompt's Stop: stops only a recording started for that
 /// call, never one started by hand.
 #[tauri::command]
 pub async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String) -> bool {
-    if recording_for_call().as_deref() != Some(key.as_str()) || !crate::is_recording().await {
+    if !crate::is_recording().await || recording_for_call().as_deref() != Some(key.as_str()) {
         return false;
     }
-    set_recording_for_call(None);
     crate::tray::stop_recording_from_detection(app).await;
     true
 }
@@ -317,7 +339,6 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
     }
     tauri::async_runtime::spawn(async move {
         let mut tracker = Tracker::default();
-        let mut was_recording = false;
         loop {
             tokio::time::sleep(POLL_EVERY).await;
             let settings = load_settings(&app);
@@ -332,8 +353,6 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
             let present: HashSet<&'static str> = users.iter().filter_map(|id| classify(id)).map(|a| a.key).collect();
             let (started, ended) = tracker.poll(&present);
             let recording = crate::is_recording().await;
-            expire_mark(was_recording, recording);
-            was_recording = recording;
             for key in started {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 if recording || settings.ignored_apps.iter().any(|k| k == key) || !onboarding_done(&app).await {
@@ -343,7 +362,7 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                 let auto_started = settings.auto_start;
                 if auto_started {
                     // The recording-started notification says it began.
-                    set_recording_for_call(Some(key.to_string()));
+                    mark_pending(key.to_string());
                     crate::tray::start_recording_from_detection(&app);
                 } else {
                     notify(&app, "Call detected", &format!("{} is using your microphone. Open Meeting Notes to record it.", call_app.name)).await;
@@ -386,17 +405,24 @@ mod tests {
     }
 
     #[test]
-    fn a_mark_survives_until_its_recording_ends() {
-        set_recording_for_call(Some("zoom".into()));
-        // Waiting for the recording to start (the page reloads first).
-        expire_mark(false, false);
-        assert_eq!(recording_for_call().as_deref(), Some("zoom"));
-        expire_mark(false, true);
-        expire_mark(true, true);
-        assert_eq!(recording_for_call().as_deref(), Some("zoom"));
-        // The recording ended.
-        expire_mark(true, false);
-        assert_eq!(recording_for_call(), None);
+    fn a_mark_belongs_to_the_one_recording_that_started_for_it() {
+        // Recording 4 is the user's, then Record marks the call.
+        *CALL_MARK.lock().unwrap() = Some(CallMark::Pending { key: "zoom".into(), at: std::time::Instant::now(), after_session: 4 });
+        // Waiting for its recording (the page reloads first).
+        assert_eq!(mark_for_session(4), None);
+        // Recording 5 starts for it.
+        assert_eq!(mark_for_session(5).as_deref(), Some("zoom"));
+        assert_eq!(mark_for_session(5).as_deref(), Some("zoom"));
+        // The user stops it and starts recording 6 at once: not the call's.
+        assert_eq!(mark_for_session(6), None);
+
+        // A pending mark nobody claimed in time doesn't go to a later recording.
+        *CALL_MARK.lock().unwrap() = Some(CallMark::Pending {
+            key: "teams".into(),
+            at: std::time::Instant::now() - MARK_WAITS_FOR_START - Duration::from_secs(1),
+            after_session: 6,
+        });
+        assert_eq!(mark_for_session(7), None);
     }
 
     #[test]
