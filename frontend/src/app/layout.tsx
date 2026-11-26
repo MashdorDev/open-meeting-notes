@@ -27,6 +27,7 @@ import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { startTheme, THEME_BOOT_SCRIPT } from '@/lib/theme'
+import { PLATFORM_BOOT_SCRIPT } from '@/lib/platform'
 
 
 // Both SIL Open Font License, from versioned @fontsource packages. Loading
@@ -111,10 +112,17 @@ export default function RootLayout({
       })
   }, [])
 
-  // Disable context menu in production
+  // In production the webview's own menu (Reload, Back) makes no sense on the
+  // app's chrome, but on selected text or in a text field the system menu is
+  // the native one (Copy, Look Up, Spelling), so it stays there.
   useEffect(() => {
     if (process.env.NODE_ENV === 'production') {
-      const handleContextMenu = (e: MouseEvent) => e.preventDefault();
+      const handleContextMenu = (e: MouseEvent) => {
+        const target = e.target as HTMLElement | null;
+        const editable = target?.closest('input, textarea, [contenteditable="true"]');
+        const hasSelection = (window.getSelection()?.toString().trim() ?? '') !== '';
+        if (!editable && !hasSelection) e.preventDefault();
+      };
       document.addEventListener('contextmenu', handleContextMenu);
       return () => document.removeEventListener('contextmenu', handleContextMenu);
     }
@@ -298,6 +306,34 @@ export default function RootLayout({
     setShowImportDialog(true);
   }, []);
 
+  // The menu bar's Import Audio… (macOS), and the same commands as keyboard
+  // shortcuts on Windows, where apps usually have no menu bar.
+  useEffect(() => {
+    const unlisten = listen('open-import-dialog', () => handleOpenImportDialog());
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, [handleOpenImportDialog]);
+  useEffect(() => {
+    if (document.documentElement.dataset.platform !== 'windows') return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.altKey || e.metaKey) return;
+      const key = e.key.toLowerCase();
+      if (key === ',' && !e.shiftKey) {
+        e.preventDefault();
+        router.push('/settings');
+      } else if (key === 'o' && !e.shiftKey) {
+        e.preventDefault();
+        handleOpenImportDialog();
+      } else if (key === 'r' && e.shiftKey) {
+        e.preventDefault();
+        invoke('toggle_recording_from_shortcut').catch(error => console.error('Shortcut failed:', error));
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [router, handleOpenImportDialog]);
+
   const handleOnboardingComplete = () => {
     console.log('[Layout] Onboarding completed, reloading app')
     setShowOnboarding(false)
@@ -310,6 +346,7 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
+        <script dangerouslySetInnerHTML={{ __html: PLATFORM_BOOT_SCRIPT }} />
       </head>
       <body className={`${figtree.variable} ${bricolage.variable} font-sans antialiased`}>
         <AnalyticsProvider>

@@ -35,7 +35,13 @@ pub fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
+/// Ctrl+Shift+R on Windows: the tray's Start/Stop Recording, from the keyboard.
+#[tauri::command]
+pub fn toggle_recording_from_shortcut<R: Runtime>(app: AppHandle<R>) {
+    toggle_recording_handler(&app);
+}
+
+pub(crate) fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
     match item_id {
         "toggle_recording" => toggle_recording_handler(app),
         "pause_recording" => pause_recording_handler(app),

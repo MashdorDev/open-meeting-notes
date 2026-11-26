@@ -218,3 +218,40 @@
     overflow: visible !important;
   }
 }
+/* Native feel per OS. <html data-platform> is set before the first paint by
+   PLATFORM_BOOT_SCRIPT (lib/platform.ts). */
+
+/* The system UI font, the way the OS's own apps set text. */
+html[data-platform="macos"] body {
+  --font-figtree: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  --font-bricolage: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
+}
+html[data-platform="windows"] body {
+  --font-figtree: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-bricolage: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+}
+
+/* Desktop apps keep the arrow over buttons and tabs; the hand is for links. */
+html[data-platform] .cursor-pointer,
+html[data-platform] button,
+html[data-platform] [role="button"],
+html[data-platform] [role="tab"],
+html[data-platform] [role="menuitem"],
+html[data-platform] [role="option"],
+html[data-platform] label,
+html[data-platform] select {
+  cursor: default;
+}
+html[data-platform] a[href] {
+  cursor: pointer;
+}
+
+/* Controls and labels can't be selected or dragged like page text. Meeting
+   text, notes and fields stay selectable. */
+html[data-platform] :is(button, [role="button"], [role="tab"], [role="menuitem"], label, nav, h1, h2, h3, h4, svg) {
+  -webkit-user-select: none;
+  user-select: none;
+}
+html[data-platform] :is(img, a) {
+  -webkit-user-drag: none;
+}

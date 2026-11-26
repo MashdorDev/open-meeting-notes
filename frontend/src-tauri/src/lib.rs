@@ -37,6 +37,8 @@ pub(crate) use perf_trace;
 
 // Declare audio module
 pub mod call_detect;
+#[cfg(target_os = "macos")]
+mod app_menu;
 pub mod analytics;
 pub mod api;
 pub mod audio;
@@ -633,6 +635,11 @@ pub fn run() {
             log::info!("Application setup complete");
 
             call_detect::start(_app.handle().clone());
+            #[cfg(target_os = "macos")]
+            match app_menu::build(_app.handle()).and_then(|menu| _app.set_menu(menu)) {
+                Ok(_) => _app.on_menu_event(app_menu::handle_event),
+                Err(e) => log::error!("Failed to build the menu bar: {}", e),
+            }
 
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
@@ -875,6 +882,7 @@ pub fn run() {
             call_detect::mark_recording_for_call,
             call_detect::stop_recording_for_call,
             api::home::api_get_home_overview,
+            tray::toggle_recording_from_shortcut,
             api::get_meeting_speaker_guesses,
             api::dismiss_speaker_guess,
             api::confirm_speaker_guesses,
