@@ -205,9 +205,10 @@ export default function RootLayout({
       const unlistenDragLeave = await listen('tauri://drag-leave', () => {
         setShowDropOverlay(false);
       });
+      // The cleanup already removed the listeners registered before it ran;
+      // removing one twice makes Tauri throw (listeners[eventId] is gone).
       if (cleanedUpRef.current) {
         unlistenDragLeave();
-        unlisteners.forEach(u => u());
         return;
       }
       unlisteners.push(unlistenDragLeave);
@@ -219,7 +220,6 @@ export default function RootLayout({
       });
       if (cleanedUpRef.current) {
         unlistenDrop();
-        unlisteners.forEach(u => u());
         return;
       }
       unlisteners.push(unlistenDrop);
