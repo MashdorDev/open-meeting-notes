@@ -237,6 +237,23 @@ pub async fn apply_title_if_default(
     }
 }
 
+/// The name an imported meeting got from its file, when the user kept it at
+/// import: the title the auto title may still replace. A title typed in the
+/// import dialog is the user's and is never returned.
+pub async fn imported_file_title(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
+    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    let bytes = std::fs::read(PathBuf::from(folder?).join("metadata.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let from_file = meta.get("source")?.as_str()? == "import" && meta.get("title_from_file")?.as_bool()?;
+    from_file.then(|| meta.get("meeting_name")?.as_str().map(str::to_string))?
+}
+
 /// Generates a title and applies it if the meeting still has a default name
 /// (or `replaceable`). Failures are logged and otherwise ignored: a missing
 /// title is not an error, and the summary heading can still fill it in later.
@@ -293,6 +310,25 @@ pub async fn generate_meeting_title<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_an_imported_meeting_has_a_file_title_to_replace() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, folder_path TEXT)").execute(&pool).await.unwrap();
+        let imported = tempfile::tempdir().unwrap();
+        std::fs::write(imported.path().join("metadata.json"), r#"{"source":"import","meeting_name":"qualio-panel","title_from_file":true}"#).unwrap();
+        let typed = tempfile::tempdir().unwrap();
+        std::fs::write(typed.path().join("metadata.json"), r#"{"source":"import","meeting_name":"Board review Q3","title_from_file":false}"#).unwrap();
+        let recorded = tempfile::tempdir().unwrap();
+        std::fs::write(recorded.path().join("metadata.json"), r#"{"meeting_name":"Meeting 11_11_26_14_05_09"}"#).unwrap();
+        for (id, folder) in [("imp", imported.path()), ("typed", typed.path()), ("rec", recorded.path())] {
+            sqlx::query("INSERT INTO meetings VALUES (?, ?)").bind(id).bind(folder.to_str()).execute(&pool).await.unwrap();
+        }
+        assert_eq!(imported_file_title(&pool, "imp").await.as_deref(), Some("qualio-panel"));
+        assert_eq!(imported_file_title(&pool, "typed").await, None);
+        assert_eq!(imported_file_title(&pool, "rec").await, None);
+        assert_eq!(imported_file_title(&pool, "missing").await, None);
+    }
 
     #[test]
     fn default_titles_are_recognised() {

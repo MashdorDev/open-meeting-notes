@@ -46,19 +46,41 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
     }
 }
 
+/// Pieces of one long speech stretch are cut at its quietest moment, often a
+/// breath in mid-sentence, and the engine ends every piece with a period:
+/// "who's a vice president." then "of quality at 4G Clinical". When the next
+/// piece starts right where this one ends and opens in lowercase, the
+/// sentence goes on and that period is not real.
+fn continues_sentence(text: &str, end_ms: f64, next_text: &str, next_start_ms: f64) -> bool {
+    // Pieces of one stretch touch (or overlap by the fallback second);
+    // separate stretches are at least a pause apart.
+    const TOUCHING_MS: f64 = 50.0;
+    next_start_ms - end_ms < TOUCHING_MS
+        && text.ends_with('.')
+        && !text.ends_with("..")
+        && next_text.trim_start().chars().next().is_some_and(|c| c.is_lowercase())
+}
+
 /// Create transcript segments from transcription results.
 /// Each tuple is (text, start_ms, end_ms) from VAD timestamps.
 pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> Vec<TranscriptSegment> {
     transcripts
         .iter()
-        .map(|(text, start_ms, end_ms)| {
+        .enumerate()
+        .map(|(i, (text, start_ms, end_ms))| {
             let start_seconds = start_ms / 1000.0;
             let end_seconds = end_ms / 1000.0;
             let duration = end_seconds - start_seconds;
+            let mut text = text.trim().to_string();
+            if let Some((next_text, next_start_ms, _)) = transcripts.get(i + 1) {
+                if continues_sentence(&text, *end_ms, next_text, *next_start_ms) {
+                    text.pop();
+                }
+            }
 
             TranscriptSegment {
                 id: format!("transcript-{}", Uuid::new_v4()),
-                text: text.trim().to_string(),
+                text,
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 audio_start_time: Some(start_seconds),
                 audio_end_time: Some(end_seconds),
@@ -235,5 +257,31 @@ mod tests {
 
         acquired_rx.await.unwrap();
         waiter.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod continues_sentence_tests {
+    use super::*;
+
+    #[test]
+    fn a_period_at_a_mid_sentence_cut_is_dropped() {
+        let pieces = vec![
+            ("Lara Aujo, who's a vice president.".to_string(), 30_000.0, 54_180.0),
+            ("of quality at 4G Clinical.".to_string(), 54_180.0, 78_000.0),
+        ];
+        let segments = create_transcript_segments(&pieces);
+        assert_eq!(segments[0].text, "Lara Aujo, who's a vice president");
+        assert_eq!(segments[1].text, "of quality at 4G Clinical.");
+    }
+
+    #[test]
+    fn real_sentence_ends_are_kept() {
+        // Next piece starts a new sentence, comes after a pause, or the
+        // period is an ellipsis.
+        assert!(!continues_sentence("We shipped it.", 10_000.0, "Then we waited.", 10_000.0));
+        assert!(!continues_sentence("We shipped it.", 10_000.0, "and then", 12_500.0));
+        assert!(!continues_sentence("So...", 10_000.0, "anyway", 10_000.0));
+        assert!(continues_sentence("a vice president.", 10_000.0, "of quality", 9_000.0));
     }
 }

@@ -606,16 +606,29 @@ impl SummaryService {
                 .await
                 {
                     Ok(true) => {
+                        let mut titled = false;
                         if let Some(name) =
                             extract_meeting_name_from_markdown(&generated.final_markdown)
                                 .filter(|name| !name.is_empty())
                         {
-                            if let Err(error) =
-                                crate::summary::title::apply_title_if_default(&pool, &meeting_id, &name, None)
-                                    .await
-                            {
-                                error!("Failed to update meeting name for {}: {}", meeting_id, error);
+                            match crate::summary::title::apply_title_if_default(&pool, &meeting_id, &name, None).await {
+                                Ok(applied) => titled = applied,
+                                Err(error) => error!("Failed to update meeting name for {}: {}", meeting_id, error),
                             }
+                        }
+                        // The auto title at save can fail (no model downloaded
+                        // yet, the model busy). The summary just worked, so try
+                        // again while the meeting still has a name the app
+                        // picked; generate_meeting_title checks that itself.
+                        if !titled {
+                            let imported = crate::summary::title::imported_file_title(&pool, &meeting_id).await;
+                            tauri::async_runtime::spawn(crate::summary::title::generate_meeting_title(
+                                _app.clone(),
+                                pool.clone(),
+                                meeting_id.clone(),
+                                text.clone(),
+                                imported,
+                            ));
                         }
                         info!("Summary saved successfully for meeting_id: {}", meeting_id);
                     }
