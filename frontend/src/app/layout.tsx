@@ -146,6 +146,9 @@ export default function RootLayout({
   useEffect(() => {
     type CallEvent = { key: string; name: string; auto_started: boolean };
     const started = listen<CallEvent>('call-detected', ({ payload }) => {
+      // Not during setup: there may be no model yet, and Record would leave
+      // a start flag behind for later.
+      if (showOnboarding) return;
       if (payload.auto_started) {
         toast.success(`Recording your ${payload.name} call`);
         return;
@@ -155,7 +158,13 @@ export default function RootLayout({
         duration: 30_000,
         action: {
           label: 'Record',
-          onClick: () => {
+          onClick: async () => {
+            // The toast lives 30 s; a recording may have started meanwhile.
+            if (await invoke<boolean>('is_recording')) {
+              toast('Already recording');
+              return;
+            }
+            await invoke('mark_recording_for_call', { key: payload.key });
             sessionStorage.setItem('autoStartRecording', 'true');
             window.location.assign('/');
           },
@@ -169,7 +178,7 @@ export default function RootLayout({
         action: {
           label: 'Stop',
           onClick: () => {
-            invoke('stop_recording_from_detection').catch(error => console.error('Stop failed:', error));
+            invoke('stop_recording_for_call', { key: payload.key }).catch(error => console.error('Stop failed:', error));
           },
         },
       });
@@ -178,7 +187,7 @@ export default function RootLayout({
       started.then(fn => fn());
       ended.then(fn => fn());
     };
-  }, []);
+  }, [showOnboarding]);
 
   // The tray's Settings item. A client-side push keeps the page's state and
   // history; a full reload from the tray could land on the old page or leave

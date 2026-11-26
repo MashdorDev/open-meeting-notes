@@ -123,10 +123,9 @@ fn start_recording_via_home<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// The "Stop" on the call-ended prompt: stops the recording the same way
-/// the tray does, and does nothing when none is running.
-#[tauri::command]
-pub async fn stop_recording_from_detection<R: Runtime>(app: AppHandle<R>) {
+/// Stops the recording the same way the tray does (call detection's Stop,
+/// after it checked the recording is the one for that call).
+pub(crate) async fn stop_recording_from_detection<R: Runtime>(app: AppHandle<R>) {
     if crate::is_recording().await {
         toggle_recording_handler(&app);
     }

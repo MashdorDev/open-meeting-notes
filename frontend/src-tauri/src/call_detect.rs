@@ -163,8 +163,17 @@ fn microphone_users() -> Vec<String> {
     let me = std::env::current_exe()
         .ok()
         .map(|p| p.to_string_lossy().replace('\\', "#").to_ascii_lowercase());
+    // FILETIME (100 ns since 1601) of 12 hours ago. Windows leaves the stop
+    // time at 0 when an app crashes holding the microphone, so an entry that
+    // "started" long ago is a leftover, not a call.
+    const FILETIME_UNIX_OFFSET: u64 = 116_444_736_000_000_000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64 / 100 + FILETIME_UNIX_OFFSET)
+        .unwrap_or(0);
+    let recent = now.saturating_sub(12 * 3600 * 10_000_000);
     let in_use = |key: &RegKey| key.get_value::<u64, _>("LastUsedTimeStop").map_or(false, |stop| stop == 0)
-        && key.get_value::<u64, _>("LastUsedTimeStart").map_or(false, |start| start > 0);
+        && key.get_value::<u64, _>("LastUsedTimeStart").map_or(false, |start| start > recent);
     let mut users = Vec::new();
     let Ok(root) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(STORE) else { return users };
     // Store apps sit directly under the key; desktop apps under NonPackaged,
@@ -238,11 +247,52 @@ impl Tracker {
     }
 }
 
-fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
-    use tauri_plugin_notification::NotificationExt;
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+/// Through the notification manager, so the user's notification consent
+/// and Do Not Disturb apply.
+async fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
+    use crate::notifications::commands::NotificationManagerState;
+    use crate::notifications::types::{Notification, NotificationType};
+    use tauri::Manager;
+    let state = app.state::<NotificationManagerState<R>>();
+    let manager = state.read().await;
+    let Some(manager) = manager.as_ref() else { return };
+    if let Err(e) = manager.show_notification(Notification::new(title, body, NotificationType::CallDetected)).await {
         warn!("Call detection: notification failed: {}", e);
     }
+}
+
+/// The call a running recording was started for (by auto-start or the
+/// prompt's Record), so "stop recording?" is offered only for that one.
+static RECORDING_FOR_CALL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn recording_for_call() -> Option<String> {
+    RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn set_recording_for_call(key: Option<String>) {
+    *RECORDING_FOR_CALL.lock().unwrap_or_else(|e| e.into_inner()) = key;
+}
+
+/// The prompt's Record: remembers which call the recording is for.
+#[tauri::command]
+pub fn mark_recording_for_call(key: String) {
+    set_recording_for_call(Some(key));
+}
+
+/// The call-ended prompt's Stop: stops only a recording started for that
+/// call, never one started by hand.
+#[tauri::command]
+pub async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String) -> bool {
+    if recording_for_call().as_deref() != Some(key.as_str()) || !crate::is_recording().await {
+        return false;
+    }
+    set_recording_for_call(None);
+    crate::tray::stop_recording_from_detection(app).await;
+    true
+}
+
+async fn onboarding_done<R: Runtime>(app: &AppHandle<R>) -> bool {
+    crate::onboarding::load_onboarding_status(app).await.map(|s| s.completed).unwrap_or(false)
 }
 
 /// Starts the background watcher. It runs for the app's lifetime and reads
@@ -261,33 +311,35 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                 continue;
             }
             let users = tokio::task::spawn_blocking(microphone_users).await.unwrap_or_default();
-            let present: HashSet<&'static str> = users
-                .iter()
-                .filter_map(|id| classify(id))
-                .filter(|a| !settings.ignored_apps.iter().any(|k| k == a.key))
-                .map(|a| a.key)
-                .collect();
+            // Every call app is tracked; the ignore list only silences
+            // prompts, so unticking an app mid-call doesn't look like the
+            // call ended.
+            let present: HashSet<&'static str> = users.iter().filter_map(|id| classify(id)).map(|a| a.key).collect();
             let (started, ended) = tracker.poll(&present);
             let recording = crate::is_recording().await;
+            if !recording {
+                set_recording_for_call(None);
+            }
             for key in started {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
-                if recording {
+                if recording || settings.ignored_apps.iter().any(|k| k == key) || !onboarding_done(&app).await {
                     continue;
                 }
                 info!("Call detection: {} started using the microphone", call_app.name);
                 let auto_started = settings.auto_start;
                 if auto_started {
+                    // The recording-started notification says it began.
+                    set_recording_for_call(Some(key.to_string()));
                     crate::tray::start_recording_from_detection(&app);
-                    notify(&app, "Recording your call", &format!("{} call detected. Open Meeting Notes started recording.", call_app.name));
                 } else {
-                    notify(&app, "Call detected", &format!("{} is using your microphone. Open Meeting Notes to record it.", call_app.name));
+                    notify(&app, "Call detected", &format!("{} is using your microphone. Open Meeting Notes to record it.", call_app.name)).await;
                 }
                 let _ = app.emit("call-detected", CallEvent { key: key.into(), name: call_app.name.into(), auto_started });
             }
             for key in ended {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 info!("Call detection: {} stopped using the microphone", call_app.name);
-                if recording {
+                if recording && recording_for_call().as_deref() == Some(key) {
                     let _ = app.emit("call-ended", CallEvent { key: key.into(), name: call_app.name.into(), auto_started: false });
                 }
             }

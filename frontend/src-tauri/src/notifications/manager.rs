@@ -308,6 +308,9 @@ impl<R: Runtime> NotificationManager<R> {
             NotificationType::TranscriptionComplete => settings.notification_preferences.show_transcription_complete,
             NotificationType::MeetingReminder(_) => settings.notification_preferences.show_meeting_reminders,
             NotificationType::SystemError(_) => settings.notification_preferences.show_system_errors,
+            // Gated by consent and Do Not Disturb above, and by its own switch
+            // in Settings > Recordings (call detection).
+            NotificationType::CallDetected => true,
             NotificationType::Test => true, // Always show test notifications
         }
     }
