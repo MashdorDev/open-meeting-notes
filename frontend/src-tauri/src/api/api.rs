@@ -388,16 +388,8 @@ pub struct RecentMeeting {
     pub names: Vec<String>,
 }
 
-/// The newest meetings for the home page, with length and speaker names.
-#[tauri::command]
-pub async fn api_get_recent_meetings(
-    state: tauri::State<'_, AppState>,
-    limit: u32,
-) -> Result<Vec<RecentMeeting>, String> {
-    recent_meetings(state.db_manager.pool(), limit).await.map_err(|e| format!("Database error: {}", e))
-}
-
-async fn recent_meetings(pool: &sqlx::SqlitePool, limit: u32) -> Result<Vec<RecentMeeting>, sqlx::Error> {
+/// The newest meetings, with length and speaker names (see api::home).
+pub(crate) async fn recent_meetings(pool: &sqlx::SqlitePool, limit: u32) -> Result<Vec<RecentMeeting>, sqlx::Error> {
     // created_at is decoded, not passed on as stored text: rows carried over
     // from the old Python backend hold "2025-09-01 10:00:00", which WebKit's
     // Date parser rejects.
@@ -1429,18 +1421,26 @@ pub async fn get_meeting_speaker_guesses(
     state: tauri::State<'_, AppState>,
     meeting_id: String,
 ) -> Result<HashMap<String, String>, String> {
-    let pool = state.db_manager.pool();
-    let mut guesses = meeting_speaker_guesses(pool, &meeting_id, GuessUse::Shown).await;
+    open_speaker_guesses(state.db_manager.pool(), &meeting_id)
+        .await
+        .map_err(|e| format!("Database error: {}", e))
+}
+
+/// The guesses still waiting for Dor: offered, and the voice not named yet.
+pub(crate) async fn open_speaker_guesses(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+) -> Result<HashMap<String, String>, sqlx::Error> {
+    let mut guesses = meeting_speaker_guesses(pool, meeting_id, GuessUse::Shown).await;
     // A voice already named (on any line, loaded or not) needs no guess.
     let named: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT speaker_label FROM transcripts
          WHERE meeting_id = ? AND speaker_label IS NOT NULL AND speaker_name IS NOT NULL
            AND COALESCE(speaker_name_pinned, 0) = 0",
     )
-    .bind(&meeting_id)
+    .bind(meeting_id)
     .fetch_all(pool)
-    .await
-    .map_err(|e| format!("Database error: {}", e))?;
+    .await?;
     for label in named {
         guesses.remove(&label);
     }
