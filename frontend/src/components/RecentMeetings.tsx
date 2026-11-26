@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
+import { resolveDeviceLabel } from '@/lib/audioDevices';
 
 interface RecentMeeting {
   id: string;
@@ -49,20 +50,43 @@ export function RecentMeetings({ hasMicrophone, hasSystemAudio }: { hasMicrophon
   const { meetings: sidebarMeetings, setCurrentMeeting } = useSidebar();
   const { selectedDevices, transcriptModelConfig } = useConfig();
   const [meetings, setMeetings] = useState<RecentMeeting[] | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [micLabel, setMicLabel] = useState<string | null>(null);
+  // Today and Yesterday move at midnight even when no meeting changes.
+  const [today, setToday] = useState(() => new Date().toDateString());
 
   useEffect(() => {
     let current = true;
     invoke<RecentMeeting[]>('api_get_recent_meetings', { limit: RECENT_LIMIT })
-      .then(found => { if (current) setMeetings(found); })
+      .then(found => {
+        if (!current) return;
+        setMeetings(found);
+        setLoadFailed(false);
+      })
       .catch(error => {
         console.error('Failed to load recent meetings:', error);
-        if (current) setMeetings([]);
+        if (current) setLoadFailed(true);
       });
     return () => { current = false; };
   }, [sidebarMeetings]);
 
+  useEffect(() => {
+    const timer = setInterval(() => setToday(new Date().toDateString()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Device ids are not for display (on Linux they read like
+  // "alsa_input.pci-0000_00_1f.3.analog-stereo").
+  useEffect(() => {
+    const id = selectedDevices.micDevice;
+    if (!id) { setMicLabel(null); return; }
+    let current = true;
+    resolveDeviceLabel(id).then(label => { if (current) setMicLabel(label); });
+    return () => { current = false; };
+  }, [selectedDevices.micDevice]);
+
   const groups = useMemo(() => {
-    const now = new Date();
+    const now = new Date(today);
     const byDay: { label: string; items: RecentMeeting[] }[] = [];
     for (const m of meetings ?? []) {
       const label = dayLabel(new Date(m.created_at), now);
@@ -71,10 +95,10 @@ export function RecentMeetings({ hasMicrophone, hasSystemAudio }: { hasMicrophon
       else byDay.push({ label, items: [m] });
     }
     return byDay;
-  }, [meetings]);
+  }, [meetings, today]);
 
   const ready = [
-    selectedDevices.micDevice ?? 'Default microphone',
+    micLabel ?? 'Default microphone',
     hasSystemAudio ? 'computer audio' : 'no computer audio',
     modelLabel(transcriptModelConfig.provider, transcriptModelConfig.model),
   ].join(' · ');
@@ -87,6 +111,10 @@ export function RecentMeetings({ hasMicrophone, hasSystemAudio }: { hasMicrophon
   return (
     <div className="pt-6 text-left">
       {hasMicrophone && <p className="text-sm text-gray-500 mb-8">Ready to record · {ready}</p>}
+
+      {loadFailed && meetings === null && (
+        <p className="text-sm text-gray-500">Recent meetings could not be loaded. They are still in the sidebar.</p>
+      )}
 
       {meetings !== null && meetings.length === 0 && (
         <div className="text-gray-500">

@@ -398,7 +398,10 @@ pub async fn api_get_recent_meetings(
 }
 
 async fn recent_meetings(pool: &sqlx::SqlitePool, limit: u32) -> Result<Vec<RecentMeeting>, sqlx::Error> {
-    let rows: Vec<(String, String, String, Option<f64>)> = sqlx::query_as(
+    // created_at is decoded, not passed on as stored text: rows carried over
+    // from the old Python backend hold "2025-09-01 10:00:00", which WebKit's
+    // Date parser rejects.
+    let rows: Vec<(String, String, crate::database::models::DateTimeUtc, Option<f64>)> = sqlx::query_as(
         "SELECT m.id, m.title, m.created_at,
                 (SELECT MAX(t.audio_end_time) FROM transcripts t WHERE t.meeting_id = m.id)
          FROM meetings m ORDER BY m.created_at DESC LIMIT ?",
@@ -408,6 +411,7 @@ async fn recent_meetings(pool: &sqlx::SqlitePool, limit: u32) -> Result<Vec<Rece
     .await?;
     let mut meetings = Vec::with_capacity(rows.len());
     for (id, title, created_at, duration_seconds) in rows {
+        // Names are extra: a failed lookup leaves them out, not the meeting.
         let mut names: Vec<String> = sqlx::query_scalar(
             "SELECT speaker_name FROM transcripts
              WHERE meeting_id = ? AND speaker_name IS NOT NULL
@@ -415,10 +419,15 @@ async fn recent_meetings(pool: &sqlx::SqlitePool, limit: u32) -> Result<Vec<Rece
         )
         .bind(&id)
         .fetch_all(pool)
-        .await?;
+        .await
+        .unwrap_or_else(|e| {
+            log_warn!("Recent meetings: names for {} not read: {}", id, e);
+            Vec::new()
+        });
         if names.is_empty() {
-            names = crate::summary::speaker_names::get_other_speaker_names(pool, &id).await?;
+            names = crate::summary::speaker_names::get_other_speaker_names(pool, &id).await.unwrap_or_default();
         }
+        let created_at = created_at.0.to_rfc3339();
         meetings.push(RecentMeeting { id, title, created_at, duration_seconds, names });
     }
     Ok(meetings)
@@ -1988,7 +1997,8 @@ mod tests {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, folder_path TEXT)").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, audio_start_time REAL, audio_end_time REAL, speaker_name TEXT)").execute(&pool).await.unwrap();
-        for (id, title, at) in [("a", "Older", "2026-11-25T10:00:00Z"), ("b", "Newer", "2026-11-26T10:00:00Z"), ("c", "Empty", "2026-11-24T10:00:00Z")] {
+        // "c" was written by the old Python backend: space, no zone.
+        for (id, title, at) in [("a", "Older", "2026-11-25T10:00:00Z"), ("b", "Newer", "2026-11-26T10:00:00Z"), ("c", "Empty", "2026-11-24 10:00:00")] {
             sqlx::query("INSERT INTO meetings (id, title, created_at) VALUES (?, ?, ?)").bind(id).bind(title).bind(at).execute(&pool).await.unwrap();
         }
         for (id, meeting, start, end, name) in [
@@ -2004,6 +2014,7 @@ mod tests {
         assert!(meetings[1].names.is_empty());
         let all = recent_meetings(&pool, 10).await.unwrap();
         assert_eq!(all[2].duration_seconds, None);
+        assert_eq!(all[2].created_at, "2026-11-24T10:00:00+00:00");
     }
 
     #[test]

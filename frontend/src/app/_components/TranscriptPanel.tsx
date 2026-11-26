@@ -5,7 +5,7 @@ import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, GlobeIcon } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useConfig } from '@/contexts/ConfigContext';
-import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { ModalType } from '@/hooks/useModalState';
 import { useIsLinux } from '@/hooks/usePlatform';
@@ -34,7 +34,9 @@ export function TranscriptPanel({
   // Contexts
   const { transcripts, transcriptContainerRef, copyTranscript, speakerGuesses } = useTranscripts();
   const { transcriptModelConfig } = useConfig();
-  const { isRecording, isPaused } = useRecordingState();
+  // Only idle (or after an error) shows the recent meetings: while a
+  // recording starts or saves, the live view keeps its status.
+  const { isRecording, isPaused, status } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
   const isLinux = useIsLinux();
 
@@ -108,7 +110,7 @@ export function TranscriptPanel({
       <div className="pb-20">
         <div className="flex justify-center">
           <div className="w-2/3 max-w-[750px]">
-            {segments.length === 0 && !isRecording && !isProcessingStop && !isStopping ? (
+            {segments.length === 0 && !isRecording && (status === RecordingStatus.IDLE || status === RecordingStatus.ERROR) ? (
               <RecentMeetings hasMicrophone={hasMicrophone} hasSystemAudio={hasSystemAudio} />
             ) : (
             <VirtualizedTranscriptView
