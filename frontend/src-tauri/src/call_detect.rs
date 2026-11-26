@@ -283,19 +283,33 @@ fn current_session() -> u64 {
 }
 
 fn mark_pending(key: String) {
+    info!("Call detection: the next recording is for the {} call", key);
     *CALL_MARK.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(CallMark::Pending { key, at: std::time::Instant::now(), after_session: current_session() });
 }
 
 /// Binds a pending mark to the recording that started for it, drops one
 /// that waited too long, and returns the call the given recording is for.
-fn mark_for_session(session: u64) -> Option<String> {
+fn mark_for_session(session: u64, started: Option<std::time::Instant>) -> Option<String> {
     let mut mark = CALL_MARK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(CallMark::Pending { key, at, after_session }) = mark.clone() {
         if session > after_session {
             // The first recording after the mark claims it, if it came in time.
-            *mark = (at.elapsed() <= MARK_WAITS_FOR_START).then(|| CallMark::Bound { key, session: after_session + 1 });
-        } else if at.elapsed() > MARK_WAITS_FOR_START {
+            // Judged by when the recording started, not when this poll ran.
+            // Only the first recording after the mark can claim it; when more
+            // than one started between polls the start time is the latest's,
+            // which is no earlier than the first's, so a late first start
+            // still can't pass.
+            let in_time = started.is_some_and(|t| t.saturating_duration_since(at) <= MARK_WAITS_FOR_START);
+            if in_time {
+                info!("Call detection: recording {} is the {} call's", after_session + 1, key);
+            } else {
+                info!("Call detection: no recording started for the {} call in time", key);
+            }
+            *mark = in_time.then(|| CallMark::Bound { key, session: after_session + 1 });
+        } else if at.elapsed() > MARK_WAITS_FOR_START + POLL_EVERY * 2 {
+            // Nothing started; give a start near the end of the wait time to
+            // be seen by a poll before dropping the mark.
             *mark = None;
         }
     }
@@ -307,7 +321,7 @@ fn mark_for_session(session: u64) -> Option<String> {
 
 /// The call the running recording was started for, if any.
 fn recording_for_call() -> Option<String> {
-    mark_for_session(current_session())
+    mark_for_session(current_session(), crate::audio::recording_commands::recording_started_at())
 }
 
 /// The prompt's Record: remembers which call the recording is for.
@@ -321,8 +335,10 @@ pub fn mark_recording_for_call(key: String) {
 #[tauri::command]
 pub async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String) -> bool {
     if !crate::is_recording().await || recording_for_call().as_deref() != Some(key.as_str()) {
+        info!("Call detection: Stop for {} refused, the running recording isn't that call's", key);
         return false;
     }
+    info!("Call detection: stopping the {} call's recording", key);
     crate::tray::stop_recording_from_detection(app).await;
     true
 }
@@ -353,6 +369,9 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
             let present: HashSet<&'static str> = users.iter().filter_map(|id| classify(id)).map(|a| a.key).collect();
             let (started, ended) = tracker.poll(&present);
             let recording = crate::is_recording().await;
+            // Claim a pending mark as soon as its recording starts. Checking
+            // only when the call ends would find the 20 s wait long over.
+            let call_recording = if recording { recording_for_call() } else { None };
             for key in started {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 if recording || settings.ignored_apps.iter().any(|k| k == key) || !onboarding_done(&app).await {
@@ -372,7 +391,8 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
             for key in ended {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 info!("Call detection: {} stopped using the microphone", call_app.name);
-                if recording && recording_for_call().as_deref() == Some(key) {
+                if call_recording.as_deref() == Some(key) {
+                    info!("Call detection: asking whether to stop the {} call's recording", key);
                     let _ = app.emit("call-ended", CallEvent { key: key.into(), name: call_app.name.into(), auto_started: false });
                 }
             }
@@ -409,12 +429,12 @@ mod tests {
         // Recording 4 is the user's, then Record marks the call.
         *CALL_MARK.lock().unwrap() = Some(CallMark::Pending { key: "zoom".into(), at: std::time::Instant::now(), after_session: 4 });
         // Waiting for its recording (the page reloads first).
-        assert_eq!(mark_for_session(4), None);
+        assert_eq!(mark_for_session(4, None), None);
         // Recording 5 starts for it.
-        assert_eq!(mark_for_session(5).as_deref(), Some("zoom"));
-        assert_eq!(mark_for_session(5).as_deref(), Some("zoom"));
+        assert_eq!(mark_for_session(5, Some(std::time::Instant::now())).as_deref(), Some("zoom"));
+        assert_eq!(mark_for_session(5, Some(std::time::Instant::now())).as_deref(), Some("zoom"));
         // The user stops it and starts recording 6 at once: not the call's.
-        assert_eq!(mark_for_session(6), None);
+        assert_eq!(mark_for_session(6, Some(std::time::Instant::now())), None);
 
         // A pending mark nobody claimed in time doesn't go to a later recording.
         *CALL_MARK.lock().unwrap() = Some(CallMark::Pending {
@@ -422,7 +442,13 @@ mod tests {
             at: std::time::Instant::now() - MARK_WAITS_FOR_START - Duration::from_secs(1),
             after_session: 6,
         });
-        assert_eq!(mark_for_session(7), None);
+        assert_eq!(mark_for_session(7, Some(std::time::Instant::now())), None);
+
+        // A recording that started 18 s after Record is in time even when
+        // the poll that sees it runs at 21 s.
+        let marked = std::time::Instant::now() - Duration::from_secs(21);
+        *CALL_MARK.lock().unwrap() = Some(CallMark::Pending { key: "meet".into(), at: marked, after_session: 7 });
+        assert_eq!(mark_for_session(8, Some(marked + Duration::from_secs(18))).as_deref(), Some("meet"));
     }
 
     #[test]
