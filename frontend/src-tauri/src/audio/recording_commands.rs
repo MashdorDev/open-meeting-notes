@@ -50,9 +50,18 @@ static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 /// particular recording (call detection's Stop) can tell it from the next.
 static RECORDING_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// When the latest recording started, for code that needs to know whether
+/// it began within some window (call detection's Record).
+static RECORDING_STARTED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
 /// The number of the latest recording started (0 before the first).
 pub fn recording_session() -> u64 {
     RECORDING_SESSION.load(Ordering::SeqCst)
+}
+
+/// When the latest recording started; None before the first.
+pub fn recording_started_at() -> Option<std::time::Instant> {
+    *RECORDING_STARTED_AT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(target_os = "linux")]
@@ -134,6 +143,7 @@ fn take_for_stop<'a, T>(
 /// the mic-recovery budget already exhausted).
 fn finalize_recording_start() {
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    *RECORDING_STARTED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
     IS_RECORDING.store(true, Ordering::SeqCst);
     MIC_FALLBACK_FAILED_ATTEMPTS.store(0, Ordering::SeqCst); // fresh mic-recovery budget per session
