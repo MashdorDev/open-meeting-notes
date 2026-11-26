@@ -1309,7 +1309,7 @@ pub async fn get_speaker_accuracy(
     let mut guesses: HashMap<String, HashMap<String, String>> = HashMap::new();
     for (meeting_id, ..) in &rows {
         if !guesses.contains_key(meeting_id) {
-            let found = meeting_speaker_guesses(state.db_manager.pool(), meeting_id, true).await;
+            let found = meeting_speaker_guesses(state.db_manager.pool(), meeting_id, GuessUse::ForAccuracy).await;
             guesses.insert(meeting_id.clone(), found);
         }
     }
@@ -1325,20 +1325,36 @@ pub async fn get_speaker_accuracy(
 
 /// The names the app guessed for a meeting's voices, by label, from the
 /// voiceprints saved with it. Empty when it has none or they can't be read.
-/// With `with_dismissed`, guesses Dor rejected are included too (for the
-/// accuracy score, which counts them as wrong).
-async fn meeting_speaker_guesses(pool: &sqlx::SqlitePool, meeting_id: &str, with_dismissed: bool) -> HashMap<String, String> {
+///
+/// `ForAccuracy` returns only voice matches, rejected ones included: the
+/// accuracy score measures the voice separation, and a name heard in the
+/// transcript says nothing about it. `Shown` is what Dor is offered: a voice
+/// match he has not rejected, else the name the voice answered to in the
+/// transcript, unless he rejected that name.
+#[derive(Clone, Copy, PartialEq)]
+enum GuessUse {
+    ForAccuracy,
+    Shown,
+}
+
+async fn meeting_speaker_guesses(pool: &sqlx::SqlitePool, meeting_id: &str, use_: GuessUse) -> HashMap<String, String> {
     let Some(folder) = meeting_folder(pool, meeting_id).await else { return HashMap::new() };
     match crate::diarization::voiceprints::read_voiceprints(&folder) {
-        Ok(voices) => voices
-            .into_iter()
-            .filter(|v| with_dismissed || !v.dismissed)
-            .filter_map(|v| Some((v.label, v.name?)))
-            .collect(),
+        Ok(voices) => voices.into_iter().filter_map(|v| Some((v.label.clone(), shown_guess(v, use_)?))).collect(),
         Err(e) => {
             log_warn!("Speaker guesses not read: {}", e);
             HashMap::new()
         }
+    }
+}
+
+fn shown_guess(v: crate::diarization::voiceprints::Voiceprint, use_: GuessUse) -> Option<String> {
+    match use_ {
+        GuessUse::ForAccuracy => v.name,
+        GuessUse::Shown => v
+            .name
+            .filter(|_| !v.dismissed)
+            .or_else(|| v.heard_name.filter(|h| v.heard_dismissed.as_ref() != Some(h))),
     }
 }
 
@@ -1357,7 +1373,7 @@ pub async fn get_meeting_speaker_guesses(
     meeting_id: String,
 ) -> Result<HashMap<String, String>, String> {
     let pool = state.db_manager.pool();
-    let mut guesses = meeting_speaker_guesses(pool, &meeting_id, false).await;
+    let mut guesses = meeting_speaker_guesses(pool, &meeting_id, GuessUse::Shown).await;
     // A voice already named (on any line, loaded or not) needs no guess.
     let named: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT speaker_label FROM transcripts
@@ -1385,7 +1401,7 @@ async fn meeting_folder(pool: &sqlx::SqlitePool, meeting_id: &str) -> Option<std
         .map(std::path::PathBuf::from)
 }
 
-/// Marks the name guessed for a voice as wrong, so it is no longer shown.
+/// Marks the name offered for a voice as wrong, so it is no longer shown.
 #[tauri::command]
 pub async fn dismiss_speaker_guess(
     state: tauri::State<'_, AppState>,
@@ -1401,7 +1417,12 @@ pub async fn dismiss_speaker_guess(
         .iter_mut()
         .find(|v| v.label == speaker_label)
         .ok_or_else(|| format!("No voice {} in this meeting", speaker_label))?;
-    voice.dismissed = true;
+    // Reject the guess Dor was shown: the voice match if there was one.
+    if voice.name.is_some() && !voice.dismissed {
+        voice.dismissed = true;
+    } else {
+        voice.heard_dismissed = voice.heard_name.clone();
+    }
     write_voiceprints(&folder, &voices).map_err(|e| format!("Voices not saved: {}", e))
 }
 
@@ -1424,7 +1445,7 @@ async fn confirm_guesses(
 ) -> Result<HashMap<String, Vec<String>>, String> {
     let meeting_id = meeting_id.to_string();
     let mut changed: HashMap<String, Vec<String>> = HashMap::new();
-    let guesses = meeting_speaker_guesses(pool, &meeting_id, false).await;
+    let guesses = meeting_speaker_guesses(pool, &meeting_id, GuessUse::Shown).await;
     for (label, name) in guesses.into_iter().filter(|(l, _)| labels.contains(l)) {
         let ids: Vec<String> = sqlx::query_scalar(
             "UPDATE transcripts SET speaker_name = ?
@@ -1913,6 +1934,23 @@ mod external_url_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejecting_one_kind_of_guess_keeps_the_other() {
+        use crate::diarization::voiceprints::Voiceprint;
+        let v = |name: Option<&str>, dismissed, heard: Option<&str>, heard_dismissed: Option<&str>| Voiceprint {
+            label: "Speaker 2".into(), segments: 5, embedding: vec![1.0], name: name.map(Into::into), dismissed,
+            heard_name: heard.map(Into::into), heard_dismissed: heard_dismissed.map(Into::into), lines: 5,
+        };
+        // A rejected voice match falls back to the heard name.
+        assert_eq!(shown_guess(v(Some("Dan"), true, Some("Alyssa"), None), GuessUse::Shown).as_deref(), Some("Alyssa"));
+        // A rejected heard name stays hidden, a different one later is offered.
+        assert_eq!(shown_guess(v(None, false, Some("Patrick"), Some("Patrick")), GuessUse::Shown), None);
+        assert_eq!(shown_guess(v(None, false, Some("Alyssa"), Some("Patrick")), GuessUse::Shown).as_deref(), Some("Alyssa"));
+        // The accuracy score only sees voice matches.
+        assert_eq!(shown_guess(v(None, false, Some("Alyssa"), None), GuessUse::ForAccuracy), None);
+        assert_eq!(shown_guess(v(Some("Dan"), true, None, None), GuessUse::ForAccuracy).as_deref(), Some("Dan"));
+    }
     use crate::diarization::voiceprints::{write_voiceprints, Voiceprint};
 
     #[tokio::test]
@@ -1944,7 +1982,7 @@ mod tests {
         .unwrap();
         let folder = tempfile::tempdir().unwrap();
         let voice = |label: &str, name: &str, dismissed| Voiceprint {
-            label: label.into(), segments: 5, embedding: vec![0.6, 0.8], name: Some(name.into()), dismissed, lines: 5,
+            label: label.into(), segments: 5, embedding: vec![0.6, 0.8], name: Some(name.into()), dismissed, heard_name: None, heard_dismissed: None, lines: 5,
         };
         write_voiceprints(
             folder.path(),
@@ -1982,8 +2020,8 @@ mod tests {
         let kept: Vec<String> =
             sqlx::query_scalar("SELECT name FROM voice_samples ORDER BY name").fetch_all(&pool).await.unwrap();
         assert_eq!(kept, vec!["Alex".to_string(), "Kim".to_string()]);
-        assert_eq!(meeting_speaker_guesses(&pool, "m1", true).await.len(), 5);
-        assert_eq!(meeting_speaker_guesses(&pool, "m1", false).await.len(), 4);
+        assert_eq!(meeting_speaker_guesses(&pool, "m1", GuessUse::ForAccuracy).await.len(), 5);
+        assert_eq!(meeting_speaker_guesses(&pool, "m1", GuessUse::Shown).await.len(), 4);
     }
 
     #[tokio::test]
@@ -2012,7 +2050,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         write_voiceprints(
             folder.path(),
-            &[Voiceprint { label: "Speaker 2".into(), segments: 7, embedding: vec![0.6, 0.8], name: None, dismissed: false, lines: 7 }],
+            &[Voiceprint { label: "Speaker 2".into(), segments: 7, embedding: vec![0.6, 0.8], name: None, dismissed: false, heard_name: None, heard_dismissed: None, lines: 7 }],
         )
         .unwrap();
         sqlx::query("INSERT INTO meetings VALUES ('m1', ?), ('m2', NULL)")

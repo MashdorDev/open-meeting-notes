@@ -34,6 +34,16 @@ pub struct Voiceprint {
     /// accuracy score still counts it as a wrong guess.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dismissed: bool,
+    /// The name this voice answered to or introduced itself with in the
+    /// transcript ("Alyssa, you're up first", then this voice). Offered
+    /// like `name` when there is no voice match, and replaced on each pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heard_name: Option<String>,
+    /// The heard name Dor said is wrong. Kept apart from `dismissed` so
+    /// rejecting one kind of guess leaves the other, and a different name
+    /// heard on a later pass is offered again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heard_dismissed: Option<String>,
     /// Transcript lines given this label, short ones included (`segments`
     /// counts only the lines long enough to move the average).
     #[serde(default)]
@@ -336,13 +346,13 @@ mod tests {
     fn round_trips_through_the_meeting_folder() {
         let folder = tempfile::tempdir().unwrap();
         assert!(read_voiceprints(folder.path()).unwrap().is_empty());
-        let prints = vec![Voiceprint { label: "Speaker 1".into(), segments: 4, embedding: vec![0.6, 0.8], name: Some("Alex".into()), dismissed: true, lines: 6 }];
+        let prints = vec![Voiceprint { label: "Speaker 1".into(), segments: 4, embedding: vec![0.6, 0.8], name: Some("Alex".into()), dismissed: true, heard_name: None, heard_dismissed: None, lines: 6 }];
         write_voiceprints(folder.path(), &prints).unwrap();
         assert_eq!(read_voiceprints(folder.path()).unwrap(), prints);
     }
 
     fn voice(label: &str, segments: usize, embedding: Vec<f32>) -> Voiceprint {
-        Voiceprint { label: label.into(), segments, embedding, name: None, dismissed: false, lines: segments }
+        Voiceprint { label: label.into(), segments, embedding, name: None, dismissed: false, heard_name: None, heard_dismissed: None, lines: segments }
     }
 
     #[test]
@@ -440,7 +450,7 @@ mod tests {
     }
 
     fn mic_voice(label: &str, segments: usize, embedding: [f32; 2]) -> Voiceprint {
-        Voiceprint { label: label.into(), segments, embedding: embedding.to_vec(), name: None, dismissed: false, lines: segments }
+        Voiceprint { label: label.into(), segments, embedding: embedding.to_vec(), name: None, dismissed: false, heard_name: None, heard_dismissed: None, lines: segments }
     }
 
     #[test]

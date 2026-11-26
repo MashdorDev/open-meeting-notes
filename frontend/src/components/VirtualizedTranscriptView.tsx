@@ -31,7 +31,7 @@ export interface VirtualizedTranscriptViewProps {
     enableStreaming?: boolean;
     /** Label for system-audio lines when the other side's name is known */
     othersLabel?: string;
-    /** Names recognized from earlier meetings, by voice label. */
+    /** Suggested names (earlier meetings or this transcript), by voice label. */
     speakerGuesses?: Record<string, string>;
     /** Opens the speaker editor for a line; without it labels are plain text */
     onEditSpeaker?: (segment: TranscriptSegmentData) => void;
@@ -142,7 +142,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                 <button
                     type="button"
                     onClick={() => onEditSpeaker(segment)}
-                    title={isGuess ? 'Recognized from earlier meetings. Click to confirm or correct' : 'Name this speaker'}
+                    title={isGuess ? 'Suggested name. Click to confirm or correct' : 'Name this speaker'}
                     className={`font-semibold mr-1 rounded hover:underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${label.className}`}
                 >
                     {labelText}:
@@ -150,7 +150,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
             ) : (
                 <span
                     className={`font-semibold mr-1 ${label.className}`}
-                    title={isGuess ? 'Recognized from earlier meetings' : undefined}
+                    title={isGuess ? 'Suggested name' : undefined}
                 >
                     {labelText}:
                 </span>

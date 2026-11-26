@@ -10,6 +10,7 @@ import { SpeakerNameEditor } from './SpeakerNameEditor';
 import { SpeakerAccuracy } from './SpeakerAccuracy';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 
@@ -81,10 +82,20 @@ export function TranscriptPanel({
   onSpeakerNamesChanged,
 }: TranscriptPanelProps) {
   const [speakerToName, setSpeakerToName] = useState<TranscriptSegmentData | null>(null);
-  // Names recognized from earlier meetings, by voice label.
+  // Suggested names by voice label: recognized from earlier meetings, or the
+  // name a voice answered to in this transcript.
   const [speakerGuesses, setSpeakerGuesses] = useState<Record<string, string>>({});
   const [namesSaved, setNamesSaved] = useState(0);
+  // Bumped when the names pass that runs after a save or retranscribe ends.
+  const [namesFound, setNamesFound] = useState(0);
   useEffect(() => setSpeakerGuesses({}), [meetingId]);
+  useEffect(() => {
+    if (!meetingId) return;
+    const unlisten = listen<{ meeting_id: string }>('meeting-speakers-identified', event => {
+      if (event.payload.meeting_id === meetingId) setNamesFound(n => n + 1);
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, [meetingId]);
   // Refetched after each save: the backend drops voices that now have a name.
   useEffect(() => {
     if (!meetingId) return;
@@ -93,7 +104,7 @@ export function TranscriptPanel({
       .then(guesses => { if (current) setSpeakerGuesses(guesses); })
       .catch(error => console.error('Failed to load speaker guesses:', error));
     return () => { current = false; };
-  }, [meetingId, namesSaved]);
+  }, [meetingId, namesSaved, namesFound]);
   const audioRef = useRef<HTMLAudioElement>(null);
   const [hasAudio, setHasAudio] = useState(false);
   const [playhead, setPlayhead] = useState<number | null>(null);
@@ -199,7 +210,7 @@ export function TranscriptPanel({
         {meetingId && !isRecording && pendingGuesses.length > 0 && (
           <div className="mt-2 flex items-center justify-between gap-2 rounded-md bg-blue-50 px-3 py-2 text-sm text-blue-900">
             <span>
-              {`Recognized from earlier meetings: ${pendingGuesses.map(([label, name]) => `${name} (${label})`).join(', ')}.`}
+              {`Suggested names: ${pendingGuesses.map(([label, name]) => `${name} (${label})`).join(', ')}.`}
             </span>
             <Button size="sm" disabled={confirming} onClick={() => void confirmGuesses()}>
               {pendingGuesses.length === 1 ? 'Confirm name' : 'Confirm names'}
