@@ -46,6 +46,14 @@ pub use super::transcription::TranscriptUpdate;
 
 // Simple recording state tracking
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+/// Counts recordings started since launch, so code that must act on one
+/// particular recording (call detection's Stop) can tell it from the next.
+static RECORDING_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number of the latest recording started (0 before the first).
+pub fn recording_session() -> u64 {
+    RECORDING_SESSION.load(Ordering::SeqCst)
+}
 
 #[cfg(target_os = "linux")]
 static START_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -126,6 +134,7 @@ fn take_for_stop<'a, T>(
 /// the mic-recovery budget already exhausted).
 fn finalize_recording_start() {
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
     IS_RECORDING.store(true, Ordering::SeqCst);
     MIC_FALLBACK_FAILED_ATTEMPTS.store(0, Ordering::SeqCst); // fresh mic-recovery budget per session
     reset_speech_detected_flag(); // reset speech-detected emit latch for the new session

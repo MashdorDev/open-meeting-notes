@@ -36,6 +36,7 @@ pub(crate) use perf_trace;
 // Re-export async logging macros for external use (removed due to macro conflicts)
 
 // Declare audio module
+pub mod call_detect;
 pub mod analytics;
 pub mod api;
 pub mod audio;
@@ -631,6 +632,8 @@ pub fn run() {
             };
             log::info!("Application setup complete");
 
+            call_detect::start(_app.handle().clone());
+
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
@@ -866,6 +869,11 @@ pub fn run() {
             api::own_voice_status,
             api::forget_own_voice,
             api::set_transcript_speaker_name,
+            call_detect::get_call_detection_settings,
+            call_detect::set_call_detection_settings,
+            call_detect::list_call_apps,
+            call_detect::mark_recording_for_call,
+            call_detect::stop_recording_for_call,
             api::home::api_get_home_overview,
             api::get_meeting_speaker_guesses,
             api::dismiss_speaker_guess,

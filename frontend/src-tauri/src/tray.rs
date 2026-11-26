@@ -105,16 +105,36 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
                 }
             }
         } else {
-            // Immediately show starting state
-            set_tray_state(&app_clone, RecordingState::Starting);
-
-            log::info!("Emitting start recording event from tray");
-            if let Some(window) = app_clone.get_webview_window("main") {
-                let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')"); // Set the flag to start recording automatically
-                let _ = window.eval("window.location.assign('/')");
-            }
+            start_recording_via_home(&app_clone);
         }
     });
+}
+
+/// Starts a recording the way the tray does: the home page starts one when
+/// it loads with the autoStartRecording flag set.
+fn start_recording_via_home<R: Runtime>(app: &AppHandle<R>) {
+    // Immediately show starting state
+    set_tray_state(app, RecordingState::Starting);
+
+    log::info!("Emitting start recording event from tray");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')"); // Set the flag to start recording automatically
+        let _ = window.eval("window.location.assign('/')");
+    }
+}
+
+/// Stops the recording the same way the tray does (call detection's Stop,
+/// after it checked the recording is the one for that call).
+pub(crate) async fn stop_recording_from_detection<R: Runtime>(app: AppHandle<R>) {
+    if crate::is_recording().await {
+        toggle_recording_handler(&app);
+    }
+}
+
+/// Call detection with auto-start on: start a recording, never stop one.
+pub(crate) fn start_recording_from_detection<R: Runtime>(app: &AppHandle<R>) {
+    focus_main_window(app);
+    start_recording_via_home(app);
 }
 
 fn pause_recording_handler<R: Runtime>(app: &AppHandle<R>) {
