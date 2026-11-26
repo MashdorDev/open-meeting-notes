@@ -376,6 +376,63 @@ async fn make_api_request<R: Runtime, T: for<'de> Deserialize<'de>>(
 
 // API Commands for Tauri
 
+/// A meeting as the home page lists it.
+#[derive(Debug, Serialize)]
+pub struct RecentMeeting {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    /// End of the last transcript line, in seconds; None before any line.
+    pub duration_seconds: Option<f64>,
+    /// Names given to the voices, else the "Other side" names found.
+    pub names: Vec<String>,
+}
+
+/// The newest meetings for the home page, with length and speaker names.
+#[tauri::command]
+pub async fn api_get_recent_meetings(
+    state: tauri::State<'_, AppState>,
+    limit: u32,
+) -> Result<Vec<RecentMeeting>, String> {
+    recent_meetings(state.db_manager.pool(), limit).await.map_err(|e| format!("Database error: {}", e))
+}
+
+async fn recent_meetings(pool: &sqlx::SqlitePool, limit: u32) -> Result<Vec<RecentMeeting>, sqlx::Error> {
+    // created_at is decoded, not passed on as stored text: rows carried over
+    // from the old Python backend hold "2025-09-01 10:00:00", which WebKit's
+    // Date parser rejects.
+    let rows: Vec<(String, String, crate::database::models::DateTimeUtc, Option<f64>)> = sqlx::query_as(
+        "SELECT m.id, m.title, m.created_at,
+                (SELECT MAX(t.audio_end_time) FROM transcripts t WHERE t.meeting_id = m.id)
+         FROM meetings m ORDER BY m.created_at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut meetings = Vec::with_capacity(rows.len());
+    for (id, title, created_at, duration_seconds) in rows {
+        // Names are extra: a failed lookup leaves them out, not the meeting.
+        let mut names: Vec<String> = sqlx::query_scalar(
+            "SELECT speaker_name FROM transcripts
+             WHERE meeting_id = ? AND speaker_name IS NOT NULL
+             GROUP BY speaker_name ORDER BY MIN(audio_start_time)",
+        )
+        .bind(&id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            log_warn!("Recent meetings: names for {} not read: {}", id, e);
+            Vec::new()
+        });
+        if names.is_empty() {
+            names = crate::summary::speaker_names::get_other_speaker_names(pool, &id).await.unwrap_or_default();
+        }
+        let created_at = created_at.0.to_rfc3339();
+        meetings.push(RecentMeeting { id, title, created_at, duration_seconds, names });
+    }
+    Ok(meetings)
+}
+
 #[tauri::command]
 pub async fn api_get_meetings<R: Runtime>(
     _app: AppHandle<R>,
@@ -1934,6 +1991,31 @@ mod external_url_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recent_meetings_come_newest_first_with_length_and_names() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, folder_path TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, audio_start_time REAL, audio_end_time REAL, speaker_name TEXT)").execute(&pool).await.unwrap();
+        // "c" was written by the old Python backend: space, no zone.
+        for (id, title, at) in [("a", "Older", "2026-11-25T10:00:00Z"), ("b", "Newer", "2026-11-26T10:00:00Z"), ("c", "Empty", "2026-11-24 10:00:00")] {
+            sqlx::query("INSERT INTO meetings (id, title, created_at) VALUES (?, ?, ?)").bind(id).bind(title).bind(at).execute(&pool).await.unwrap();
+        }
+        for (id, meeting, start, end, name) in [
+            ("1", "b", 0.0, 10.0, Some("Patrick")), ("2", "b", 10.0, 20.0, Some("Alyssa")), ("3", "b", 20.0, 245.5, Some("Patrick")),
+            ("4", "a", 0.0, 60.0, None),
+        ] {
+            sqlx::query("INSERT INTO transcripts VALUES (?, ?, ?, ?, ?)").bind(id).bind(meeting).bind(start).bind(end).bind(name).execute(&pool).await.unwrap();
+        }
+        let meetings = recent_meetings(&pool, 2).await.unwrap();
+        assert_eq!(meetings.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["Newer", "Older"]);
+        assert_eq!(meetings[0].duration_seconds, Some(245.5));
+        assert_eq!(meetings[0].names, ["Patrick", "Alyssa"]);
+        assert!(meetings[1].names.is_empty());
+        let all = recent_meetings(&pool, 10).await.unwrap();
+        assert_eq!(all[2].duration_seconds, None);
+        assert_eq!(all[2].created_at, "2026-11-24T10:00:00+00:00");
+    }
 
     #[test]
     fn rejecting_one_kind_of_guess_keeps_the_other() {
