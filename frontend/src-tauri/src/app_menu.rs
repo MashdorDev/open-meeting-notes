@@ -7,19 +7,21 @@ use tauri::menu::{AboutMetadata, Menu, MenuEvent, MenuItemBuilder, PredefinedMen
 use tauri::{AppHandle, Emitter, Runtime};
 
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
-    let name = app.package_info().name.clone();
+    // The product name ("Open Meeting Notes"); package_info().name is the
+    // crate name, which macOS would show as "Quit open-meeting-notes".
+    let name = app.config().product_name.clone().unwrap_or_else(|| app.package_info().name.clone());
     let app_menu = SubmenuBuilder::new(app, &name)
-        .item(&PredefinedMenuItem::about(app, None, Some(AboutMetadata::default()))?)
+        .item(&PredefinedMenuItem::about(app, Some(&format!("About {name}")), Some(AboutMetadata { name: Some(name.clone()), ..Default::default() }))?)
         .separator()
         .item(&MenuItemBuilder::with_id("menu_settings", "Settings…").accelerator("CmdOrCtrl+,").build(app)?)
         .separator()
         .item(&PredefinedMenuItem::services(app, None)?)
         .separator()
-        .item(&PredefinedMenuItem::hide(app, None)?)
+        .item(&PredefinedMenuItem::hide(app, Some(&format!("Hide {name}")))?)
         .item(&PredefinedMenuItem::hide_others(app, None)?)
         .item(&PredefinedMenuItem::show_all(app, None)?)
         .separator()
-        .item(&PredefinedMenuItem::quit(app, None)?)
+        .item(&PredefinedMenuItem::quit(app, Some(&format!("Quit {name}")))?)
         .build()?;
     let file = SubmenuBuilder::new(app, "File")
         .item(
