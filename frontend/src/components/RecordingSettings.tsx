@@ -6,6 +6,7 @@ import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
 import Analytics from '@/lib/analytics';
 import { cachedDeviceLabel } from '@/lib/audioDevices';
 import { toast } from 'sonner';
+import { CallDetectionSettings } from '@/components/CallDetectionSettings';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useConfig } from '@/contexts/ConfigContext';
 
@@ -289,6 +290,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           onCheckedChange={handleNotificationToggle}
         />
       </div>
+
+      <CallDetectionSettings />
 
       <OwnVoiceSetting />
 
