@@ -283,6 +283,7 @@ fn current_session() -> u64 {
 }
 
 fn mark_pending(key: String) {
+    info!("Call detection: the next recording is for the {} call", key);
     *CALL_MARK.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(CallMark::Pending { key, at: std::time::Instant::now(), after_session: current_session() });
 }
@@ -294,7 +295,13 @@ fn mark_for_session(session: u64) -> Option<String> {
     if let Some(CallMark::Pending { key, at, after_session }) = mark.clone() {
         if session > after_session {
             // The first recording after the mark claims it, if it came in time.
-            *mark = (at.elapsed() <= MARK_WAITS_FOR_START).then(|| CallMark::Bound { key, session: after_session + 1 });
+            let in_time = at.elapsed() <= MARK_WAITS_FOR_START;
+            if in_time {
+                info!("Call detection: recording {} is the {} call's", after_session + 1, key);
+            } else {
+                info!("Call detection: no recording started for the {} call in time", key);
+            }
+            *mark = in_time.then(|| CallMark::Bound { key, session: after_session + 1 });
         } else if at.elapsed() > MARK_WAITS_FOR_START {
             *mark = None;
         }
@@ -321,8 +328,10 @@ pub fn mark_recording_for_call(key: String) {
 #[tauri::command]
 pub async fn stop_recording_for_call<R: Runtime>(app: AppHandle<R>, key: String) -> bool {
     if !crate::is_recording().await || recording_for_call().as_deref() != Some(key.as_str()) {
+        info!("Call detection: Stop for {} refused, the running recording isn't that call's", key);
         return false;
     }
+    info!("Call detection: stopping the {} call's recording", key);
     crate::tray::stop_recording_from_detection(app).await;
     true
 }
@@ -353,6 +362,9 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
             let present: HashSet<&'static str> = users.iter().filter_map(|id| classify(id)).map(|a| a.key).collect();
             let (started, ended) = tracker.poll(&present);
             let recording = crate::is_recording().await;
+            // Claim a pending mark as soon as its recording starts. Checking
+            // only when the call ends would find the 20 s wait long over.
+            let call_recording = if recording { recording_for_call() } else { None };
             for key in started {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 if recording || settings.ignored_apps.iter().any(|k| k == key) || !onboarding_done(&app).await {
@@ -372,7 +384,8 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
             for key in ended {
                 let Some(call_app) = CALL_APPS.iter().find(|a| a.key == key) else { continue };
                 info!("Call detection: {} stopped using the microphone", call_app.name);
-                if recording && recording_for_call().as_deref() == Some(key) {
+                if call_recording.as_deref() == Some(key) {
+                    info!("Call detection: asking whether to stop the {} call's recording", key);
                     let _ = app.emit("call-ended", CallEvent { key: key.into(), name: call_app.name.into(), auto_started: false });
                 }
             }
